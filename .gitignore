@@ -1,4 +1,5 @@
 build/
+target/
 linux/.*.cmd
 linux/.*.d
 linux/.tmp_versions/
