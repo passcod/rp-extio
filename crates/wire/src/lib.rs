@@ -11,6 +11,9 @@ pub const MAX_DATA: usize = 3584;
 pub const MAX_I2C_MESSAGES: usize = 16;
 pub const MAX_SPI_SEGMENTS: usize = 16;
 pub const USB_REPLY: u8 = 1;
+pub const CAP_GENERAL: u16 = 1;
+pub const CAP_I2C: u16 = 2;
+pub const CAP_SPI: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -155,6 +158,9 @@ impl<'a> Writer<'a> {
         self.extend(&value.to_le_bytes())
     }
     pub fn u32(&mut self, value: u32) -> Result<(), WireError> {
+        self.extend(&value.to_le_bytes())
+    }
+    pub fn i32(&mut self, value: i32) -> Result<(), WireError> {
         self.extend(&value.to_le_bytes())
     }
     pub fn extend(&mut self, value: &[u8]) -> Result<(), WireError> {

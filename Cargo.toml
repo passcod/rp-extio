@@ -1,8 +1,13 @@
 [workspace]
-members = ["crates/wire"]
+members = ["crates/firmware", "crates/wire"]
 resolver = "3"
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"

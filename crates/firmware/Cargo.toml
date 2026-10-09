@@ -1,0 +1,28 @@
+[package]
+name = "rp-extio-firmware"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[[bin]]
+name = "rp-extio-firmware"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["firmware"]
+
+[dependencies]
+rp-extio-wire = { path = "../wire" }
+
+[features]
+default = []
+firmware = []
+
+[target.'cfg(target_arch = "arm")'.dependencies]
+embassy-executor = { version = "0.10.0", features = ["executor-thread", "platform-cortex-m"] }
+embassy-futures = "0.1.2"
+embassy-rp = { version = "0.10.0", features = ["rp235xa", "binary-info", "critical-section-impl"] }
+embassy-usb = "0.6.0"
+static_cell = "2.1.1"
+
