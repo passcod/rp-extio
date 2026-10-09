@@ -1,0 +1,10 @@
+build/
+linux/.*.cmd
+linux/.*.d
+linux/.tmp_versions/
+linux/Module.symvers
+linux/modules.order
+linux/*.mod
+linux/*.mod.c
+linux/*.o
+linux/*.ko
