@@ -5,7 +5,8 @@
 Expose I2C and SPI buses from a USB-connected Pico 2 as ordinary Linux
 `/dev/i2c-*` and `/dev/spidev*` devices. I2C and SPI are the first required
 interfaces. Add UART through CDC ACM after the core buses; additional
-peripherals need their own requirements.
+GPIO is the fourth interface. Other RP2350 peripherals need their own
+requirements.
 
 Use Rust for the firmware, shared protocol, and host daemon. A daemon is an
 acceptable runtime dependency. Its hardware backend talks to the Pico 2 over
@@ -99,6 +100,16 @@ either. Neither is part of the initial kernel boundary.
    Linux's existing serial driver provides `/dev/ttyACM*`. Keep UART optional
    in board capability reporting; it must not delay the usable I2C/SPI
    bridge.
+8. **Add GPIO as the fourth interface.** Register a Linux GPIO controller so
+   applications can use `/dev/gpiochipN` through the standard GPIO character
+   device API. Extend the daemon and firmware protocols for line discovery,
+   direction, value changes, and edge events, including asynchronous event
+   delivery across USB and the userspace request channel. Let the simulated
+   backend expose GPIO lines and scripted input changes too. Keep pin
+   ownership explicit so a line assigned to I2C, SPI, or UART cannot also be
+   exported as general-purpose GPIO. Document that `/dev/gpiomem` is a
+   Raspberry Pi memory-mapped interface and cannot directly represent GPIO
+   on a USB-attached microcontroller.
 
 ## Boundaries
 
