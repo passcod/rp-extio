@@ -182,6 +182,15 @@ chip-select and atomic-message contract.
 
 ## Implementation handoff
 
+Use one Cargo workspace at the repository root, with members for the shared
+`no_std` wire crate, Pico 2 firmware, and Linux daemon. Keep one `Cargo.lock`
+and pin dependency versions after resolving them. Put board-specific and
+host-only dependencies in their respective packages so the wire crate stays
+usable on both targets. Use explicit package and target selections for host
+and RP2350 builds; the workspace must not set a firmware target as the
+default for host commands. The C kernel module and DKMS files live beside
+this workspace rather than in a Cargo package.
+
 ### 3. Rust firmware
 
 Create a `no_std` wire crate with the USB frame parser, capability records,
