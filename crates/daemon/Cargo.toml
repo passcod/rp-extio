@@ -1,0 +1,15 @@
+[package]
+name = "rp-extiod"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = "0.1.92"
+libc = "0.2.190"
+nusb = { version = "0.2.7", features = ["tokio"] }
+rp-extio-wire = { path = "../wire" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "signal"] }
