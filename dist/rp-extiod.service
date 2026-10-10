@@ -1,5 +1,5 @@
 [Unit]
-Description=RP external I2C/SPI bridge daemon
+Description=RP external I2C/SPI/UART/GPIO bridge daemon
 After=systemd-modules-load.service
 
 [Service]

@@ -1077,5 +1077,5 @@ module_init(rpe_init);
 module_exit(rpe_exit);
 
 MODULE_AUTHOR("rp-extio contributors");
-MODULE_DESCRIPTION("Userspace-backed I2C and SPI controllers");
+MODULE_DESCRIPTION("Userspace-backed I2C, SPI, and GPIO controllers");
 MODULE_LICENSE("GPL");

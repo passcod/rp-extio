@@ -119,6 +119,12 @@ capabilities before registering buses, and supports multiple boards. It permits
 one physical transaction at a time per board. Independent boards and simulated
 devices can operate concurrently.
 
+The installed service runs as root because `/dev/rp-extio-control` is mode
+`0600`; this also gives it access to the Pico through Linux usbfs without a
+separate udev rule. A direct daemon invocation needs equivalent permissions for
+both the control device and USB device. The CDC ACM interface keeps the normal
+distribution-provided serial-device permissions.
+
 A disconnect, USB timeout, mismatched response, or uncertain frame tears down
 that board's Linux buses. Non-idempotent transactions are never retried. A
 reconnected board is negotiated and registered again, potentially under new
