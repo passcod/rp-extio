@@ -854,4 +854,29 @@ mod tests {
     fn rp_extio_firmware_gpio_pins() -> [u8; 17] {
         [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
     }
+
+    #[tokio::test]
+    #[ignore = "requires a connected rp-extio Pico 2"]
+    async fn negotiates_connected_bridge_and_reads_gpio_snapshot() {
+        let info = nusb::list_devices()
+            .await
+            .unwrap()
+            .find(matches_bridge)
+            .expect("rp-extio Pico 2 not found");
+        let (failed, _failures) = mpsc::unbounded_channel();
+        let (backend, config) = UsbBackend::connect(&info, failed).await.unwrap();
+        assert_eq!(config, RegistrationConfig::PICO2);
+
+        let snapshot = backend
+            .transact(Transaction::Gpio {
+                command: rp_extio_wire::GPIO_SNAPSHOT,
+                line: 0,
+                value: 0,
+            })
+            .await;
+        assert_eq!(snapshot.status, Status::Ok as i32);
+        assert_eq!(snapshot.completed, 17);
+        assert_eq!(snapshot.data.len(), 4);
+        backend.disconnect().await;
+    }
 }
