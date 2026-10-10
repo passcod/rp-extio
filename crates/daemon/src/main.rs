@@ -1,30 +1,116 @@
-use rp_extiod::sim::{self, Simulator};
-use std::{env, error::Error, path::PathBuf, sync::Arc};
+use rp_extiod::{
+    kernel::{DeviceRegistration, Kernel},
+    sim::{self, Command, Simulator},
+};
+use std::{
+    collections::{HashMap, hash_map::Entry},
+    env,
+    error::Error,
+    path::PathBuf,
+    sync::Arc,
+};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::UnixListener,
+    sync::Mutex,
 };
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let socket = env::args_os()
-        .skip_while(|a| a != "--simulate")
-        .nth(1)
-        .map(PathBuf::from)
-        .ok_or("usage: rp-extiod --simulate SOCKET")?;
+    let mut arguments = env::args_os().skip(1);
+    let mut socket = None;
+    let mut control = PathBuf::from("/dev/rp-extio-control");
+    while let Some(argument) = arguments.next() {
+        if argument == "--simulate" {
+            socket = arguments.next().map(PathBuf::from);
+        } else if argument == "--control" {
+            control = arguments
+                .next()
+                .map(PathBuf::from)
+                .ok_or("--control needs a path")?;
+        } else {
+            return Err(format!("unknown argument: {}", argument.to_string_lossy()).into());
+        }
+    }
+    let socket = socket.ok_or("usage: rp-extiod --simulate SOCKET [--control PATH]")?;
     if socket.exists() {
         std::fs::remove_file(&socket)?;
     }
+    let kernel = Kernel::open(control)?;
+    let dispatch_kernel = kernel.clone();
+    let dispatcher = dispatch_kernel.run();
+    tokio::pin!(dispatcher);
     let listener = UnixListener::bind(&socket)?;
     let simulator = Arc::new(Simulator::default());
+    let registrations = Arc::new(Mutex::new(HashMap::<String, DeviceRegistration>::new()));
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = tokio::select! {
+            result = &mut dispatcher => {
+                result?;
+                return Err("kernel dispatcher stopped".into());
+            }
+            accepted = listener.accept() => accepted?,
+        };
         let simulator = simulator.clone();
+        let kernel = kernel.clone();
+        let registrations = registrations.clone();
         tokio::spawn(async move {
             let (read, mut write) = stream.into_split();
             let mut lines = BufReader::new(read).lines();
             while let Ok(Some(line)) = lines.next_line().await {
-                let response = match serde_json::from_str(&line) {
+                let response = match serde_json::from_str::<Command>(&line) {
+                    Ok(Command::Create { device }) => {
+                        let mut registrations = registrations.lock().await;
+                        match registrations.entry(device.clone()) {
+                            Entry::Occupied(_) => sim::Response::Error {
+                                message: "device already exists".into(),
+                            },
+                            Entry::Vacant(entry) => match simulator
+                                .command(Command::Create {
+                                    device: device.clone(),
+                                })
+                                .await
+                            {
+                                sim::Response::Ok => match kernel
+                                    .register_device(Arc::new(simulator.device(device.clone())))
+                                {
+                                    Ok(registration) => {
+                                        let buses = registration.buses;
+                                        entry.insert(registration);
+                                        sim::Response::Created {
+                                            i2c_bus: buses.i2c,
+                                            spi_bus: buses.spi,
+                                        }
+                                    }
+                                    Err(error) => {
+                                        simulator.command(Command::Remove { device }).await;
+                                        sim::Response::Error {
+                                            message: error.to_string(),
+                                        }
+                                    }
+                                },
+                                response => response,
+                            },
+                        }
+                    }
+                    Ok(Command::Remove { device }) => {
+                        let registration = registrations.lock().await.remove(&device);
+                        match registration {
+                            Some(registration) => {
+                                let destroy = registration.destroy();
+                                let response = simulator.command(Command::Remove { device }).await;
+                                match destroy {
+                                    Ok(()) => response,
+                                    Err(error) => sim::Response::Error {
+                                        message: error.to_string(),
+                                    },
+                                }
+                            }
+                            None => sim::Response::Error {
+                                message: "unknown device".into(),
+                            },
+                        }
+                    }
                     Ok(command) => simulator.command(command).await,
                     Err(error) => sim::Response::Error {
                         message: error.to_string(),
