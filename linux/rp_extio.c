@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/completion.h>
 #include <linux/build_bug.h>
+#include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/gpio/driver.h>
 #include <linux/i2c.h>
 #include <linux/idr.h>
 #include <linux/jiffies.h>
+#include <linux/kmod.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
 #include <linux/module.h>
@@ -82,6 +84,7 @@ struct rpe_instance {
 			spinlock_t irq_lock;
 			unsigned long irq_enabled;
 			u32 irq_type[RPE_GPIO_LINES];
+			bool registering;
 		} gpio;
 	};
 };
@@ -436,6 +439,13 @@ static int rpe_gpio_call(struct rpe_instance *instance, u8 command,
 
 	if (offset >= instance->gpio.chip.ngpio)
 		return -EINVAL;
+	/* gpiochip_add_data() queries initial directions before its ioctl can
+	 * return the instance ID to the daemon. Firmware starts every exposed
+	 * line as a low input, so answer registration-time probes locally.
+	 */
+	if (READ_ONCE(instance->gpio.registering))
+		return command == RPE_GPIO_GET_DIRECTION ||
+		       command == RPE_GPIO_DIRECTION_INPUT;
 	request = kzalloc(sizeof(*request), GFP_KERNEL);
 	if (!request)
 		return -ENOMEM;
@@ -756,6 +766,7 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 		return -ENOMEM;
 	instance->session = session;
 	instance->type = RPE_INSTANCE_GPIO;
+	instance->gpio.registering = true;
 	mutex_init(&instance->transaction_lock);
 	spin_lock_init(&instance->gpio.irq_lock);
 	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
@@ -784,6 +795,7 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 	ret = gpiochip_add_data(&instance->gpio.chip, instance);
 	if (ret)
 		goto free_id;
+	WRITE_ONCE(instance->gpio.registering, false);
 	list_add_tail(&instance->node, &session->instances);
 	create.instance_id = instance->id;
 	if (copy_to_user(argument, &create, sizeof(create))) {
@@ -860,6 +872,8 @@ static int rpe_create_spi(struct rpe_session *session, void __user *argument)
 	    !create.min_speed_hz || create.min_speed_hz > create.max_speed_hz ||
 	    (create.mode_bits & ~RPE_SPI_MODES))
 		return -EINVAL;
+	if (request_module("spidev"))
+		return -ENODEV;
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
 	if (!instance)
 		return -ENOMEM;
@@ -906,6 +920,17 @@ static int rpe_create_spi(struct rpe_session *session, void __user *argument)
 			ret = -ENODEV;
 			goto unregister_children;
 		}
+		ret = device_set_driver_override(&instance->spi.children[i]->dev,
+						 "spidev");
+		if (ret)
+			goto unregister_current_child;
+		ret = device_attach(&instance->spi.children[i]->dev);
+		if (ret < 0)
+			goto unregister_current_child;
+		if (!ret) {
+			ret = -ENODEV;
+			goto unregister_current_child;
+		}
 	}
 	list_add_tail(&instance->node, &session->instances);
 	create.instance_id = instance->id;
@@ -916,6 +941,9 @@ static int rpe_create_spi(struct rpe_session *session, void __user *argument)
 		return ret;
 	}
 	return 0;
+unregister_current_child:
+	spi_unregister_device(instance->spi.children[i]);
+	instance->spi.children[i] = NULL;
 unregister_children:
 	while (i--)
 		spi_unregister_device(instance->spi.children[i]);
