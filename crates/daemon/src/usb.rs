@@ -914,6 +914,16 @@ mod tests {
         assert!(parse_capabilities(&payload).is_err());
     }
 
+    #[test]
+    fn validates_alternate_i2c_pin_map() {
+        let gpio = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 20, 22, 26, 27, 28];
+        assert!(validate_pin_map([12, 13], &[18, 19, 16, 17, 21], [0, 1], &gpio).is_ok());
+
+        let mut duplicate = gpio;
+        duplicate[0] = 12;
+        assert!(validate_pin_map([12, 13], &[18, 19, 16, 17, 21], [0, 1], &duplicate).is_err());
+    }
+
     fn rp_extio_firmware_gpio_pins() -> [u8; 17] {
         [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
     }
