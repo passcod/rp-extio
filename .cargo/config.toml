@@ -1,0 +1,5 @@
+[alias]
+firmware = "build --release --package rp-extio-firmware --features firmware --target thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = ["-C", "link-arg=-Tlink.x"]

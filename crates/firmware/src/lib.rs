@@ -1,8 +1,8 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_I2C, CAP_SPI, I2cRequest, MAX_PAYLOAD, Operation, SPI_CS_CHANGE,
-    SpiRequest, Status, UsbHeader, WireError, Writer,
+    CAP_GENERAL, CAP_I2C, CAP_SPI, I2cRequest, MAX_PAYLOAD, Operation, SPI_CS_CHANGE, SpiRequest,
+    Status, UsbHeader, WireError, Writer,
 };
 
 pub const I2C_BUS_ID: u8 = 0;
@@ -63,6 +63,8 @@ pub trait Board {
         request: &SpiRequest<'_>,
         receive: &mut [u8],
     ) -> Result<SpiOutcome, BusFailure>;
+
+    fn disconnect(&mut self) {}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -155,11 +157,7 @@ fn record(
     value(out).map_err(bad_frame)
 }
 
-fn i2c<B: Board>(
-    payload: &[u8],
-    board: &mut B,
-    response: &mut [u8],
-) -> Result<usize, BusFailure> {
+fn i2c<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
     let request = I2cRequest::parse(payload).map_err(bad_frame)?;
     if request.bus_id != I2C_BUS_ID {
         return Err(BusFailure::new(Status::Unsupported, 0));
@@ -172,11 +170,7 @@ fn i2c<B: Board>(
     Ok(4 + read_len)
 }
 
-fn spi<B: Board>(
-    payload: &[u8],
-    board: &mut B,
-    response: &mut [u8],
-) -> Result<usize, BusFailure> {
+fn spi<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
     let request = SpiRequest::parse(payload).map_err(bad_frame)?;
     if request.bus_id != SPI_BUS_ID
         || request.mode & !SPI_SUPPORTED_MODES != 0
@@ -190,7 +184,10 @@ fn spi<B: Board>(
     response[..4].copy_from_slice(&outcome.completed_bytes.to_le_bytes());
     response[4] = request.count;
     response[5..8].fill(0);
-    for (index, speed) in outcome.effective_speeds[..request.count as usize].iter().enumerate() {
+    for (index, speed) in outcome.effective_speeds[..request.count as usize]
+        .iter()
+        .enumerate()
+    {
         let offset = 8 + index * 4;
         response[offset..offset + 4].copy_from_slice(&speed.to_le_bytes());
     }
@@ -289,9 +286,11 @@ mod tests {
         let reply = dispatch(header(Operation::Hello, 0), &[], &mut Stub, &mut response);
         assert_eq!(reply.header.status, Status::Ok);
         assert_eq!(&response[..2], &CAP_GENERAL.to_le_bytes());
-        assert!(response[..reply.payload_len]
-            .windows(2)
-            .any(|window| window == CAP_SPI.to_le_bytes()));
+        assert!(
+            response[..reply.payload_len]
+                .windows(2)
+                .any(|window| window == CAP_SPI.to_le_bytes())
+        );
     }
 
     #[test]
