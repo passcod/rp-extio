@@ -1,6 +1,7 @@
 use rp_extiod::{
-    kernel::{DeviceRegistration, Kernel},
+    kernel::{DeviceRegistration, Kernel, RegistrationConfig},
     sim::{self, Command, Simulator},
+    usb,
 };
 use std::{
     collections::{HashMap, hash_map::Entry},
@@ -32,25 +33,38 @@ async fn main() -> Result<(), Box<dyn Error>> {
             return Err(format!("unknown argument: {}", argument.to_string_lossy()).into());
         }
     }
-    let socket = socket.ok_or("usage: rp-extiod --simulate SOCKET [--control PATH]")?;
+    let kernel = Kernel::open(control)?;
+    let dispatcher = kernel.clone().run();
+    let usb = usb::run(kernel.clone());
+    tokio::pin!(dispatcher, usb);
+    if let Some(socket) = socket {
+        let simulation = serve_simulation(socket, kernel);
+        tokio::pin!(simulation);
+        tokio::select! {
+            result = &mut dispatcher => result?,
+            result = &mut usb => result?,
+            result = &mut simulation => result?,
+            result = tokio::signal::ctrl_c() => result?,
+        }
+    } else {
+        tokio::select! {
+            result = &mut dispatcher => result?,
+            result = &mut usb => result?,
+            result = tokio::signal::ctrl_c() => result?,
+        }
+    }
+    Ok(())
+}
+
+async fn serve_simulation(socket: PathBuf, kernel: Arc<Kernel>) -> std::io::Result<()> {
     if socket.exists() {
         std::fs::remove_file(&socket)?;
     }
-    let kernel = Kernel::open(control)?;
-    let dispatch_kernel = kernel.clone();
-    let dispatcher = dispatch_kernel.run();
-    tokio::pin!(dispatcher);
     let listener = UnixListener::bind(&socket)?;
     let simulator = Arc::new(Simulator::default());
     let registrations = Arc::new(Mutex::new(HashMap::<String, DeviceRegistration>::new()));
     loop {
-        let (stream, _) = tokio::select! {
-            result = &mut dispatcher => {
-                result?;
-                return Err("kernel dispatcher stopped".into());
-            }
-            accepted = listener.accept() => accepted?,
-        };
+        let (stream, _) = listener.accept().await?;
         let simulator = simulator.clone();
         let kernel = kernel.clone();
         let registrations = registrations.clone();
@@ -71,9 +85,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                 })
                                 .await
                             {
-                                sim::Response::Ok => match kernel
-                                    .register_device(Arc::new(simulator.device(device.clone())))
-                                {
+                                sim::Response::Ok => match kernel.register_device(
+                                    Arc::new(simulator.device(device.clone())),
+                                    RegistrationConfig::PICO2,
+                                ) {
                                     Ok(registration) => {
                                         let buses = registration.buses;
                                         entry.insert(registration);

@@ -7,6 +7,7 @@ publish = false
 
 [dependencies]
 async-trait = "0.1.92"
+futures-lite = "2.6.1"
 libc = "0.2.190"
 nusb = { version = "0.2.7", features = ["tokio"] }
 rp-extio-wire = { path = "../wire" }

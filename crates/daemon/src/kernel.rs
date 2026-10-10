@@ -17,7 +17,25 @@ use std::{
 const ABI_MAJOR: u16 = 1;
 const IOC_MAGIC: u32 = b'R' as u32;
 const I2C_FUNCTIONALITY: u32 = 0x0eff_000b;
-const SPI_MODE_BITS: u32 = 0x4f;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RegistrationConfig {
+    pub i2c_speed_hz: u32,
+    pub spi_mode_bits: u32,
+    pub spi_min_speed_hz: u32,
+    pub spi_max_speed_hz: u32,
+    pub spi_chip_selects: u16,
+}
+
+impl RegistrationConfig {
+    pub const PICO2: Self = Self {
+        i2c_speed_hz: 100_000,
+        spi_mode_bits: 0x4f,
+        spi_min_speed_hz: 50_000,
+        spi_max_speed_hz: 20_000_000,
+        spi_chip_selects: 2,
+    };
+}
 
 #[repr(C)]
 #[derive(Default)]
@@ -122,10 +140,11 @@ impl Kernel {
     pub fn register_device(
         self: &Arc<Self>,
         backend: Arc<dyn Backend>,
+        config: RegistrationConfig,
     ) -> io::Result<DeviceRegistration> {
         let mut i2c = IocCreateI2c {
             functionality: I2C_FUNCTIONALITY,
-            speed_hz: 100_000,
+            speed_hz: config.i2c_speed_hz,
             instance_id: 0,
             bus_num: -1,
         };
@@ -136,10 +155,10 @@ impl Kernel {
             .insert(i2c.instance_id, backend.clone());
 
         let mut spi = IocCreateSpi {
-            mode_bits: SPI_MODE_BITS,
-            min_speed_hz: 50_000,
-            max_speed_hz: 20_000_000,
-            chip_selects: 2,
+            mode_bits: config.spi_mode_bits,
+            min_speed_hz: config.spi_min_speed_hz,
+            max_speed_hz: config.spi_max_speed_hz,
+            chip_selects: config.spi_chip_selects,
             reserved: 0,
             instance_id: 0,
             bus_num: -1,

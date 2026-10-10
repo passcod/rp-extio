@@ -16,7 +16,7 @@ pub const SPI_CPHA: u16 = 1 << 0;
 pub const SPI_CPOL: u16 = 1 << 1;
 pub const SPI_CS_HIGH: u16 = 1 << 2;
 pub const SPI_LSB_FIRST: u16 = 1 << 3;
-pub const SPI_NO_CS: u16 = 1 << 4;
+pub const SPI_NO_CS: u16 = 1 << 6;
 pub const SPI_SUPPORTED_MODES: u16 = SPI_CPHA | SPI_CPOL | SPI_CS_HIGH | SPI_LSB_FIRST | SPI_NO_CS;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
