@@ -25,6 +25,7 @@ pub struct RegistrationConfig {
     pub spi_min_speed_hz: u32,
     pub spi_max_speed_hz: u32,
     pub spi_chip_selects: u16,
+    pub gpio_lines: u16,
 }
 
 impl RegistrationConfig {
@@ -34,6 +35,7 @@ impl RegistrationConfig {
         spi_min_speed_hz: 50_000,
         spi_max_speed_hz: 20_000_000,
         spi_chip_selects: 2,
+        gpio_lines: 17,
     };
 }
 
@@ -71,15 +73,26 @@ struct IocDestroy {
     reserved: u32,
 }
 
+#[repr(C)]
+struct IocCreateGpio {
+    lines: u16,
+    reserved: u16,
+    instance_id: u32,
+    features: u32,
+    reserved2: u32,
+}
+
 const _: () = assert!(size_of::<IocVersion>() == 16);
 const _: () = assert!(size_of::<IocCreateI2c>() == 16);
 const _: () = assert!(size_of::<IocCreateSpi>() == 24);
 const _: () = assert!(size_of::<IocDestroy>() == 8);
+const _: () = assert!(size_of::<IocCreateGpio>() == 16);
 
 const IOC_GET_VERSION: libc::Ioctl = libc::_IOR::<IocVersion>(IOC_MAGIC, 0x00);
 const IOC_CREATE_I2C: libc::Ioctl = libc::_IOWR::<IocCreateI2c>(IOC_MAGIC, 0x01);
 const IOC_CREATE_SPI: libc::Ioctl = libc::_IOWR::<IocCreateSpi>(IOC_MAGIC, 0x02);
 const IOC_DESTROY: libc::Ioctl = libc::_IOW::<IocDestroy>(IOC_MAGIC, 0x03);
+const IOC_CREATE_GPIO: libc::Ioctl = libc::_IOWR::<IocCreateGpio>(IOC_MAGIC, 0x04);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BusNumbers {
@@ -89,11 +102,15 @@ pub struct BusNumbers {
 
 pub struct DeviceRegistration {
     kernel: Arc<Kernel>,
-    instance_ids: [u32; 2],
+    instance_ids: [u32; 3],
     pub buses: BusNumbers,
 }
 
 impl DeviceRegistration {
+    pub fn gpio_instance_id(&self) -> u32 {
+        self.instance_ids[2]
+    }
+
     pub fn destroy(self) -> io::Result<()> {
         let mut first_error = None;
         for id in self.instance_ids {
@@ -170,10 +187,26 @@ impl Kernel {
         self.backends
             .write()
             .unwrap()
-            .insert(spi.instance_id, backend);
+            .insert(spi.instance_id, backend.clone());
+        let mut gpio = IocCreateGpio {
+            lines: config.gpio_lines,
+            reserved: 0,
+            instance_id: 0,
+            features: 0,
+            reserved2: 0,
+        };
+        if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_GPIO, &mut gpio) {
+            let _ = self.destroy_instance(spi.instance_id);
+            let _ = self.destroy_instance(i2c.instance_id);
+            return Err(error);
+        }
+        self.backends
+            .write()
+            .unwrap()
+            .insert(gpio.instance_id, backend);
         Ok(DeviceRegistration {
             kernel: self.clone(),
-            instance_ids: [i2c.instance_id, spi.instance_id],
+            instance_ids: [i2c.instance_id, spi.instance_id, gpio.instance_id],
             buses: BusNumbers {
                 i2c: i2c.bus_num,
                 spi: spi.bus_num,
@@ -220,6 +253,23 @@ impl Kernel {
         let result = ioctl(self.file.get_ref().as_raw_fd(), IOC_DESTROY, &mut destroy);
         self.backends.write().unwrap().remove(&instance_id);
         result
+    }
+
+    pub fn gpio_event(
+        &self,
+        instance_id: u32,
+        line: u8,
+        old_value: u8,
+        new_value: u8,
+    ) -> io::Result<()> {
+        let mut frame = vec![0_u8; KERNEL_HEADER_LEN + 4];
+        frame[..4].copy_from_slice(&KERNEL_MAGIC);
+        frame[4..6].copy_from_slice(&ABI_MAJOR.to_le_bytes());
+        frame[6..8].copy_from_slice(&5_u16.to_le_bytes());
+        frame[8..12].copy_from_slice(&instance_id.to_le_bytes());
+        frame[12..16].copy_from_slice(&4_u32.to_le_bytes());
+        frame[KERNEL_HEADER_LEN..].copy_from_slice(&[line, old_value, new_value, 0]);
+        write_frame(self.file.get_ref().as_raw_fd(), &frame)
     }
 }
 
@@ -291,6 +341,7 @@ impl Request {
         let operation = match u16::from_le_bytes(frame[6..8].try_into().unwrap()) {
             2 => Operation::I2cTransfer,
             3 => Operation::SpiMessage,
+            4 => Operation::GpioCommand,
             _ => return invalid("unsupported kernel operation"),
         };
         let payload = &frame[KERNEL_HEADER_LEN..];
@@ -339,6 +390,22 @@ impl Request {
                     chip_select: request.chip_select,
                     mode: request.mode,
                     segments,
+                }
+            }
+            Operation::GpioCommand => {
+                if payload.len() != 4
+                    || payload[0] < rp_extio_wire::GPIO_GET
+                    || payload[0] > rp_extio_wire::GPIO_GET_DIRECTION
+                    || payload[1] >= RegistrationConfig::PICO2.gpio_lines as u8
+                    || payload[2] > 1
+                    || payload[3] != 0
+                {
+                    return invalid("invalid GPIO command payload");
+                }
+                Transaction::Gpio {
+                    command: payload[0],
+                    line: payload[1],
+                    value: payload[2],
                 }
             }
             Operation::Hello => unreachable!(),
@@ -409,6 +476,19 @@ impl Request {
                     payload.extend_from_slice(&speed.to_le_bytes());
                 }
                 payload.extend_from_slice(&reply.data);
+                Some(payload)
+            }
+            Transaction::Gpio { .. } => {
+                if reply.completed != 1
+                    || reply.data.len() != 1
+                    || reply.data[0] > 1
+                    || !reply.effective_speeds.is_empty()
+                {
+                    return None;
+                }
+                let mut payload = reply.completed.to_le_bytes().to_vec();
+                payload.push(reply.data[0]);
+                payload.extend_from_slice(&[0; 3]);
                 Some(payload)
             }
         }
@@ -502,6 +582,31 @@ mod tests {
     }
 
     #[test]
+    fn decodes_gpio_request_and_encodes_reply() {
+        let request = Request::decode(&frame(
+            Operation::GpioCommand as u16,
+            &[rp_extio_wire::GPIO_DIRECTION_OUTPUT, 3, 1, 0],
+        ))
+        .unwrap();
+        assert_eq!(
+            request.transaction,
+            Transaction::Gpio {
+                command: rp_extio_wire::GPIO_DIRECTION_OUTPUT,
+                line: 3,
+                value: 1,
+            }
+        );
+        let reply = request.encode_reply(BackendReply {
+            status: Status::Ok as i32,
+            completed: 1,
+            data: vec![0],
+            effective_speeds: vec![],
+        });
+        assert_eq!(&reply[24..28], &0_i32.to_le_bytes());
+        assert_eq!(&reply[KERNEL_HEADER_LEN..], &[1, 0, 0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn rejects_malformed_frames_and_backend_replies() {
         let mut bad_header = frame(2, &[0; 4]);
         bad_header[28] = 1;
@@ -521,5 +626,15 @@ mod tests {
             i32::from_le_bytes(reply[24..28].try_into().unwrap()),
             Status::BadFrame as i32
         );
+
+        for payload in [
+            &[rp_extio_wire::GPIO_GET, 0, 0][..],
+            &[rp_extio_wire::GPIO_GET, 17, 0, 0],
+            &[rp_extio_wire::GPIO_SNAPSHOT, 0, 0, 0],
+            &[rp_extio_wire::GPIO_GET, 0, 2, 0],
+            &[rp_extio_wire::GPIO_GET, 0, 0, 1],
+        ] {
+            assert!(Request::decode(&frame(Operation::GpioCommand as u16, payload)).is_err());
+        }
     }
 }

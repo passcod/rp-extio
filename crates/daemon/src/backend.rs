@@ -35,6 +35,11 @@ pub enum Transaction {
         mode: u16,
         segments: Vec<SpiSegment>,
     },
+    Gpio {
+        command: u8,
+        line: u8,
+        value: u8,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

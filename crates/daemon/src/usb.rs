@@ -10,7 +10,8 @@ use nusb::{
     transfer::{Buffer, Bulk, Direction, In, Out},
 };
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_I2C, CAP_SPI, MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN,
+    UsbHeader,
 };
 use std::{
     collections::HashMap,
@@ -30,6 +31,7 @@ const USB_DEADLINE: Duration = Duration::from_secs(6);
 struct ConnectedDevice {
     backend: Arc<UsbBackend>,
     registration: DeviceRegistration,
+    gpio_poll: tokio::task::JoinHandle<()>,
 }
 
 pub async fn run(kernel: Arc<Kernel>) -> io::Result<()> {
@@ -94,11 +96,19 @@ async fn try_connect(
     };
     match kernel.register_device(backend.clone(), config) {
         Ok(registration) => {
+            let gpio_instance_id = registration.gpio_instance_id();
+            let gpio_poll = tokio::spawn(poll_gpio(
+                backend.clone(),
+                kernel.clone(),
+                gpio_instance_id,
+                config.gpio_lines,
+            ));
             devices.insert(
                 id,
                 ConnectedDevice {
                     backend,
                     registration,
+                    gpio_poll,
                 },
             );
         }
@@ -114,8 +124,53 @@ async fn try_connect(
 
 async fn remove_device(devices: &mut HashMap<DeviceId, ConnectedDevice>, id: &DeviceId) {
     if let Some(device) = devices.remove(id) {
+        device.gpio_poll.abort();
         device.backend.disconnect().await;
         let _ = device.registration.destroy();
+    }
+}
+
+async fn poll_gpio(backend: Arc<UsbBackend>, kernel: Arc<Kernel>, instance_id: u32, lines: u16) {
+    let mut previous: Option<u32> = None;
+    let mut interval = tokio::time::interval(Duration::from_millis(10));
+    loop {
+        interval.tick().await;
+        let reply = backend
+            .transact(Transaction::Gpio {
+                command: rp_extio_wire::GPIO_SNAPSHOT,
+                line: 0,
+                value: 0,
+            })
+            .await;
+        if reply.status != Status::Ok as i32
+            || reply.completed != lines as u32
+            || reply.data.len() != 4
+        {
+            backend.fail();
+            return;
+        }
+        let values = u32::from_le_bytes(reply.data.try_into().unwrap());
+        if let Some(old) = previous {
+            let mut changed = (old ^ values) & ((1_u32 << lines) - 1);
+            while changed != 0 {
+                let line = changed.trailing_zeros() as u8;
+                let mask = 1_u32 << line;
+                if kernel
+                    .gpio_event(
+                        instance_id,
+                        line,
+                        u8::from(old & mask != 0),
+                        u8::from(values & mask != 0),
+                    )
+                    .is_err()
+                {
+                    backend.fail();
+                    return;
+                }
+                changed &= !mask;
+            }
+        }
+        previous = Some(values);
     }
 }
 
@@ -423,6 +478,11 @@ fn encode_transaction(transaction: &Transaction) -> io::Result<(Operation, Vec<u
             }
             Ok((Operation::SpiMessage, payload))
         }
+        Transaction::Gpio {
+            command,
+            line,
+            value,
+        } => Ok((Operation::GpioCommand, vec![*command, *line, *value, 0])),
     }
 }
 
@@ -481,6 +541,32 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
                 effective_speeds,
             })
         }
+        Transaction::Gpio { command, .. } => {
+            if *command == rp_extio_wire::GPIO_SNAPSHOT {
+                if reply.payload.len() != 8 {
+                    return Err(invalid("invalid GPIO snapshot reply"));
+                }
+                return Ok(BackendReply {
+                    status: Status::Ok as i32,
+                    completed,
+                    data: reply.payload[4..8].to_vec(),
+                    effective_speeds: Vec::new(),
+                });
+            }
+            if completed != 1
+                || reply.payload.len() != 8
+                || reply.payload[4] > 1
+                || reply.payload[5..8] != [0; 3]
+            {
+                return Err(invalid("invalid successful GPIO reply"));
+            }
+            Ok(BackendReply {
+                status: Status::Ok as i32,
+                completed,
+                data: vec![reply.payload[4]],
+                effective_speeds: Vec::new(),
+            })
+        }
     }
 }
 
@@ -489,6 +575,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
     let mut general = false;
     let mut i2c_speed = None;
     let mut spi = None;
+    let mut gpio_lines = None;
     while offset < payload.len() {
         if payload.len() - offset < 4 {
             return Err(invalid("truncated capability record"));
@@ -548,6 +635,18 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
                 }
                 spi = Some((mode_bits, minimum, maximum, value[1] as u16));
             }
+            CAP_GPIO => {
+                if gpio_lines.is_some()
+                    || value.len() < 4
+                    || value[0] == 0
+                    || value[1..4] != [0; 3]
+                    || value.len() != 4 + value[0] as usize
+                    || value[4..] != [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
+                {
+                    return Err(invalid("invalid GPIO capability"));
+                }
+                gpio_lines = Some(value[0] as u16);
+            }
             _ => {}
         }
     }
@@ -562,6 +661,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
         spi_min_speed_hz,
         spi_max_speed_hz,
         spi_chip_selects,
+        gpio_lines: gpio_lines.ok_or_else(|| invalid("GPIO capability missing"))?,
     })
 }
 
@@ -606,6 +706,10 @@ mod tests {
         payload.extend_from_slice(&0x4f_u16.to_le_bytes());
         payload.extend_from_slice(&50_000_u32.to_le_bytes());
         payload.extend_from_slice(&20_000_000_u32.to_le_bytes());
+        payload.extend_from_slice(&CAP_GPIO.to_le_bytes());
+        payload.extend_from_slice(&21_u16.to_le_bytes());
+        payload.extend_from_slice(&[17, 0, 0, 0]);
+        payload.extend_from_slice(&rp_extio_firmware_gpio_pins());
         assert_eq!(
             parse_capabilities(&payload).unwrap(),
             RegistrationConfig::PICO2
@@ -667,8 +771,87 @@ mod tests {
     }
 
     #[test]
+    fn gpio_transaction_and_reply_codecs_validate_commands_and_snapshots() {
+        let command = Transaction::Gpio {
+            command: rp_extio_wire::GPIO_GET,
+            line: 4,
+            value: 0,
+        };
+        assert_eq!(
+            encode_transaction(&command).unwrap(),
+            (
+                Operation::GpioCommand,
+                vec![rp_extio_wire::GPIO_GET, 4, 0, 0]
+            )
+        );
+        let reply = decode_reply(
+            &command,
+            UsbReply {
+                header: UsbHeader {
+                    operation: Operation::GpioCommand,
+                    reply: true,
+                    request_id: 8,
+                    payload_len: 8,
+                    status: Status::Ok,
+                },
+                payload: vec![1, 0, 0, 0, 1, 0, 0, 0],
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.completed, 1);
+        assert_eq!(reply.data, [1]);
+
+        let snapshot = Transaction::Gpio {
+            command: rp_extio_wire::GPIO_SNAPSHOT,
+            line: 0,
+            value: 0,
+        };
+        let reply = decode_reply(
+            &snapshot,
+            UsbReply {
+                header: UsbHeader {
+                    operation: Operation::GpioCommand,
+                    reply: true,
+                    request_id: 9,
+                    payload_len: 8,
+                    status: Status::Ok,
+                },
+                payload: vec![17, 0, 0, 0, 0x34, 0x12, 0, 0],
+            },
+        )
+        .unwrap();
+        assert_eq!(reply.completed, 17);
+        assert_eq!(reply.data, [0x34, 0x12, 0, 0]);
+
+        let malformed = UsbReply {
+            header: UsbHeader {
+                operation: Operation::GpioCommand,
+                reply: true,
+                request_id: 10,
+                payload_len: 8,
+                status: Status::Ok,
+            },
+            payload: vec![1, 0, 0, 0, 1, 1, 0, 0],
+        };
+        assert!(decode_reply(&command, malformed).is_err());
+    }
+
+    #[test]
     fn rejects_missing_and_malformed_capabilities() {
         assert!(parse_capabilities(&[]).is_err());
         assert!(parse_capabilities(&[1, 0, 8, 0, 1]).is_err());
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&CAP_GPIO.to_le_bytes());
+        payload.extend_from_slice(&21_u16.to_le_bytes());
+        payload.extend_from_slice(&[17, 0, 0, 0]);
+        let mut pins = rp_extio_firmware_gpio_pins();
+        pins[0] = 0;
+        payload.extend_from_slice(&pins);
+        assert!(parse_capabilities(&payload).is_err());
+    }
+
+    fn rp_extio_firmware_gpio_pins() -> [u8; 17] {
+        [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
     }
 }

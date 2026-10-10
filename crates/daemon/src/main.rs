@@ -126,6 +126,41 @@ async fn serve_simulation(socket: PathBuf, kernel: Arc<Kernel>) -> std::io::Resu
                             },
                         }
                     }
+                    Ok(Command::SetInput {
+                        device,
+                        line,
+                        value,
+                    }) => {
+                        let registrations = registrations.lock().await;
+                        match registrations.get(&device) {
+                            Some(registration) => {
+                                match simulator.set_input(&device, line, value).await {
+                                    Ok(old) => {
+                                        let result = if old == value {
+                                            Ok(())
+                                        } else {
+                                            kernel.gpio_event(
+                                                registration.gpio_instance_id(),
+                                                line,
+                                                old,
+                                                value,
+                                            )
+                                        };
+                                        match result {
+                                            Ok(()) => sim::Response::Ok,
+                                            Err(error) => sim::Response::Error {
+                                                message: error.to_string(),
+                                            },
+                                        }
+                                    }
+                                    Err(message) => sim::Response::Error { message },
+                                }
+                            }
+                            None => sim::Response::Error {
+                                message: "unknown device".into(),
+                            },
+                        }
+                    }
                     Ok(command) => simulator.command(command).await,
                     Err(error) => sim::Response::Error {
                         message: error.to_string(),

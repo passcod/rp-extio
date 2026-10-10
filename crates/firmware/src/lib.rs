@@ -1,8 +1,8 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_I2C, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD, Operation, SPI_CS_CHANGE,
-    SpiRequest, Status, UsbHeader, WireError, Writer,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD, Operation,
+    SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError, Writer,
 };
 
 pub const I2C_BUS_ID: u8 = 0;
@@ -14,6 +14,7 @@ pub const SPI_CHIP_SELECTS: u8 = 2;
 pub const UART_TX_PIN: u8 = 0;
 pub const UART_RX_PIN: u8 = 1;
 pub const UART_BAUD: u32 = 115_200;
+pub const GPIO_PINS: [u8; 17] = [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28];
 
 pub const SPI_CPHA: u16 = 1 << 0;
 pub const SPI_CPOL: u16 = 1 << 1;
@@ -68,6 +69,10 @@ pub trait Board {
     ) -> Result<SpiOutcome, BusFailure>;
 
     fn disconnect(&mut self) {}
+
+    fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure>;
+
+    fn gpio_snapshot(&mut self) -> Result<u32, BusFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -90,6 +95,7 @@ pub fn dispatch<B: Board>(
         Operation::Hello => hello(payload, response),
         Operation::I2cTransfer => i2c(payload, board, response),
         Operation::SpiMessage => spi(payload, board, response),
+        Operation::GpioCommand => gpio(payload, board, response),
     };
 
     match result {
@@ -154,7 +160,32 @@ fn hello(payload: &[u8], response: &mut [u8]) -> Result<usize, BusFailure> {
         out.u32(UART_BAUD)?;
         out.u32(0)
     })?;
+    record(&mut out, CAP_GPIO, 21, |out| {
+        out.push(GPIO_PINS.len() as u8)?;
+        out.push(0)?;
+        out.u16(0)?;
+        out.extend(&GPIO_PINS)
+    })?;
     Ok(out.len())
+}
+
+fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
+    if payload.len() != 4 || payload[2] > 1 || payload[3] != 0 {
+        return Err(BusFailure::new(Status::BadFrame, 0));
+    }
+    if payload[0] == rp_extio_wire::GPIO_SNAPSHOT {
+        if payload[1] != 0 || payload[2] != 0 {
+            return Err(BusFailure::new(Status::BadFrame, 0));
+        }
+        response[..4].copy_from_slice(&(GPIO_PINS.len() as u32).to_le_bytes());
+        response[4..8].copy_from_slice(&board.gpio_snapshot()?.to_le_bytes());
+        return Ok(8);
+    }
+    let value = board.gpio_command(payload[0], payload[1], payload[2])?;
+    response[..4].copy_from_slice(&1_u32.to_le_bytes());
+    response[4] = value;
+    response[5..8].fill(0);
+    Ok(8)
 }
 
 fn record(
@@ -244,7 +275,11 @@ mod tests {
 
     use super::*;
 
-    struct Stub;
+    #[derive(Default)]
+    struct Stub {
+        gpio_values: u32,
+        gpio_outputs: u32,
+    }
 
     impl Board for Stub {
         fn i2c_transfer(
@@ -279,6 +314,35 @@ mod tests {
             outcome.completed_bytes = offset as u32;
             Ok(outcome)
         }
+
+        fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {
+            if line as usize >= GPIO_PINS.len() {
+                return Err(BusFailure::new(Status::Unsupported, 0));
+            }
+            let mask = 1_u32 << line;
+            match command {
+                rp_extio_wire::GPIO_GET => Ok(u8::from(self.gpio_values & mask != 0)),
+                rp_extio_wire::GPIO_SET if self.gpio_outputs & mask != 0 => {
+                    self.gpio_values = (self.gpio_values & !mask) | (u32::from(value) << line);
+                    Ok(value)
+                }
+                rp_extio_wire::GPIO_DIRECTION_INPUT => {
+                    self.gpio_outputs &= !mask;
+                    Ok(1)
+                }
+                rp_extio_wire::GPIO_DIRECTION_OUTPUT => {
+                    self.gpio_outputs |= mask;
+                    self.gpio_values = (self.gpio_values & !mask) | (u32::from(value) << line);
+                    Ok(0)
+                }
+                rp_extio_wire::GPIO_GET_DIRECTION => Ok(u8::from(self.gpio_outputs & mask == 0)),
+                _ => Err(BusFailure::new(Status::Unsupported, 0)),
+            }
+        }
+
+        fn gpio_snapshot(&mut self) -> Result<u32, BusFailure> {
+            Ok(self.gpio_values)
+        }
     }
 
     fn header(operation: Operation, len: usize) -> UsbHeader {
@@ -292,9 +356,14 @@ mod tests {
     }
 
     #[test]
-    fn hello_reports_bus_and_uart_capabilities() {
+    fn hello_reports_bus_uart_and_gpio_capabilities() {
         let mut response = [0; MAX_PAYLOAD];
-        let reply = dispatch(header(Operation::Hello, 0), &[], &mut Stub, &mut response);
+        let reply = dispatch(
+            header(Operation::Hello, 0),
+            &[],
+            &mut Stub::default(),
+            &mut response,
+        );
         assert_eq!(reply.header.status, Status::Ok);
         assert_eq!(&response[..2], &CAP_GENERAL.to_le_bytes());
         assert!(
@@ -306,6 +375,11 @@ mod tests {
             response[..reply.payload_len]
                 .windows(2)
                 .any(|window| window == CAP_UART.to_le_bytes())
+        );
+        assert!(
+            response[..reply.payload_len]
+                .windows(2)
+                .any(|window| window == CAP_GPIO.to_le_bytes())
         );
     }
 
@@ -320,10 +394,64 @@ mod tests {
         let reply = dispatch(
             header(Operation::I2cTransfer, request.len()),
             &request,
-            &mut Stub,
+            &mut Stub::default(),
             &mut response,
         );
         assert_eq!(reply.header.status, Status::Ok);
         assert_eq!(&response[..6], &[1, 0, 0, 0, 0xa5, 0xa5]);
+    }
+
+    #[test]
+    fn gpio_dispatches_commands_and_snapshots() {
+        let mut board = Stub::default();
+        let mut response = [0; MAX_PAYLOAD];
+
+        let reply = dispatch(
+            header(Operation::GpioCommand, 4),
+            &[rp_extio_wire::GPIO_DIRECTION_OUTPUT, 3, 1, 0],
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(reply.header.status, Status::Ok);
+        assert_eq!(&response[..8], &[1, 0, 0, 0, 0, 0, 0, 0]);
+
+        let reply = dispatch(
+            header(Operation::GpioCommand, 4),
+            &[rp_extio_wire::GPIO_GET, 3, 0, 0],
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(reply.header.status, Status::Ok);
+        assert_eq!(&response[..8], &[1, 0, 0, 0, 1, 0, 0, 0]);
+
+        let reply = dispatch(
+            header(Operation::GpioCommand, 4),
+            &[rp_extio_wire::GPIO_SNAPSHOT, 0, 0, 0],
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(reply.header.status, Status::Ok);
+        assert_eq!(&response[..4], &(GPIO_PINS.len() as u32).to_le_bytes());
+        assert_eq!(&response[4..8], &(1_u32 << 3).to_le_bytes());
+    }
+
+    #[test]
+    fn gpio_rejects_malformed_payloads() {
+        let mut response = [0; MAX_PAYLOAD];
+        let mut board = Stub::default();
+        for payload in [
+            &[rp_extio_wire::GPIO_GET, 0, 0][..],
+            &[rp_extio_wire::GPIO_GET, 0, 2, 0],
+            &[rp_extio_wire::GPIO_GET, 0, 0, 1],
+            &[rp_extio_wire::GPIO_SNAPSHOT, 1, 0, 0],
+        ] {
+            let reply = dispatch(
+                header(Operation::GpioCommand, payload.len()),
+                payload,
+                &mut board,
+                &mut response,
+            );
+            assert_eq!(reply.header.status, Status::BadFrame);
+        }
     }
 }

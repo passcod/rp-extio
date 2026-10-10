@@ -2,6 +2,7 @@
 #include <linux/completion.h>
 #include <linux/build_bug.h>
 #include <linux/fs.h>
+#include <linux/gpio/driver.h>
 #include <linux/i2c.h>
 #include <linux/idr.h>
 #include <linux/jiffies.h>
@@ -9,11 +10,14 @@
 #include <linux/miscdevice.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/irq.h>
+#include <linux/irqdomain.h>
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
+#include <linux/version.h>
 
 #include "rp_extio_uapi.h"
 
@@ -23,6 +27,15 @@
 
 #define RPE_OP_I2C 2
 #define RPE_OP_SPI 3
+#define RPE_OP_GPIO 4
+#define RPE_OP_GPIO_EVENT 5
+
+#define RPE_GPIO_GET 1
+#define RPE_GPIO_SET 2
+#define RPE_GPIO_DIRECTION_INPUT 3
+#define RPE_GPIO_DIRECTION_OUTPUT 4
+#define RPE_GPIO_GET_DIRECTION 5
+#define RPE_GPIO_LINES 17
 
 #define RPE_STATUS_OK 0
 #define RPE_STATUS_NACK 1
@@ -42,6 +55,7 @@
 enum rpe_instance_type {
 	RPE_INSTANCE_I2C,
 	RPE_INSTANCE_SPI,
+	RPE_INSTANCE_GPIO,
 };
 
 struct rpe_session;
@@ -63,6 +77,12 @@ struct rpe_instance {
 			struct spi_device **children;
 			u16 chip_selects;
 		} spi;
+		struct {
+			struct gpio_chip chip;
+			spinlock_t irq_lock;
+			unsigned long irq_enabled;
+			u32 irq_type[RPE_GPIO_LINES];
+		} gpio;
 	};
 };
 
@@ -99,6 +119,7 @@ static_assert(sizeof(struct rpe_ioc_version) == 16);
 static_assert(sizeof(struct rpe_ioc_create_i2c) == 16);
 static_assert(sizeof(struct rpe_ioc_create_spi) == 24);
 static_assert(sizeof(struct rpe_ioc_destroy) == 8);
+static_assert(sizeof(struct rpe_ioc_create_gpio) == 16);
 
 static void rpe_put16(u8 *p, u16 value)
 {
@@ -407,6 +428,135 @@ finish:
 	return 0;
 }
 
+static int rpe_gpio_call(struct rpe_instance *instance, u8 command,
+			 unsigned int offset, int value)
+{
+	struct rpe_request *request;
+	int ret;
+
+	if (offset >= instance->gpio.chip.ngpio)
+		return -EINVAL;
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&request->node);
+	request->request[RPE_HEADER_SIZE] = command;
+	request->request[RPE_HEADER_SIZE + 1] = offset;
+	request->request[RPE_HEADER_SIZE + 2] = !!value;
+	request->instance = instance;
+
+	mutex_lock(&instance->transaction_lock);
+	rpe_make_header(request, RPE_OP_GPIO, 4);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		if (request->reply_len != 8 || rpe_get32(request->reply) != 1 ||
+		    request->reply[4] > 1 || request->reply[5] || request->reply[6] ||
+		    request->reply[7])
+			ret = -EPROTO;
+		else
+			ret = request->reply[4];
+	}
+	mutex_unlock(&instance->transaction_lock);
+	kfree(request);
+	return ret;
+}
+
+static int rpe_gpio_get_direction(struct gpio_chip *chip, unsigned int offset)
+{
+	return rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_GET_DIRECTION,
+			     offset, 0);
+}
+
+static int rpe_gpio_direction_input(struct gpio_chip *chip, unsigned int offset)
+{
+	int ret = rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_DIRECTION_INPUT,
+				 offset, 0);
+
+	return ret < 0 ? ret : 0;
+}
+
+static int rpe_gpio_direction_output(struct gpio_chip *chip, unsigned int offset,
+				     int value)
+{
+	int ret = rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_DIRECTION_OUTPUT,
+				 offset, value);
+
+	return ret < 0 ? ret : 0;
+}
+
+static int rpe_gpio_get(struct gpio_chip *chip, unsigned int offset)
+{
+	return rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_GET, offset, 0);
+}
+
+static int rpe_gpio_set_result(struct gpio_chip *chip, unsigned int offset, int value)
+{
+	int ret = rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_SET, offset, value);
+
+	return ret < 0 ? ret : 0;
+}
+
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 17, 0)
+static int rpe_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+{
+	return rpe_gpio_set_result(chip, offset, value);
+}
+#else
+static void rpe_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
+{
+	rpe_gpio_set_result(chip, offset, value);
+}
+#endif
+
+static void rpe_gpio_irq_mask(struct irq_data *data)
+{
+	struct gpio_chip *chip = irq_data_get_irq_chip_data(data);
+	struct rpe_instance *instance = gpiochip_get_data(chip);
+	unsigned long flags;
+
+	spin_lock_irqsave(&instance->gpio.irq_lock, flags);
+	clear_bit(irqd_to_hwirq(data), &instance->gpio.irq_enabled);
+	spin_unlock_irqrestore(&instance->gpio.irq_lock, flags);
+	gpiochip_disable_irq(chip, irqd_to_hwirq(data));
+}
+
+static void rpe_gpio_irq_unmask(struct irq_data *data)
+{
+	struct gpio_chip *chip = irq_data_get_irq_chip_data(data);
+	struct rpe_instance *instance = gpiochip_get_data(chip);
+	unsigned long flags;
+
+	gpiochip_enable_irq(chip, irqd_to_hwirq(data));
+	spin_lock_irqsave(&instance->gpio.irq_lock, flags);
+	set_bit(irqd_to_hwirq(data), &instance->gpio.irq_enabled);
+	spin_unlock_irqrestore(&instance->gpio.irq_lock, flags);
+}
+
+static int rpe_gpio_irq_set_type(struct irq_data *data, unsigned int type)
+{
+	struct gpio_chip *chip = irq_data_get_irq_chip_data(data);
+	struct rpe_instance *instance = gpiochip_get_data(chip);
+	unsigned int offset = irqd_to_hwirq(data);
+	unsigned long flags;
+
+	if (type != IRQ_TYPE_EDGE_RISING && type != IRQ_TYPE_EDGE_FALLING &&
+	    type != IRQ_TYPE_EDGE_BOTH)
+		return -EINVAL;
+	spin_lock_irqsave(&instance->gpio.irq_lock, flags);
+	instance->gpio.irq_type[offset] = type;
+	spin_unlock_irqrestore(&instance->gpio.irq_lock, flags);
+	return 0;
+}
+
+static const struct irq_chip rpe_gpio_irq_chip = {
+	.name = "rp-extio-gpio",
+	.irq_mask = rpe_gpio_irq_mask,
+	.irq_unmask = rpe_gpio_irq_unmask,
+	.irq_set_type = rpe_gpio_irq_set_type,
+	.flags = IRQCHIP_IMMUTABLE,
+	GPIOCHIP_IRQ_RESOURCE_HELPERS,
+};
+
 static struct rpe_request *rpe_next_request(struct rpe_session *session)
 {
 	struct rpe_request *request;
@@ -487,6 +637,45 @@ static ssize_t rpe_write(struct file *file, const char __user *buffer,
 	}
 
 	mutex_lock(&session->lock);
+	if (operation == RPE_OP_GPIO_EVENT) {
+		struct rpe_instance *instance;
+		u8 line, old_value, new_value;
+		unsigned long flags;
+		u32 type;
+		bool enabled, trigger;
+
+		if (request_id || status || payload_len != 4 || frame[RPE_HEADER_SIZE + 3]) {
+			ret = -EPROTO;
+			goto unlock_write;
+		}
+		line = frame[RPE_HEADER_SIZE];
+		old_value = frame[RPE_HEADER_SIZE + 1];
+		new_value = frame[RPE_HEADER_SIZE + 2];
+		if (old_value > 1 || new_value > 1 || old_value == new_value) {
+			ret = -EPROTO;
+			goto unlock_write;
+		}
+		ret = -ENOENT;
+		list_for_each_entry(instance, &session->instances, node) {
+			if (instance->id != instance_id || instance->type != RPE_INSTANCE_GPIO)
+				continue;
+			if (line >= instance->gpio.chip.ngpio) {
+				ret = -EINVAL;
+				break;
+			}
+			spin_lock_irqsave(&instance->gpio.irq_lock, flags);
+			enabled = test_bit(line, &instance->gpio.irq_enabled);
+			type = instance->gpio.irq_type[line];
+			spin_unlock_irqrestore(&instance->gpio.irq_lock, flags);
+			trigger = (new_value && (type & IRQ_TYPE_EDGE_RISING)) ||
+				  (!new_value && (type & IRQ_TYPE_EDGE_FALLING));
+			if (enabled && trigger)
+				generic_handle_domain_irq(instance->gpio.chip.irq.domain, line);
+			ret = count;
+			break;
+		}
+		goto unlock_write;
+	}
 	list_for_each_entry(request, &session->requests, node) {
 		if (!request->delivered || request->id != request_id)
 			continue;
@@ -502,6 +691,7 @@ static ssize_t rpe_write(struct file *file, const char __user *buffer,
 		ret = count;
 		break;
 	}
+unlock_write:
 	mutex_unlock(&session->lock);
 free_frame:
 	kfree(frame);
@@ -531,15 +721,82 @@ static void rpe_destroy_instance(struct rpe_instance *instance)
 		list_del_init(&instance->node);
 	if (instance->type == RPE_INSTANCE_I2C) {
 		i2c_del_adapter(&instance->i2c.adapter);
-	} else {
+	} else if (instance->type == RPE_INSTANCE_SPI) {
 		for (i = 0; i < instance->spi.chip_selects; i++)
 			if (instance->spi.children[i])
 				spi_unregister_device(instance->spi.children[i]);
 		spi_unregister_controller(instance->spi.controller);
 		kfree(instance->spi.children);
+	} else {
+		gpiochip_remove(&instance->gpio.chip);
 	}
 	ida_free(&instance->session->instance_ids, instance->id);
 	kfree(instance);
+}
+
+static const char *const rpe_gpio_names[RPE_GPIO_LINES] = {
+	"GP2", "GP3", "GP6", "GP7", "GP8", "GP9", "GP10", "GP11", "GP12",
+	"GP13", "GP14", "GP15", "GP20", "GP22", "GP26", "GP27", "GP28",
+};
+
+static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
+{
+	struct rpe_ioc_create_gpio create;
+	struct rpe_instance *instance;
+	struct gpio_irq_chip *girq;
+	int ret;
+
+	if (copy_from_user(&create, argument, sizeof(create)))
+		return -EFAULT;
+	if (create.lines != RPE_GPIO_LINES || create.reserved || create.features ||
+	    create.reserved2)
+		return -EINVAL;
+	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	if (!instance)
+		return -ENOMEM;
+	instance->session = session;
+	instance->type = RPE_INSTANCE_GPIO;
+	mutex_init(&instance->transaction_lock);
+	spin_lock_init(&instance->gpio.irq_lock);
+	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
+	if ((int)instance->id < 0) {
+		ret = (int)instance->id;
+		goto free_instance;
+	}
+	instance->gpio.chip.label = "rp-extio virtual GPIO";
+	instance->gpio.chip.parent = rpe_misc.this_device;
+	instance->gpio.chip.owner = THIS_MODULE;
+	instance->gpio.chip.get_direction = rpe_gpio_get_direction;
+	instance->gpio.chip.direction_input = rpe_gpio_direction_input;
+	instance->gpio.chip.direction_output = rpe_gpio_direction_output;
+	instance->gpio.chip.get = rpe_gpio_get;
+	instance->gpio.chip.set = rpe_gpio_set;
+	instance->gpio.chip.base = -1;
+	instance->gpio.chip.ngpio = RPE_GPIO_LINES;
+	instance->gpio.chip.names = rpe_gpio_names;
+	instance->gpio.chip.can_sleep = true;
+	girq = &instance->gpio.chip.irq;
+	gpio_irq_chip_set_chip(girq, &rpe_gpio_irq_chip);
+	girq->handler = handle_edge_irq;
+	girq->default_type = IRQ_TYPE_NONE;
+	girq->parent_handler = NULL;
+	girq->num_parents = 0;
+	ret = gpiochip_add_data(&instance->gpio.chip, instance);
+	if (ret)
+		goto free_id;
+	list_add_tail(&instance->node, &session->instances);
+	create.instance_id = instance->id;
+	if (copy_to_user(argument, &create, sizeof(create))) {
+		ret = -EFAULT;
+		rpe_destroy_instance(instance);
+		return ret;
+	}
+	return 0;
+free_id:
+	ida_free(&session->instance_ids, instance->id);
+free_instance:
+	kfree(instance);
+	return ret;
 }
 
 static int rpe_create_i2c(struct rpe_session *session, void __user *argument)
@@ -702,6 +959,9 @@ static long rpe_ioctl(struct file *file, unsigned int command, unsigned long arg
 		break;
 	case RPE_IOC_CREATE_SPI:
 		ret = rpe_create_spi(session, argument);
+		break;
+	case RPE_IOC_CREATE_GPIO:
+		ret = rpe_create_gpio(session, argument);
 		break;
 	case RPE_IOC_DESTROY:
 		if (copy_from_user(&destroy, argument, sizeof(destroy))) {

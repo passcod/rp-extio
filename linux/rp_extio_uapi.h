@@ -6,7 +6,7 @@
 #include <linux/types.h>
 
 #define RPE_ABI_MAJOR 1
-#define RPE_ABI_MINOR 0
+#define RPE_ABI_MINOR 1
 #define RPE_MAX_PAYLOAD 4096
 #define RPE_MAX_DATA 3584
 #define RPE_MAX_I2C_MSGS 16
@@ -41,10 +41,19 @@ struct rpe_ioc_destroy {
 	__u32 reserved;
 };
 
+struct rpe_ioc_create_gpio {
+	__u16 lines;
+	__u16 reserved;
+	__u32 instance_id;
+	__u32 features;
+	__u32 reserved2;
+};
+
 #define RPE_IOC_MAGIC 'R'
 #define RPE_IOC_GET_VERSION _IOR(RPE_IOC_MAGIC, 0x00, struct rpe_ioc_version)
 #define RPE_IOC_CREATE_I2C _IOWR(RPE_IOC_MAGIC, 0x01, struct rpe_ioc_create_i2c)
 #define RPE_IOC_CREATE_SPI _IOWR(RPE_IOC_MAGIC, 0x02, struct rpe_ioc_create_spi)
 #define RPE_IOC_DESTROY _IOW(RPE_IOC_MAGIC, 0x03, struct rpe_ioc_destroy)
+#define RPE_IOC_CREATE_GPIO _IOWR(RPE_IOC_MAGIC, 0x04, struct rpe_ioc_create_gpio)
 
 #endif

@@ -1,12 +1,15 @@
-use embassy_rp::gpio::{Level, Output, OutputOpenDrain};
+use embassy_rp::gpio::{Flex, Level, Output, OutputOpenDrain};
 use embassy_rp::peripherals::{PIN_4, PIN_5, PIN_16, PIN_17, PIN_18, PIN_19, PIN_21, SPI0};
 use embassy_rp::spi::{Blocking, Config, Phase, Polarity, Spi};
 use embassy_rp::{Peri, pac};
 use rp_extio_firmware::{
-    Board, BusFailure, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ,
+    Board, BusFailure, GPIO_PINS, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ,
     SPI_MIN_SPEED_HZ, SPI_NO_CS, SpiOutcome, cumulative_spi_delay_ns,
 };
-use rp_extio_wire::{I2C_READ, I2C_TEN_BIT, I2cRequest, SpiRequest, Status};
+use rp_extio_wire::{
+    GPIO_DIRECTION_INPUT, GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET, I2C_READ,
+    I2C_TEN_BIT, I2cRequest, SpiRequest, Status,
+};
 
 const TRANSACTION_DEADLINE_US: u64 = 5_000_000;
 const I2C_HALF_PERIOD_US: u64 = 5;
@@ -18,6 +21,8 @@ pub struct Pico2Board<'d> {
     spi: Spi<'d, SPI0, Blocking>,
     chip_selects: [Output<'d>; 2],
     cs_active_high: [bool; 2],
+    gpio: [Flex<'d>; GPIO_PINS.len()],
+    gpio_outputs: u32,
 }
 
 impl<'d> Pico2Board<'d> {
@@ -31,6 +36,7 @@ impl<'d> Pico2Board<'d> {
         mosi: Peri<'d, PIN_19>,
         cs1: Peri<'d, PIN_21>,
         spi0: Peri<'d, SPI0>,
+        mut gpio: [Flex<'d>; GPIO_PINS.len()],
     ) -> Self {
         let mut sda = OutputOpenDrain::new(sda, Level::High);
         let mut scl = OutputOpenDrain::new(scl, Level::High);
@@ -39,12 +45,17 @@ impl<'d> Pico2Board<'d> {
 
         let spi = Spi::new_blocking(spi0, sck, mosi, miso, Config::default());
         let chip_selects = [Output::new(cs0, Level::High), Output::new(cs1, Level::High)];
+        for pin in &mut gpio {
+            pin.set_as_input();
+        }
         Self {
             sda,
             scl,
             spi,
             chip_selects,
             cs_active_high: [false; 2],
+            gpio,
+            gpio_outputs: 0,
         }
     }
 
@@ -411,5 +422,46 @@ impl Board for Pico2Board<'_> {
 
     fn disconnect(&mut self) {
         self.release_buses();
+    }
+
+    fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {
+        let index = line as usize;
+        let Some(pin) = self.gpio.get_mut(index) else {
+            return Err(BusFailure::new(Status::Unsupported, 0));
+        };
+        let mask = 1_u32 << index;
+        match command {
+            GPIO_GET => Ok(u8::from(pin.is_high())),
+            GPIO_SET => {
+                if self.gpio_outputs & mask == 0 {
+                    return Err(BusFailure::new(Status::Unsupported, 0));
+                }
+                pin.set_level(if value == 0 { Level::Low } else { Level::High });
+                Ok(value)
+            }
+            GPIO_DIRECTION_INPUT => {
+                pin.set_as_input();
+                self.gpio_outputs &= !mask;
+                Ok(1)
+            }
+            GPIO_DIRECTION_OUTPUT => {
+                pin.set_level(if value == 0 { Level::Low } else { Level::High });
+                pin.set_as_output();
+                self.gpio_outputs |= mask;
+                Ok(0)
+            }
+            GPIO_GET_DIRECTION => Ok(u8::from(self.gpio_outputs & mask == 0)),
+            _ => Err(BusFailure::new(Status::Unsupported, 0)),
+        }
+    }
+
+    fn gpio_snapshot(&mut self) -> Result<u32, BusFailure> {
+        let mut values = 0;
+        for (index, pin) in self.gpio.iter().enumerate() {
+            if pin.is_high() {
+                values |= 1 << index;
+            }
+        }
+        Ok(values)
     }
 }

@@ -15,6 +15,13 @@ pub const CAP_GENERAL: u16 = 1;
 pub const CAP_I2C: u16 = 2;
 pub const CAP_SPI: u16 = 3;
 pub const CAP_UART: u16 = 4;
+pub const CAP_GPIO: u16 = 5;
+pub const GPIO_GET: u8 = 1;
+pub const GPIO_SET: u8 = 2;
+pub const GPIO_DIRECTION_INPUT: u8 = 3;
+pub const GPIO_DIRECTION_OUTPUT: u8 = 4;
+pub const GPIO_GET_DIRECTION: u8 = 5;
+pub const GPIO_SNAPSHOT: u8 = 6;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -22,6 +29,7 @@ pub enum Operation {
     Hello = 1,
     I2cTransfer = 2,
     SpiMessage = 3,
+    GpioCommand = 4,
 }
 
 impl TryFrom<u8> for Operation {
@@ -31,6 +39,7 @@ impl TryFrom<u8> for Operation {
             1 => Ok(Self::Hello),
             2 => Ok(Self::I2cTransfer),
             3 => Ok(Self::SpiMessage),
+            4 => Ok(Self::GpioCommand),
             _ => Err(WireError::Unsupported),
         }
     }

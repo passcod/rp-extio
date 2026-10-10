@@ -6,7 +6,7 @@ mod pico2;
 use core::panic::PanicInfo;
 
 use embassy_futures::join::join;
-use embassy_rp::{bind_interrupts, peripherals, uart, usb};
+use embassy_rp::{bind_interrupts, gpio::Flex, peripherals, uart, usb};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State as CdcState};
 use embassy_usb::driver::Driver as UsbDriver;
 use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
@@ -161,6 +161,25 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         peripherals.PIN_19,
         peripherals.PIN_21,
         peripherals.SPI0,
+        [
+            Flex::new(peripherals.PIN_2),
+            Flex::new(peripherals.PIN_3),
+            Flex::new(peripherals.PIN_6),
+            Flex::new(peripherals.PIN_7),
+            Flex::new(peripherals.PIN_8),
+            Flex::new(peripherals.PIN_9),
+            Flex::new(peripherals.PIN_10),
+            Flex::new(peripherals.PIN_11),
+            Flex::new(peripherals.PIN_12),
+            Flex::new(peripherals.PIN_13),
+            Flex::new(peripherals.PIN_14),
+            Flex::new(peripherals.PIN_15),
+            Flex::new(peripherals.PIN_20),
+            Flex::new(peripherals.PIN_22),
+            Flex::new(peripherals.PIN_26),
+            Flex::new(peripherals.PIN_27),
+            Flex::new(peripherals.PIN_28),
+        ],
     );
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());
     join(
