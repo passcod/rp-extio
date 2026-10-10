@@ -26,6 +26,7 @@ pub struct RegistrationConfig {
     pub spi_max_speed_hz: u32,
     pub spi_chip_selects: u16,
     pub gpio_lines: u16,
+    pub gpio_pins: [u8; 17],
 }
 
 impl RegistrationConfig {
@@ -36,6 +37,7 @@ impl RegistrationConfig {
         spi_max_speed_hz: 20_000_000,
         spi_chip_selects: 2,
         gpio_lines: 17,
+        gpio_pins: [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28],
     };
 }
 
@@ -80,13 +82,15 @@ struct IocCreateGpio {
     instance_id: u32,
     features: u32,
     reserved2: u32,
+    pins: [u8; 17],
+    reserved3: [u8; 7],
 }
 
 const _: () = assert!(size_of::<IocVersion>() == 16);
 const _: () = assert!(size_of::<IocCreateI2c>() == 16);
 const _: () = assert!(size_of::<IocCreateSpi>() == 24);
 const _: () = assert!(size_of::<IocDestroy>() == 8);
-const _: () = assert!(size_of::<IocCreateGpio>() == 16);
+const _: () = assert!(size_of::<IocCreateGpio>() == 40);
 
 const IOC_GET_VERSION: libc::Ioctl = libc::_IOR::<IocVersion>(IOC_MAGIC, 0x00);
 const IOC_CREATE_I2C: libc::Ioctl = libc::_IOWR::<IocCreateI2c>(IOC_MAGIC, 0x01);
@@ -194,6 +198,8 @@ impl Kernel {
             instance_id: 0,
             features: 0,
             reserved2: 0,
+            pins: config.gpio_pins,
+            reserved3: [0; 7],
         };
         if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_GPIO, &mut gpio) {
             let _ = self.destroy_instance(spi.instance_id);

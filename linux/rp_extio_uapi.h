@@ -6,7 +6,7 @@
 #include <linux/types.h>
 
 #define RPE_ABI_MAJOR 1
-#define RPE_ABI_MINOR 1
+#define RPE_ABI_MINOR 2
 #define RPE_MAX_PAYLOAD 4096
 #define RPE_MAX_DATA 3584
 #define RPE_MAX_I2C_MSGS 16
@@ -47,6 +47,8 @@ struct rpe_ioc_create_gpio {
 	__u32 instance_id;
 	__u32 features;
 	__u32 reserved2;
+	__u8 pins[17];
+	__u8 reserved3[7];
 };
 
 #define RPE_IOC_MAGIC 'R'

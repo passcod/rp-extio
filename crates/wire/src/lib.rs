@@ -3,7 +3,7 @@
 pub const USB_MAGIC: [u8; 4] = *b"RPXB";
 pub const KERNEL_MAGIC: [u8; 4] = *b"RPKD";
 pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 1;
+pub const VERSION_MINOR: u8 = 2;
 pub const USB_HEADER_LEN: usize = 24;
 pub const KERNEL_HEADER_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 4096;

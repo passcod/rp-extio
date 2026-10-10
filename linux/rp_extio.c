@@ -17,6 +17,7 @@
 #include <linux/poll.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
+#include <linux/string.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/version.h>
@@ -85,6 +86,8 @@ struct rpe_instance {
 			unsigned long irq_enabled;
 			u32 irq_type[RPE_GPIO_LINES];
 			bool registering;
+			char names[RPE_GPIO_LINES][6];
+			const char *name_ptrs[RPE_GPIO_LINES];
 		} gpio;
 	};
 };
@@ -122,7 +125,7 @@ static_assert(sizeof(struct rpe_ioc_version) == 16);
 static_assert(sizeof(struct rpe_ioc_create_i2c) == 16);
 static_assert(sizeof(struct rpe_ioc_create_spi) == 24);
 static_assert(sizeof(struct rpe_ioc_destroy) == 8);
-static_assert(sizeof(struct rpe_ioc_create_gpio) == 16);
+static_assert(sizeof(struct rpe_ioc_create_gpio) == 40);
 
 static void rpe_put16(u8 *p, u16 value)
 {
@@ -744,23 +747,25 @@ static void rpe_destroy_instance(struct rpe_instance *instance)
 	kfree(instance);
 }
 
-static const char *const rpe_gpio_names[RPE_GPIO_LINES] = {
-	"GP2", "GP3", "GP6", "GP7", "GP8", "GP9", "GP10", "GP11", "GP12",
-	"GP13", "GP14", "GP15", "GP20", "GP22", "GP26", "GP27", "GP28",
-};
-
 static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 {
 	struct rpe_ioc_create_gpio create;
 	struct rpe_instance *instance;
 	struct gpio_irq_chip *girq;
-	int ret;
+	int i, j, ret;
 
 	if (copy_from_user(&create, argument, sizeof(create)))
 		return -EFAULT;
 	if (create.lines != RPE_GPIO_LINES || create.reserved || create.features ||
-	    create.reserved2)
+	    create.reserved2 || memchr_inv(create.reserved3, 0, sizeof(create.reserved3)))
 		return -EINVAL;
+	for (i = 0; i < create.lines; i++) {
+		if (create.pins[i] > 28 || (create.pins[i] > 22 && create.pins[i] < 26))
+			return -EINVAL;
+		for (j = 0; j < i; j++)
+			if (create.pins[i] == create.pins[j])
+				return -EINVAL;
+	}
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
 	if (!instance)
 		return -ENOMEM;
@@ -784,7 +789,12 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 	instance->gpio.chip.set = rpe_gpio_set;
 	instance->gpio.chip.base = -1;
 	instance->gpio.chip.ngpio = RPE_GPIO_LINES;
-	instance->gpio.chip.names = rpe_gpio_names;
+	for (i = 0; i < create.lines; i++) {
+		snprintf(instance->gpio.names[i], sizeof(instance->gpio.names[i]), "GP%u",
+			 create.pins[i]);
+		instance->gpio.name_ptrs[i] = instance->gpio.names[i];
+	}
+	instance->gpio.chip.names = instance->gpio.name_ptrs;
 	instance->gpio.chip.can_sleep = true;
 	girq = &instance->gpio.chip.irq;
 	gpio_irq_chip_set_chip(girq, &rpe_gpio_irq_chip);

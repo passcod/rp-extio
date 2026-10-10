@@ -10,8 +10,8 @@ use nusb::{
     transfer::{Buffer, Bulk, Direction, In, Out},
 };
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN,
-    UsbHeader,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, MAX_PAYLOAD, Operation, Status,
+    USB_HEADER_LEN, UsbHeader,
 };
 use std::{
     collections::HashMap,
@@ -573,9 +573,10 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
 fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
     let mut offset = 0;
     let mut general = false;
-    let mut i2c_speed = None;
+    let mut i2c = None;
     let mut spi = None;
-    let mut gpio_lines = None;
+    let mut uart = None;
+    let mut gpio_pins = None;
     while offset < payload.len() {
         if payload.len() - offset < 4 {
             return Err(invalid("truncated capability record"));
@@ -602,14 +603,14 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
                 general = true;
             }
             CAP_I2C => {
-                if i2c_speed.is_some()
+                if i2c.is_some()
                     || value.len() != 16
                     || value[0] != 0
                     || value[1] != 0
                     || u16::from_le_bytes(value[2..4].try_into().unwrap())
                         & (rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)
                         != (rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)
-                    || value[12..16] != [0; 4]
+                    || value[14..16] != [0; 2]
                 {
                     return Err(invalid("invalid I2C capability"));
                 }
@@ -618,10 +619,15 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
                 if minimum == 0 || minimum > maximum {
                     return Err(invalid("invalid I2C speed range"));
                 }
-                i2c_speed = Some(maximum);
+                i2c = Some((maximum, [value[12], value[13]]));
             }
             CAP_SPI => {
-                if spi.is_some() || value.len() != 12 || value[0] != 0 || value[1] == 0 {
+                if spi.is_some()
+                    || value.len() < 16
+                    || value[0] != 0
+                    || value[1] == 0
+                    || value.len() != 15 + value[1] as usize
+                {
                     return Err(invalid("invalid SPI capability"));
                 }
                 let mode_bits = u16::from_le_bytes(value[2..4].try_into().unwrap()) as u32;
@@ -633,36 +639,87 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
                 {
                     return Err(invalid("invalid SPI capability values"));
                 }
-                spi = Some((mode_bits, minimum, maximum, value[1] as u16));
+                spi = Some((
+                    mode_bits,
+                    minimum,
+                    maximum,
+                    value[1] as u16,
+                    value[12..].to_vec(),
+                ));
+            }
+            CAP_UART => {
+                if uart.is_some()
+                    || value.len() != 12
+                    || value[0] != 0
+                    || value[3] != 0
+                    || value[8..12] != [0; 4]
+                {
+                    return Err(invalid("invalid UART capability"));
+                }
+                uart = Some([value[1], value[2]]);
             }
             CAP_GPIO => {
-                if gpio_lines.is_some()
+                if gpio_pins.is_some()
                     || value.len() < 4
-                    || value[0] == 0
+                    || value[0] != 17
                     || value[1..4] != [0; 3]
                     || value.len() != 4 + value[0] as usize
-                    || value[4..] != [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
                 {
                     return Err(invalid("invalid GPIO capability"));
                 }
-                gpio_lines = Some(value[0] as u16);
+                gpio_pins = Some(value[4..].try_into().unwrap());
             }
             _ => {}
         }
     }
-    let (spi_mode_bits, spi_min_speed_hz, spi_max_speed_hz, spi_chip_selects) =
+    let (spi_mode_bits, spi_min_speed_hz, spi_max_speed_hz, spi_chip_selects, spi_pins) =
         spi.ok_or_else(|| invalid("SPI capability missing"))?;
+    let (i2c_speed_hz, i2c_pins) = i2c.ok_or_else(|| invalid("I2C capability missing"))?;
+    let uart_pins = uart.ok_or_else(|| invalid("UART capability missing"))?;
+    let gpio_pins = gpio_pins.ok_or_else(|| invalid("GPIO capability missing"))?;
     if !general {
         return Err(invalid("general capability missing"));
     }
+    validate_pin_map(i2c_pins, &spi_pins, uart_pins, &gpio_pins)?;
     Ok(RegistrationConfig {
-        i2c_speed_hz: i2c_speed.ok_or_else(|| invalid("I2C capability missing"))?,
+        i2c_speed_hz,
         spi_mode_bits,
         spi_min_speed_hz,
         spi_max_speed_hz,
         spi_chip_selects,
-        gpio_lines: gpio_lines.ok_or_else(|| invalid("GPIO capability missing"))?,
+        gpio_lines: gpio_pins.len() as u16,
+        gpio_pins,
     })
+}
+
+fn validate_pin_map(i2c: [u8; 2], spi: &[u8], uart: [u8; 2], gpio: &[u8; 17]) -> io::Result<()> {
+    const HEADER: [u8; 26] = [
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27,
+        28,
+    ];
+    if ![0, 4, 8, 12, 16, 20].contains(&i2c[0]) || i2c[1] != i2c[0] + 1 {
+        return Err(invalid("invalid I2C0 pin route"));
+    }
+    if spi.len() != 5
+        || ![2, 6, 18, 22].contains(&spi[0])
+        || ![3, 7, 19].contains(&spi[1])
+        || ![0, 4, 16, 20].contains(&spi[2])
+        || ![0, 2, 12, 14, 16, 18, 28].contains(&uart[0])
+        || ![1, 3, 13, 15, 17, 19].contains(&uart[1])
+    {
+        return Err(invalid("invalid SPI0 or UART0 pin route"));
+    }
+    let mut used = [false; 29];
+    for &pin in i2c.iter().chain(spi).chain(&uart).chain(gpio) {
+        if !HEADER.contains(&pin) || used[pin as usize] {
+            return Err(invalid("duplicate or unavailable configured pin"));
+        }
+        used[pin as usize] = true;
+    }
+    if HEADER.iter().any(|&pin| !used[pin as usize]) {
+        return Err(invalid("configured pins do not cover Pico 2 headers"));
+    }
+    Ok(())
 }
 
 fn nusb_error(error: nusb::Error) -> io::Error {
@@ -699,13 +756,19 @@ mod tests {
         payload.extend_from_slice(&3_u16.to_le_bytes());
         payload.extend_from_slice(&100_000_u32.to_le_bytes());
         payload.extend_from_slice(&100_000_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
+        payload.extend_from_slice(&[4, 5, 0, 0]);
         payload.extend_from_slice(&CAP_SPI.to_le_bytes());
-        payload.extend_from_slice(&12_u16.to_le_bytes());
+        payload.extend_from_slice(&17_u16.to_le_bytes());
         payload.extend_from_slice(&[0, 2]);
         payload.extend_from_slice(&0x4f_u16.to_le_bytes());
         payload.extend_from_slice(&50_000_u32.to_le_bytes());
         payload.extend_from_slice(&20_000_000_u32.to_le_bytes());
+        payload.extend_from_slice(&[18, 19, 16, 17, 21]);
+        payload.extend_from_slice(&CAP_UART.to_le_bytes());
+        payload.extend_from_slice(&12_u16.to_le_bytes());
+        payload.extend_from_slice(&[0, 0, 1, 0]);
+        payload.extend_from_slice(&115_200_u32.to_le_bytes());
+        payload.extend_from_slice(&0_u32.to_le_bytes());
         payload.extend_from_slice(&CAP_GPIO.to_le_bytes());
         payload.extend_from_slice(&21_u16.to_le_bytes());
         payload.extend_from_slice(&[17, 0, 0, 0]);
@@ -865,7 +928,9 @@ mod tests {
             .expect("rp-extio Pico 2 not found");
         let (failed, _failures) = mpsc::unbounded_channel();
         let (backend, config) = UsbBackend::connect(&info, failed).await.unwrap();
-        assert_eq!(config, RegistrationConfig::PICO2);
+        assert_eq!(config.i2c_speed_hz, RegistrationConfig::PICO2.i2c_speed_hz);
+        assert_eq!(config.spi_chip_selects, 2);
+        assert_eq!(config.gpio_lines, 17);
 
         let snapshot = backend
             .transact(Transaction::Gpio {

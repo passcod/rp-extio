@@ -1,10 +1,10 @@
-use embassy_rp::gpio::{Flex, Level, Output, OutputOpenDrain};
-use embassy_rp::peripherals::{PIN_4, PIN_5, PIN_16, PIN_17, PIN_18, PIN_19, PIN_21, SPI0};
-use embassy_rp::spi::{Blocking, Config, Phase, Polarity, Spi};
+use embassy_rp::gpio::{Flex, Level, Output, OutputOpenDrain, Pin};
+use embassy_rp::peripherals::SPI0;
+use embassy_rp::spi::{Blocking, ClkPin, Config, MisoPin, MosiPin, Phase, Polarity, Spi};
 use embassy_rp::{Peri, pac};
 use rp_extio_firmware::{
-    Board, BusFailure, GPIO_PINS, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ,
-    SPI_MIN_SPEED_HZ, SPI_NO_CS, SpiOutcome, cumulative_spi_delay_ns,
+    Board, BusFailure, GPIO_LINE_COUNT, PinConfig, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST,
+    SPI_MAX_SPEED_HZ, SPI_MIN_SPEED_HZ, SPI_NO_CS, SpiOutcome, cumulative_spi_delay_ns,
 };
 use rp_extio_wire::{
     GPIO_DIRECTION_INPUT, GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET, I2C_READ,
@@ -21,22 +21,24 @@ pub struct Pico2Board<'d> {
     spi: Spi<'d, SPI0, Blocking>,
     chip_selects: [Output<'d>; 2],
     cs_active_high: [bool; 2],
-    gpio: [Flex<'d>; GPIO_PINS.len()],
+    gpio: [Flex<'d>; GPIO_LINE_COUNT],
     gpio_outputs: u32,
+    pin_config: &'static PinConfig,
 }
 
 impl<'d> Pico2Board<'d> {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
-        sda: Peri<'d, PIN_4>,
-        scl: Peri<'d, PIN_5>,
-        miso: Peri<'d, PIN_16>,
-        cs0: Peri<'d, PIN_17>,
-        sck: Peri<'d, PIN_18>,
-        mosi: Peri<'d, PIN_19>,
-        cs1: Peri<'d, PIN_21>,
+        sda: Peri<'d, impl Pin>,
+        scl: Peri<'d, impl Pin>,
+        miso: Peri<'d, impl MisoPin<SPI0>>,
+        cs0: Peri<'d, impl Pin>,
+        sck: Peri<'d, impl ClkPin<SPI0>>,
+        mosi: Peri<'d, impl MosiPin<SPI0>>,
+        cs1: Peri<'d, impl Pin>,
         spi0: Peri<'d, SPI0>,
-        mut gpio: [Flex<'d>; GPIO_PINS.len()],
+        mut gpio: [Flex<'d>; GPIO_LINE_COUNT],
+        pin_config: &'static PinConfig,
     ) -> Self {
         let mut sda = OutputOpenDrain::new(sda, Level::High);
         let mut scl = OutputOpenDrain::new(scl, Level::High);
@@ -56,6 +58,7 @@ impl<'d> Pico2Board<'d> {
             cs_active_high: [false; 2],
             gpio,
             gpio_outputs: 0,
+            pin_config,
         }
     }
 
@@ -265,6 +268,10 @@ impl<'d> Pico2Board<'d> {
 }
 
 impl Board for Pico2Board<'_> {
+    fn pin_config(&self) -> &PinConfig {
+        self.pin_config
+    }
+
     fn i2c_transfer(
         &mut self,
         request: &I2cRequest<'_>,

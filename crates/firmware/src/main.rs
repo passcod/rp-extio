@@ -6,7 +6,7 @@ mod pico2;
 use core::panic::PanicInfo;
 
 use embassy_futures::join::join;
-use embassy_rp::{bind_interrupts, gpio::Flex, peripherals, uart, usb};
+use embassy_rp::{bind_interrupts, peripherals, uart, usb};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State as CdcState};
 use embassy_usb::driver::Driver as UsbDriver;
 use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
@@ -16,6 +16,8 @@ use pico2::Pico2Board;
 use rp_extio_firmware::{Board, dispatch};
 use rp_extio_wire::{MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader, WireError};
 use static_cell::StaticCell;
+
+include!(concat!(env!("OUT_DIR"), "/pin_config.rs"));
 
 const USB_MAX_PACKET: usize = 64;
 const USB_FRAME_LEN: usize = USB_HEADER_LEN + MAX_PAYLOAD;
@@ -142,8 +144,8 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     uart_config.baudrate = rp_extio_firmware::UART_BAUD;
     let uart = uart::BufferedUart::new(
         peripherals.UART0,
-        peripherals.PIN_0,
-        peripherals.PIN_1,
+        configured_uart_tx!(peripherals),
+        configured_uart_rx!(peripherals),
         Irqs,
         UART_TX_BUFFER.init([0; 256]),
         UART_RX_BUFFER.init([0; 256]),
@@ -153,33 +155,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let (cdc_tx, cdc_rx) = cdc.split();
 
     let mut board = Pico2Board::new(
-        peripherals.PIN_4,
-        peripherals.PIN_5,
-        peripherals.PIN_16,
-        peripherals.PIN_17,
-        peripherals.PIN_18,
-        peripherals.PIN_19,
-        peripherals.PIN_21,
+        configured_i2c_sda!(peripherals),
+        configured_i2c_scl!(peripherals),
+        configured_spi_miso!(peripherals),
+        configured_spi_cs0!(peripherals),
+        configured_spi_sck!(peripherals),
+        configured_spi_mosi!(peripherals),
+        configured_spi_cs1!(peripherals),
         peripherals.SPI0,
-        [
-            Flex::new(peripherals.PIN_2),
-            Flex::new(peripherals.PIN_3),
-            Flex::new(peripherals.PIN_6),
-            Flex::new(peripherals.PIN_7),
-            Flex::new(peripherals.PIN_8),
-            Flex::new(peripherals.PIN_9),
-            Flex::new(peripherals.PIN_10),
-            Flex::new(peripherals.PIN_11),
-            Flex::new(peripherals.PIN_12),
-            Flex::new(peripherals.PIN_13),
-            Flex::new(peripherals.PIN_14),
-            Flex::new(peripherals.PIN_15),
-            Flex::new(peripherals.PIN_20),
-            Flex::new(peripherals.PIN_22),
-            Flex::new(peripherals.PIN_26),
-            Flex::new(peripherals.PIN_27),
-            Flex::new(peripherals.PIN_28),
-        ],
+        configured_gpio!(peripherals),
+        &PIN_CONFIG,
     );
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());
     join(

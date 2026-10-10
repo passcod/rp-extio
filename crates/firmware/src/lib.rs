@@ -14,7 +14,31 @@ pub const SPI_CHIP_SELECTS: u8 = 2;
 pub const UART_TX_PIN: u8 = 0;
 pub const UART_RX_PIN: u8 = 1;
 pub const UART_BAUD: u32 = 115_200;
-pub const GPIO_PINS: [u8; 17] = [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28];
+pub const GPIO_LINE_COUNT: usize = 17;
+pub const DEFAULT_PIN_CONFIG: PinConfig = PinConfig {
+    uart_tx: 0,
+    uart_rx: 1,
+    i2c_sda: 4,
+    i2c_scl: 5,
+    spi_miso: 16,
+    spi_sck: 18,
+    spi_mosi: 19,
+    spi_chip_selects: [17, 21],
+    gpio_pins: [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28],
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinConfig {
+    pub uart_tx: u8,
+    pub uart_rx: u8,
+    pub i2c_sda: u8,
+    pub i2c_scl: u8,
+    pub spi_miso: u8,
+    pub spi_sck: u8,
+    pub spi_mosi: u8,
+    pub spi_chip_selects: [u8; 2],
+    pub gpio_pins: [u8; GPIO_LINE_COUNT],
+}
 
 pub const SPI_CPHA: u16 = 1 << 0;
 pub const SPI_CPOL: u16 = 1 << 1;
@@ -56,6 +80,8 @@ impl Default for SpiOutcome {
 }
 
 pub trait Board {
+    fn pin_config(&self) -> &PinConfig;
+
     fn i2c_transfer(
         &mut self,
         request: &I2cRequest<'_>,
@@ -92,7 +118,7 @@ pub fn dispatch<B: Board>(
     }
 
     let result = match request.operation {
-        Operation::Hello => hello(payload, response),
+        Operation::Hello => hello(payload, board, response),
         Operation::I2cTransfer => i2c(payload, board, response),
         Operation::SpiMessage => spi(payload, board, response),
         Operation::GpioCommand => gpio(payload, board, response),
@@ -124,11 +150,12 @@ fn error_reply(request: UsbHeader, status: Status, payload_len: usize) -> Reply 
     reply(request, status, payload_len)
 }
 
-fn hello(payload: &[u8], response: &mut [u8]) -> Result<usize, BusFailure> {
+fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usize, BusFailure> {
     if !payload.is_empty() {
         return Err(BusFailure::new(Status::BadFrame, 0));
     }
 
+    let pins = board.pin_config();
     let mut out = Writer::new(response);
     record(&mut out, CAP_GENERAL, 8, |out| {
         out.push(rp_extio_wire::VERSION_MAJOR)?;
@@ -143,28 +170,34 @@ fn hello(payload: &[u8], response: &mut [u8]) -> Result<usize, BusFailure> {
         out.u16(rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)?;
         out.u32(I2C_SPEED_HZ)?;
         out.u32(I2C_SPEED_HZ)?;
-        out.u32(0)
+        out.push(pins.i2c_sda)?;
+        out.push(pins.i2c_scl)?;
+        out.u16(0)
     })?;
-    record(&mut out, CAP_SPI, 12, |out| {
+    record(&mut out, CAP_SPI, 17, |out| {
         out.push(SPI_BUS_ID)?;
         out.push(SPI_CHIP_SELECTS)?;
         out.u16(SPI_SUPPORTED_MODES)?;
         out.u32(SPI_MIN_SPEED_HZ)?;
-        out.u32(SPI_MAX_SPEED_HZ)
+        out.u32(SPI_MAX_SPEED_HZ)?;
+        out.push(pins.spi_sck)?;
+        out.push(pins.spi_mosi)?;
+        out.push(pins.spi_miso)?;
+        out.extend(&pins.spi_chip_selects)
     })?;
     record(&mut out, CAP_UART, 12, |out| {
         out.push(0)?;
-        out.push(UART_TX_PIN)?;
-        out.push(UART_RX_PIN)?;
+        out.push(pins.uart_tx)?;
+        out.push(pins.uart_rx)?;
         out.push(0)?;
         out.u32(UART_BAUD)?;
         out.u32(0)
     })?;
     record(&mut out, CAP_GPIO, 21, |out| {
-        out.push(GPIO_PINS.len() as u8)?;
+        out.push(pins.gpio_pins.len() as u8)?;
         out.push(0)?;
         out.u16(0)?;
-        out.extend(&GPIO_PINS)
+        out.extend(&pins.gpio_pins)
     })?;
     Ok(out.len())
 }
@@ -177,7 +210,7 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
         if payload[1] != 0 || payload[2] != 0 {
             return Err(BusFailure::new(Status::BadFrame, 0));
         }
-        response[..4].copy_from_slice(&(GPIO_PINS.len() as u32).to_le_bytes());
+        response[..4].copy_from_slice(&(board.pin_config().gpio_pins.len() as u32).to_le_bytes());
         response[4..8].copy_from_slice(&board.gpio_snapshot()?.to_le_bytes());
         return Ok(8);
     }
@@ -282,6 +315,10 @@ mod tests {
     }
 
     impl Board for Stub {
+        fn pin_config(&self) -> &PinConfig {
+            &DEFAULT_PIN_CONFIG
+        }
+
         fn i2c_transfer(
             &mut self,
             request: &I2cRequest<'_>,
@@ -316,7 +353,7 @@ mod tests {
         }
 
         fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {
-            if line as usize >= GPIO_PINS.len() {
+            if line as usize >= GPIO_LINE_COUNT {
                 return Err(BusFailure::new(Status::Unsupported, 0));
             }
             let mask = 1_u32 << line;
@@ -431,7 +468,7 @@ mod tests {
             &mut response,
         );
         assert_eq!(reply.header.status, Status::Ok);
-        assert_eq!(&response[..4], &(GPIO_PINS.len() as u32).to_le_bytes());
+        assert_eq!(&response[..4], &(GPIO_LINE_COUNT as u32).to_le_bytes());
         assert_eq!(&response[4..8], &(1_u32 << 3).to_le_bytes());
     }
 
