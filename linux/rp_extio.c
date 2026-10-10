@@ -1,0 +1,821 @@
+// SPDX-License-Identifier: GPL-2.0-only
+#include <linux/completion.h>
+#include <linux/build_bug.h>
+#include <linux/fs.h>
+#include <linux/i2c.h>
+#include <linux/idr.h>
+#include <linux/jiffies.h>
+#include <linux/list.h>
+#include <linux/miscdevice.h>
+#include <linux/module.h>
+#include <linux/mutex.h>
+#include <linux/poll.h>
+#include <linux/slab.h>
+#include <linux/spi/spi.h>
+#include <linux/uaccess.h>
+#include <linux/unaligned.h>
+
+#include "rp_extio_uapi.h"
+
+#define RPE_MAGIC 0x444b5052U /* "RPKD" in little endian */
+#define RPE_HEADER_SIZE 32
+#define RPE_TIMEOUT (8 * HZ)
+
+#define RPE_OP_I2C 2
+#define RPE_OP_SPI 3
+
+#define RPE_STATUS_OK 0
+#define RPE_STATUS_NACK 1
+#define RPE_STATUS_ARBITRATION_LOST 2
+#define RPE_STATUS_TIMEOUT 3
+#define RPE_STATUS_DISCONNECTED 4
+#define RPE_STATUS_UNSUPPORTED 5
+#define RPE_STATUS_BAD_FRAME 6
+#define RPE_STATUS_IO_ERROR 7
+
+#define RPE_I2C_READ 1
+#define RPE_I2C_TEN_BIT 2
+#define RPE_SPI_CS_CHANGE 1
+#define RPE_SPI_MODES (SPI_CPHA | SPI_CPOL | SPI_CS_HIGH | SPI_LSB_FIRST | SPI_NO_CS)
+#define RPE_I2C_FUNCTIONS (I2C_FUNC_I2C | I2C_FUNC_10BIT_ADDR | I2C_FUNC_SMBUS_EMUL)
+
+enum rpe_instance_type {
+	RPE_INSTANCE_I2C,
+	RPE_INSTANCE_SPI,
+};
+
+struct rpe_session;
+
+struct rpe_instance {
+	struct list_head node;
+	struct rpe_session *session;
+	enum rpe_instance_type type;
+	u32 id;
+	struct mutex transaction_lock;
+	union {
+		struct {
+			struct i2c_adapter adapter;
+			u32 functionality;
+			u32 speed_hz;
+		} i2c;
+		struct {
+			struct spi_controller *controller;
+			struct spi_device **children;
+			u16 chip_selects;
+		} spi;
+	};
+};
+
+struct rpe_request {
+	struct list_head node;
+	struct completion done;
+	struct rpe_instance *instance;
+	u64 id;
+	u16 operation;
+	size_t request_len;
+	size_t reply_len;
+	bool delivered;
+	int result;
+	u8 request[RPE_HEADER_SIZE + RPE_MAX_PAYLOAD];
+	u8 reply[RPE_MAX_PAYLOAD];
+};
+
+struct rpe_session {
+	struct mutex lock;
+	struct list_head requests;
+	struct list_head instances;
+	wait_queue_head_t read_wait;
+	struct ida instance_ids;
+	atomic_t readable_requests;
+	u64 next_request_id;
+	bool closing;
+};
+
+static DEFINE_MUTEX(rpe_open_lock);
+static bool rpe_opened;
+static struct miscdevice rpe_misc;
+
+static_assert(sizeof(struct rpe_ioc_version) == 16);
+static_assert(sizeof(struct rpe_ioc_create_i2c) == 16);
+static_assert(sizeof(struct rpe_ioc_create_spi) == 24);
+static_assert(sizeof(struct rpe_ioc_destroy) == 8);
+
+static void rpe_put16(u8 *p, u16 value)
+{
+	put_unaligned_le16(value, p);
+}
+
+static void rpe_put32(u8 *p, u32 value)
+{
+	put_unaligned_le32(value, p);
+}
+
+static void rpe_put64(u8 *p, u64 value)
+{
+	put_unaligned_le64(value, p);
+}
+
+static u16 rpe_get16(const u8 *p)
+{
+	return get_unaligned_le16(p);
+}
+
+static u32 rpe_get32(const u8 *p)
+{
+	return get_unaligned_le32(p);
+}
+
+static u64 rpe_get64(const u8 *p)
+{
+	return get_unaligned_le64(p);
+}
+
+static void rpe_make_header(struct rpe_request *request, u16 operation,
+			    u32 payload_len)
+{
+	u8 *header = request->request;
+
+	rpe_put32(header, RPE_MAGIC);
+	rpe_put16(header + 4, RPE_ABI_MAJOR);
+	rpe_put16(header + 6, operation);
+	rpe_put32(header + 8, request->instance->id);
+	rpe_put32(header + 12, payload_len);
+	rpe_put64(header + 16, request->id);
+	rpe_put32(header + 24, 0);
+	rpe_put32(header + 28, 0);
+	request->operation = operation;
+	request->request_len = RPE_HEADER_SIZE + payload_len;
+}
+
+static int rpe_status_errno(s32 status)
+{
+	switch (status) {
+	case RPE_STATUS_OK:
+		return 0;
+	case RPE_STATUS_NACK:
+		return -EREMOTEIO;
+	case RPE_STATUS_ARBITRATION_LOST:
+		return -EAGAIN;
+	case RPE_STATUS_TIMEOUT:
+		return -ETIMEDOUT;
+	case RPE_STATUS_DISCONNECTED:
+		return -ENODEV;
+	case RPE_STATUS_UNSUPPORTED:
+		return -EOPNOTSUPP;
+	case RPE_STATUS_BAD_FRAME:
+		return -EPROTO;
+	case RPE_STATUS_IO_ERROR:
+		return -EIO;
+	default:
+		return -EPROTO;
+	}
+}
+
+static int rpe_submit(struct rpe_instance *instance, struct rpe_request *request)
+{
+	struct rpe_session *session = instance->session;
+	long waited;
+
+	init_completion(&request->done);
+	request->instance = instance;
+	request->result = -ENODEV;
+
+	mutex_lock(&session->lock);
+	if (session->closing) {
+		mutex_unlock(&session->lock);
+		return -ENODEV;
+	}
+	request->id = ++session->next_request_id;
+	rpe_put64(request->request + 16, request->id);
+	list_add_tail(&request->node, &session->requests);
+	atomic_inc(&session->readable_requests);
+	mutex_unlock(&session->lock);
+	wake_up_interruptible(&session->read_wait);
+
+	waited = wait_for_completion_interruptible_timeout(&request->done, RPE_TIMEOUT);
+	mutex_lock(&session->lock);
+	if (!list_empty(&request->node)) {
+		if (!request->delivered)
+			atomic_dec(&session->readable_requests);
+		list_del_init(&request->node);
+	}
+	if (waited == 0)
+		request->result = -ETIMEDOUT;
+	else if (waited < 0)
+		request->result = waited;
+	mutex_unlock(&session->lock);
+	return request->result;
+}
+
+static int rpe_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *messages,
+			int count)
+{
+	struct rpe_instance *instance = i2c_get_adapdata(adapter);
+	struct rpe_request *request;
+	size_t offset = RPE_HEADER_SIZE + 4;
+	size_t read_len = 0;
+	size_t write_len = 0;
+	int i, ret;
+
+	if (count < 1 || count > RPE_MAX_I2C_MSGS)
+		return -EOPNOTSUPP;
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&request->node);
+	request->request[RPE_HEADER_SIZE] = 0;
+	request->request[RPE_HEADER_SIZE + 1] = count;
+
+	for (i = 0; i < count; i++) {
+		u16 wire_flags = 0;
+
+		if (messages[i].flags & ~(I2C_M_RD | I2C_M_TEN | I2C_M_DMA_SAFE)) {
+			ret = -EOPNOTSUPP;
+			goto free_request;
+		}
+		if (messages[i].addr > ((messages[i].flags & I2C_M_TEN) ? 0x3ff : 0x7f)) {
+			ret = -EINVAL;
+			goto free_request;
+		}
+		if (messages[i].flags & I2C_M_RD) {
+			wire_flags |= RPE_I2C_READ;
+			read_len += messages[i].len;
+		}
+		if (messages[i].flags & I2C_M_TEN)
+			wire_flags |= RPE_I2C_TEN_BIT;
+		if (!(wire_flags & RPE_I2C_READ))
+			write_len += messages[i].len;
+		if (offset + 8 + ((wire_flags & RPE_I2C_READ) ? 0 : messages[i].len) >
+		    sizeof(request->request) || read_len > RPE_MAX_DATA ||
+		    write_len > RPE_MAX_DATA) {
+			ret = -EMSGSIZE;
+			goto free_request;
+		}
+		rpe_put16(request->request + offset, messages[i].addr);
+		rpe_put16(request->request + offset + 2, wire_flags);
+		rpe_put16(request->request + offset + 4, messages[i].len);
+		rpe_put16(request->request + offset + 6, 0);
+		offset += 8;
+		if (!(wire_flags & RPE_I2C_READ)) {
+			memcpy(request->request + offset, messages[i].buf, messages[i].len);
+			offset += messages[i].len;
+		}
+	}
+
+	mutex_lock(&instance->transaction_lock);
+	request->instance = instance;
+	rpe_make_header(request, RPE_OP_I2C, offset - RPE_HEADER_SIZE);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		size_t input = 4;
+
+		if (request->reply_len != 4 + read_len || rpe_get32(request->reply) != count) {
+			ret = -EPROTO;
+			goto unlock;
+		}
+		for (i = 0; i < count; i++) {
+			if (messages[i].flags & I2C_M_RD) {
+				memcpy(messages[i].buf, request->reply + input, messages[i].len);
+				input += messages[i].len;
+			}
+		}
+		ret = count;
+	}
+unlock:
+	mutex_unlock(&instance->transaction_lock);
+free_request:
+	kfree(request);
+	return ret;
+}
+
+static u32 rpe_i2c_functionality(struct i2c_adapter *adapter)
+{
+	struct rpe_instance *instance = i2c_get_adapdata(adapter);
+
+	return instance->i2c.functionality;
+}
+
+static const struct i2c_algorithm rpe_i2c_algorithm = {
+	.xfer = rpe_i2c_xfer,
+	.functionality = rpe_i2c_functionality,
+};
+
+static int rpe_delay_ns(struct spi_delay delay, struct spi_transfer *transfer,
+			u32 *nanoseconds)
+{
+	int value = spi_delay_to_ns(&delay, transfer);
+
+	if (value < 0)
+		return value;
+	*nanoseconds = value;
+	return 0;
+}
+
+static int rpe_spi_message(struct spi_controller *controller,
+			   struct spi_message *message)
+{
+	struct rpe_instance *instance =
+		*(struct rpe_instance **)spi_controller_get_devdata(controller);
+	struct rpe_request *request;
+	struct spi_transfer *transfer;
+	size_t offset = RPE_HEADER_SIZE + 8;
+	size_t data_len = 0;
+	u8 segments = 0;
+	int ret = 0;
+
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request) {
+		ret = -ENOMEM;
+		goto finish;
+	}
+	INIT_LIST_HEAD(&request->node);
+	request->request[RPE_HEADER_SIZE] = 0;
+	request->request[RPE_HEADER_SIZE + 1] = spi_get_chipselect(message->spi, 0);
+	rpe_put16(request->request + RPE_HEADER_SIZE + 2, message->spi->mode);
+
+	list_for_each_entry(transfer, &message->transfers, transfer_list) {
+		u32 speed = transfer->speed_hz ?: message->spi->max_speed_hz;
+		u16 flags = transfer->cs_change ? RPE_SPI_CS_CHANGE : 0;
+		u32 word_delay, delay, cs_change_delay;
+
+		if ((transfer->bits_per_word && transfer->bits_per_word != 8) ||
+		    ++segments > RPE_MAX_SPI_SEGMENTS ||
+		    data_len + transfer->len > RPE_MAX_DATA || offset + 20 + transfer->len >
+		    sizeof(request->request)) {
+			ret = -EOPNOTSUPP;
+			goto free_request;
+		}
+		ret = rpe_delay_ns(transfer->word_delay, transfer, &word_delay);
+		if (!ret)
+			ret = rpe_delay_ns(transfer->delay, transfer, &delay);
+		if (!ret)
+			ret = rpe_delay_ns(transfer->cs_change_delay, transfer,
+					   &cs_change_delay);
+		if (ret)
+			goto free_request;
+		rpe_put32(request->request + offset, speed);
+		rpe_put16(request->request + offset + 4, transfer->len);
+		rpe_put16(request->request + offset + 6, flags);
+		rpe_put32(request->request + offset + 8, word_delay);
+		rpe_put32(request->request + offset + 12, delay);
+		rpe_put32(request->request + offset + 16, cs_change_delay);
+		offset += 20;
+		if (transfer->tx_buf)
+			memcpy(request->request + offset, transfer->tx_buf, transfer->len);
+		else
+			memset(request->request + offset, 0, transfer->len);
+		offset += transfer->len;
+		data_len += transfer->len;
+	}
+	if (!segments) {
+		ret = -EINVAL;
+		goto free_request;
+	}
+	request->request[RPE_HEADER_SIZE + 4] = segments;
+
+	mutex_lock(&instance->transaction_lock);
+	request->instance = instance;
+	rpe_make_header(request, RPE_OP_SPI, offset - RPE_HEADER_SIZE);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		size_t input = 8 + segments * 4;
+		size_t output = 0;
+		int index = 0;
+
+		if (request->reply_len != input + data_len || request->reply[4] != segments ||
+		    request->reply[5] || request->reply[6] || request->reply[7]) {
+			ret = -EPROTO;
+			goto unlock_spi;
+		}
+		list_for_each_entry(transfer, &message->transfers, transfer_list) {
+			transfer->effective_speed_hz = rpe_get32(request->reply + 8 + index * 4);
+			if (transfer->rx_buf)
+				memcpy(transfer->rx_buf, request->reply + input + output,
+				       transfer->len);
+			output += transfer->len;
+			index++;
+		}
+		message->actual_length = rpe_get32(request->reply);
+	}
+unlock_spi:
+	mutex_unlock(&instance->transaction_lock);
+free_request:
+	kfree(request);
+finish:
+	message->status = ret;
+	spi_finalize_current_message(controller);
+	return 0;
+}
+
+static struct rpe_request *rpe_next_request(struct rpe_session *session)
+{
+	struct rpe_request *request;
+
+	list_for_each_entry(request, &session->requests, node)
+		if (!request->delivered)
+			return request;
+	return NULL;
+}
+
+static ssize_t rpe_read(struct file *file, char __user *buffer, size_t count,
+			loff_t *position)
+{
+	struct rpe_session *session = file->private_data;
+	struct rpe_request *request;
+	int ret;
+
+	if (count < RPE_HEADER_SIZE)
+		return -EMSGSIZE;
+	ret = wait_event_interruptible(session->read_wait,
+				       READ_ONCE(session->closing) ||
+				       atomic_read(&session->readable_requests));
+	if (ret)
+		return ret;
+	mutex_lock(&session->lock);
+	request = rpe_next_request(session);
+	if (!request) {
+		ret = session->closing ? -ENODEV : -EAGAIN;
+		goto unlock;
+	}
+	if (count < request->request_len) {
+		ret = -EMSGSIZE;
+		goto unlock;
+	}
+	if (copy_to_user(buffer, request->request, request->request_len)) {
+		ret = -EFAULT;
+		goto unlock;
+	}
+	request->delivered = true;
+	atomic_dec(&session->readable_requests);
+	ret = request->request_len;
+unlock:
+	mutex_unlock(&session->lock);
+	return ret;
+}
+
+static ssize_t rpe_write(struct file *file, const char __user *buffer,
+			 size_t count, loff_t *position)
+{
+	struct rpe_session *session = file->private_data;
+	struct rpe_request *request;
+	u8 *frame;
+	u32 payload_len, instance_id;
+	u16 operation;
+	u64 request_id;
+	s32 status;
+	int ret = -ENOENT;
+
+	if (count < RPE_HEADER_SIZE || count > RPE_HEADER_SIZE + RPE_MAX_PAYLOAD)
+		return -EMSGSIZE;
+	frame = memdup_user(buffer, count);
+	if (IS_ERR(frame))
+		return PTR_ERR(frame);
+	if (rpe_get32(frame) != RPE_MAGIC || rpe_get16(frame + 4) != RPE_ABI_MAJOR ||
+	    rpe_get32(frame + 28)) {
+		ret = -EPROTO;
+		goto free_frame;
+	}
+	operation = rpe_get16(frame + 6);
+	instance_id = rpe_get32(frame + 8);
+	payload_len = rpe_get32(frame + 12);
+	request_id = rpe_get64(frame + 16);
+	status = (s32)rpe_get32(frame + 24);
+	if (payload_len > RPE_MAX_PAYLOAD || count != RPE_HEADER_SIZE + payload_len ||
+	    (rpe_status_errno(status) == -EPROTO && status != RPE_STATUS_BAD_FRAME)) {
+		ret = -EPROTO;
+		goto free_frame;
+	}
+
+	mutex_lock(&session->lock);
+	list_for_each_entry(request, &session->requests, node) {
+		if (!request->delivered || request->id != request_id)
+			continue;
+		if (request->instance->id != instance_id || request->operation != operation) {
+			ret = -EPROTO;
+			break;
+		}
+		memcpy(request->reply, frame + RPE_HEADER_SIZE, payload_len);
+		request->reply_len = payload_len;
+		request->result = rpe_status_errno(status);
+		list_del_init(&request->node);
+		complete(&request->done);
+		ret = count;
+		break;
+	}
+	mutex_unlock(&session->lock);
+free_frame:
+	kfree(frame);
+	return ret;
+}
+
+static __poll_t rpe_poll(struct file *file, poll_table *wait)
+{
+	struct rpe_session *session = file->private_data;
+	__poll_t mask = 0;
+
+	poll_wait(file, &session->read_wait, wait);
+	mutex_lock(&session->lock);
+	if (rpe_next_request(session))
+		mask |= EPOLLIN | EPOLLRDNORM;
+	if (session->closing)
+		mask |= EPOLLHUP | EPOLLERR;
+	mutex_unlock(&session->lock);
+	return mask;
+}
+
+static void rpe_destroy_instance(struct rpe_instance *instance)
+{
+	int i;
+
+	if (!list_empty(&instance->node))
+		list_del_init(&instance->node);
+	if (instance->type == RPE_INSTANCE_I2C) {
+		i2c_del_adapter(&instance->i2c.adapter);
+	} else {
+		for (i = 0; i < instance->spi.chip_selects; i++)
+			if (instance->spi.children[i])
+				spi_unregister_device(instance->spi.children[i]);
+		spi_unregister_controller(instance->spi.controller);
+		kfree(instance->spi.children);
+	}
+	ida_free(&instance->session->instance_ids, instance->id);
+	kfree(instance);
+}
+
+static int rpe_create_i2c(struct rpe_session *session, void __user *argument)
+{
+	struct rpe_ioc_create_i2c create;
+	struct rpe_instance *instance;
+	int ret;
+
+	if (copy_from_user(&create, argument, sizeof(create)))
+		return -EFAULT;
+	if (!create.speed_hz || !(create.functionality & I2C_FUNC_I2C) ||
+	    (create.functionality & ~RPE_I2C_FUNCTIONS))
+		return -EINVAL;
+	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	if (!instance)
+		return -ENOMEM;
+	instance->session = session;
+	instance->type = RPE_INSTANCE_I2C;
+	mutex_init(&instance->transaction_lock);
+	instance->i2c.functionality = create.functionality;
+	instance->i2c.speed_hz = create.speed_hz;
+	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
+	if ((int)instance->id < 0) {
+		ret = (int)instance->id;
+		goto free_instance;
+	}
+	strscpy(instance->i2c.adapter.name, "rp-extio virtual I2C",
+		sizeof(instance->i2c.adapter.name));
+	instance->i2c.adapter.owner = THIS_MODULE;
+	instance->i2c.adapter.algo = &rpe_i2c_algorithm;
+	i2c_set_adapdata(&instance->i2c.adapter, instance);
+	ret = i2c_add_adapter(&instance->i2c.adapter);
+	if (ret)
+		goto free_id;
+	list_add_tail(&instance->node, &session->instances);
+	create.instance_id = instance->id;
+	create.bus_num = instance->i2c.adapter.nr;
+	if (copy_to_user(argument, &create, sizeof(create))) {
+		ret = -EFAULT;
+		rpe_destroy_instance(instance);
+		return ret;
+	}
+	return 0;
+free_id:
+	ida_free(&session->instance_ids, instance->id);
+free_instance:
+	kfree(instance);
+	return ret;
+}
+
+static int rpe_create_spi(struct rpe_session *session, void __user *argument)
+{
+	struct rpe_ioc_create_spi create;
+	struct rpe_instance *instance;
+	struct spi_controller *controller;
+	int i, ret;
+
+	if (copy_from_user(&create, argument, sizeof(create)))
+		return -EFAULT;
+	if (!create.chip_selects || create.chip_selects > 32 || create.reserved ||
+	    !create.min_speed_hz || create.min_speed_hz > create.max_speed_hz ||
+	    (create.mode_bits & ~RPE_SPI_MODES))
+		return -EINVAL;
+	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	if (!instance)
+		return -ENOMEM;
+	instance->session = session;
+	instance->type = RPE_INSTANCE_SPI;
+	mutex_init(&instance->transaction_lock);
+	instance->spi.chip_selects = create.chip_selects;
+	instance->spi.children = kcalloc(create.chip_selects,
+					 sizeof(*instance->spi.children), GFP_KERNEL);
+	if (!instance->spi.children) {
+		ret = -ENOMEM;
+		goto free_instance;
+	}
+	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
+	if ((int)instance->id < 0) {
+		ret = (int)instance->id;
+		goto free_children;
+	}
+	controller = spi_alloc_host(rpe_misc.this_device, sizeof(struct rpe_instance *));
+	if (!controller) {
+		ret = -ENOMEM;
+		goto free_id;
+	}
+	*(struct rpe_instance **)spi_controller_get_devdata(controller) = instance;
+	instance->spi.controller = controller;
+	controller->num_chipselect = create.chip_selects;
+	controller->mode_bits = create.mode_bits;
+	controller->bits_per_word_mask = SPI_BPW_MASK(8);
+	controller->min_speed_hz = create.min_speed_hz;
+	controller->max_speed_hz = create.max_speed_hz;
+	controller->transfer_one_message = rpe_spi_message;
+	ret = spi_register_controller(controller);
+	if (ret)
+		goto put_controller;
+	for (i = 0; i < create.chip_selects; i++) {
+		struct spi_board_info info = {
+			.modalias = "spidev",
+			.max_speed_hz = create.max_speed_hz,
+			.chip_select = i,
+		};
+
+		instance->spi.children[i] = spi_new_device(controller, &info);
+		if (!instance->spi.children[i]) {
+			ret = -ENODEV;
+			goto unregister_children;
+		}
+	}
+	list_add_tail(&instance->node, &session->instances);
+	create.instance_id = instance->id;
+	create.bus_num = controller->bus_num;
+	if (copy_to_user(argument, &create, sizeof(create))) {
+		ret = -EFAULT;
+		rpe_destroy_instance(instance);
+		return ret;
+	}
+	return 0;
+unregister_children:
+	while (i--)
+		spi_unregister_device(instance->spi.children[i]);
+	spi_unregister_controller(controller);
+	goto free_id;
+put_controller:
+	spi_controller_put(controller);
+free_id:
+	ida_free(&session->instance_ids, instance->id);
+free_children:
+	kfree(instance->spi.children);
+free_instance:
+	kfree(instance);
+	return ret;
+}
+
+static long rpe_ioctl(struct file *file, unsigned int command, unsigned long arg)
+{
+	struct rpe_session *session = file->private_data;
+	void __user *argument = (void __user *)arg;
+	struct rpe_instance *instance;
+	struct rpe_ioc_destroy destroy;
+	struct rpe_ioc_version version = {
+		.major = RPE_ABI_MAJOR,
+		.minor = RPE_ABI_MINOR,
+		.max_payload = RPE_MAX_PAYLOAD,
+	};
+	int ret = 0;
+
+	mutex_lock(&session->lock);
+	if (session->closing) {
+		ret = -ENODEV;
+		goto unlock;
+	}
+	switch (command) {
+	case RPE_IOC_GET_VERSION:
+		ret = copy_to_user(argument, &version, sizeof(version)) ? -EFAULT : 0;
+		break;
+	case RPE_IOC_CREATE_I2C:
+		ret = rpe_create_i2c(session, argument);
+		break;
+	case RPE_IOC_CREATE_SPI:
+		ret = rpe_create_spi(session, argument);
+		break;
+	case RPE_IOC_DESTROY:
+		if (copy_from_user(&destroy, argument, sizeof(destroy))) {
+			ret = -EFAULT;
+			break;
+		}
+		if (destroy.reserved) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = -ENOENT;
+		list_for_each_entry(instance, &session->instances, node) {
+			if (instance->id == destroy.instance_id) {
+				list_del_init(&instance->node);
+				mutex_unlock(&session->lock);
+				rpe_destroy_instance(instance);
+				return 0;
+			}
+		}
+		break;
+	default:
+		ret = -ENOTTY;
+	}
+unlock:
+	mutex_unlock(&session->lock);
+	return ret;
+}
+
+static int rpe_open(struct inode *inode, struct file *file)
+{
+	struct rpe_session *session;
+
+	mutex_lock(&rpe_open_lock);
+	if (rpe_opened) {
+		mutex_unlock(&rpe_open_lock);
+		return -EBUSY;
+	}
+	session = kzalloc(sizeof(*session), GFP_KERNEL);
+	if (!session) {
+		mutex_unlock(&rpe_open_lock);
+		return -ENOMEM;
+	}
+	mutex_init(&session->lock);
+	INIT_LIST_HEAD(&session->requests);
+	INIT_LIST_HEAD(&session->instances);
+	init_waitqueue_head(&session->read_wait);
+	ida_init(&session->instance_ids);
+	atomic_set(&session->readable_requests, 0);
+	rpe_opened = true;
+	file->private_data = session;
+	mutex_unlock(&rpe_open_lock);
+	return 0;
+}
+
+static int rpe_release(struct inode *inode, struct file *file)
+{
+	struct rpe_session *session = file->private_data;
+	struct rpe_request *request, *request_tmp;
+	struct rpe_instance *instance, *instance_tmp;
+	LIST_HEAD(instances);
+
+	mutex_lock(&session->lock);
+	session->closing = true;
+	list_for_each_entry_safe(request, request_tmp, &session->requests, node) {
+		list_del_init(&request->node);
+		request->result = -ENODEV;
+		complete(&request->done);
+	}
+	atomic_set(&session->readable_requests, 0);
+	wake_up_interruptible(&session->read_wait);
+	list_splice_init(&session->instances, &instances);
+	mutex_unlock(&session->lock);
+	list_for_each_entry_safe(instance, instance_tmp, &instances, node)
+		rpe_destroy_instance(instance);
+	ida_destroy(&session->instance_ids);
+	kfree(session);
+
+	mutex_lock(&rpe_open_lock);
+	rpe_opened = false;
+	mutex_unlock(&rpe_open_lock);
+	return 0;
+}
+
+static const struct file_operations rpe_fops = {
+	.owner = THIS_MODULE,
+	.open = rpe_open,
+	.release = rpe_release,
+	.read = rpe_read,
+	.write = rpe_write,
+	.poll = rpe_poll,
+	.unlocked_ioctl = rpe_ioctl,
+	.compat_ioctl = compat_ptr_ioctl,
+};
+
+static struct miscdevice rpe_misc = {
+	.minor = MISC_DYNAMIC_MINOR,
+	.name = "rp-extio-control",
+	.fops = &rpe_fops,
+	.mode = 0600,
+};
+
+static int __init rpe_init(void)
+{
+	return misc_register(&rpe_misc);
+}
+
+static void __exit rpe_exit(void)
+{
+	misc_deregister(&rpe_misc);
+}
+
+module_init(rpe_init);
+module_exit(rpe_exit);
+
+MODULE_AUTHOR("rp-extio contributors");
+MODULE_DESCRIPTION("Userspace-backed I2C and SPI controllers");
+MODULE_LICENSE("GPL");
