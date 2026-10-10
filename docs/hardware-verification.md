@@ -63,7 +63,11 @@ the same transaction pattern:
 The programmable-slave fixture is optional for initial verification, but it is
 the practical route to exhaustive protocol coverage.
 
-## Pico wiring reference
+## Default Pico wiring reference
+
+These are build defaults, not fixed firmware pins. If the UF2 was built with
+`RP_EXTIO_*` pin variables, wire the fixture to the pin map printed by the
+firmware build and reported in its capabilities.
 
 | Interface | GPIO | Pico header pin |
 | --- | ---: | ---: |

@@ -16,7 +16,7 @@ distributed product uses an allocated VID/PID.
 
 ## Hardware and electrical limits
 
-The Pico 2 pin map is:
+The default Pico 2 pin map is:
 
 | Function | Pico 2 pin |
 | --- | --- |
@@ -30,6 +30,11 @@ The Pico 2 pin map is:
 | UART0 TX | GP0 |
 | UART0 RX | GP1 |
 | GPIO lines 0–16 | GP2, GP3, GP6–GP15, GP20, GP22, GP26–GP28 |
+
+Firmware builds can select other valid, conflict-free RP2350A peripheral
+routes. The 17 unassigned Pico 2 header pins automatically become the GPIO
+lines in ascending pin order, and the firmware reports that generated map to
+the daemon and kernel.
 
 All signals are 3.3 V only. Do not connect 5 V logic directly. I2C SDA and SCL
 need external pull-ups to 3.3 V; 2.2–4.7 kΩ is a common starting range, but the
@@ -71,6 +76,32 @@ Install the Rust target and `picotool`, then build the UF2:
 rustup target add thumbv8m.main-none-eabihf
 ./scripts/build-uf2.sh
 ```
+
+Set pin environment variables on the build command to change the route. For
+example, this builds I2C0 on GP12/GP13:
+
+```sh
+RP_EXTIO_I2C_SDA=12 RP_EXTIO_I2C_SCL=13 ./scripts/build-uf2.sh
+```
+
+Supported variables and defaults are:
+
+| Variable | Default | Valid Pico 2 GPIOs |
+| --- | ---: | --- |
+| `RP_EXTIO_UART_TX` | 0 | 0, 2, 12, 14, 16, 18, 28 |
+| `RP_EXTIO_UART_RX` | 1 | 1, 3, 13, 15, 17, 19 |
+| `RP_EXTIO_I2C_SDA` | 4 | 0, 4, 8, 12, 16, 20 |
+| `RP_EXTIO_I2C_SCL` | 5 | 1, 5, 9, 13, 17, 21 |
+| `RP_EXTIO_SPI_MISO` | 16 | 0, 4, 16, 20 |
+| `RP_EXTIO_SPI_SCK` | 18 | 2, 6, 18, 22 |
+| `RP_EXTIO_SPI_MOSI` | 19 | 3, 7, 19 |
+| `RP_EXTIO_SPI_CS0` | 17 | any Pico 2 header GPIO |
+| `RP_EXTIO_SPI_CS1` | 21 | any Pico 2 header GPIO |
+
+I2C SDA/SCL must be a matching pair, and no pin can be assigned to two
+signals. Invalid or conflicting maps fail the firmware build with a diagnostic.
+Pin selection is currently a build-time interface; runtime daemon-controlled
+routing is planned separately.
 
 Hold BOOTSEL while connecting the Pico 2, then copy
 `build/rp-extio-firmware.uf2` to the `RP2350` mass-storage volume. The firmware
