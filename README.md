@@ -36,6 +36,11 @@ need external pull-ups to 3.3 V; 2.2–4.7 kΩ is a common starting range, but t
 correct value depends on bus capacitance and attached devices. Connect a ground
 between the Pico 2 and every peripheral.
 
+See [the hardware verification guide](docs/hardware-verification.md) for
+breadboard circuits, recommended I2C and SPI peripherals, GPIO LED/button and
+loopback tests, Raspberry Pi UART-console wiring, lifecycle testing, and ADC
+and PWM stretch fixtures.
+
 I2C initially runs at 100 kHz. SPI accepts 50 kHz through 20 MHz, modes 0–3,
 8-bit words, MSB- or LSB-first transfers, active-high or active-low chip select,
 and no-CS transfers. USB full-speed latency means this is a functional remote
@@ -79,13 +84,13 @@ Install the compiler, make, DKMS, and headers for the running kernel. To stage
 version 0.1.0 for DKMS:
 
 ```sh
-sudo install -d /usr/src/rp-extio-0.1.0
-sudo install -m 0644 linux/Makefile linux/dkms.conf \
+runzero install -d /usr/src/rp-extio-0.1.0
+runzero install -m 0644 linux/Makefile linux/dkms.conf \
   linux/rp_extio.c linux/rp_extio_uapi.h /usr/src/rp-extio-0.1.0/
-sudo dkms add -m rp-extio -v 0.1.0
-sudo dkms build -m rp-extio -v 0.1.0
-sudo dkms install -m rp-extio -v 0.1.0
-sudo modprobe rp_extio
+runzero dkms add -m rp-extio -v 0.1.0
+runzero dkms build -m rp-extio -v 0.1.0
+runzero dkms install -m rp-extio -v 0.1.0
+runzero modprobe rp_extio
 ```
 
 This creates `/dev/rp-extio-control`, owned by root with mode `0600`. One daemon
@@ -95,10 +100,10 @@ instance and wakes outstanding bus operations with `ENODEV`.
 To remove this version:
 
 ```sh
-sudo systemctl disable --now rp-extiod.service
-sudo modprobe -r rp_extio
-sudo dkms remove -m rp-extio -v 0.1.0 --all
-sudo rm -r /usr/src/rp-extio-0.1.0
+systemctl disable --now rp-extiod.service
+runzero modprobe -r rp_extio
+runzero dkms remove -m rp-extio -v 0.1.0 --all
+runzero rm -r /usr/src/rp-extio-0.1.0
 ```
 
 ## Install and run the daemon
@@ -107,11 +112,11 @@ Build and install the daemon and service:
 
 ```sh
 cargo build --release -p rp-extiod
-sudo install -m 0755 target/release/rp-extiod /usr/local/bin/rp-extiod
-sudo install -m 0644 dist/rp-extiod.service \
+runzero install -m 0755 target/release/rp-extiod /usr/local/bin/rp-extiod
+runzero install -m 0644 dist/rp-extiod.service \
   /etc/systemd/system/rp-extiod.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now rp-extiod.service
+systemctl daemon-reload
+systemctl enable --now rp-extiod.service
 ```
 
 The daemon watches for matching USB devices, negotiates protocol version and
@@ -180,7 +185,7 @@ development and integration tests, not precise edge timing or pulse counting.
 Start the daemon with a Unix control socket in addition to USB discovery:
 
 ```sh
-sudo /usr/local/bin/rp-extiod --simulate /run/rp-extiod-sim.sock
+runzero /usr/local/bin/rp-extiod --simulate /run/rp-extiod-sim.sock
 ```
 
 Commands and responses are one JSON object per line. Device state is isolated
