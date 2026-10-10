@@ -5,13 +5,16 @@ MEMORY
 }
 
 SECTIONS {
-  .boot_info : ALIGN(4)
+  /* The RP2350 boot ROM scans the first 4 KiB for the IMAGE_DEF start block. */
+  .start_block : ALIGN(4)
   {
+    __start_block_addr = .;
+    KEEP(*(.start_block));
     KEEP(*(.boot_info));
   } > FLASH
 } INSERT AFTER .vector_table;
 
-_stext = ADDR(.boot_info) + SIZEOF(.boot_info);
+_stext = ALIGN(ADDR(.start_block) + SIZEOF(.start_block), 8);
 
 SECTIONS {
   .bi_entries : ALIGN(4)
