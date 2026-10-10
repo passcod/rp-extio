@@ -1,8 +1,8 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_I2C, CAP_SPI, I2cRequest, MAX_PAYLOAD, Operation, SPI_CS_CHANGE, SpiRequest,
-    Status, UsbHeader, WireError, Writer,
+    CAP_GENERAL, CAP_I2C, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD, Operation, SPI_CS_CHANGE,
+    SpiRequest, Status, UsbHeader, WireError, Writer,
 };
 
 pub const I2C_BUS_ID: u8 = 0;
@@ -11,6 +11,9 @@ pub const I2C_SPEED_HZ: u32 = 100_000;
 pub const SPI_MIN_SPEED_HZ: u32 = 50_000;
 pub const SPI_MAX_SPEED_HZ: u32 = 20_000_000;
 pub const SPI_CHIP_SELECTS: u8 = 2;
+pub const UART_TX_PIN: u8 = 0;
+pub const UART_RX_PIN: u8 = 1;
+pub const UART_BAUD: u32 = 115_200;
 
 pub const SPI_CPHA: u16 = 1 << 0;
 pub const SPI_CPOL: u16 = 1 << 1;
@@ -142,6 +145,14 @@ fn hello(payload: &[u8], response: &mut [u8]) -> Result<usize, BusFailure> {
         out.u16(SPI_SUPPORTED_MODES)?;
         out.u32(SPI_MIN_SPEED_HZ)?;
         out.u32(SPI_MAX_SPEED_HZ)
+    })?;
+    record(&mut out, CAP_UART, 12, |out| {
+        out.push(0)?;
+        out.push(UART_TX_PIN)?;
+        out.push(UART_RX_PIN)?;
+        out.push(0)?;
+        out.u32(UART_BAUD)?;
+        out.u32(0)
     })?;
     Ok(out.len())
 }
@@ -281,7 +292,7 @@ mod tests {
     }
 
     #[test]
-    fn hello_reports_both_buses() {
+    fn hello_reports_bus_and_uart_capabilities() {
         let mut response = [0; MAX_PAYLOAD];
         let reply = dispatch(header(Operation::Hello, 0), &[], &mut Stub, &mut response);
         assert_eq!(reply.header.status, Status::Ok);
@@ -290,6 +301,11 @@ mod tests {
             response[..reply.payload_len]
                 .windows(2)
                 .any(|window| window == CAP_SPI.to_le_bytes())
+        );
+        assert!(
+            response[..reply.payload_len]
+                .windows(2)
+                .any(|window| window == CAP_UART.to_le_bytes())
         );
     }
 

@@ -27,6 +27,8 @@ The Pico 2 pin map is:
 | SPI0 MISO | GP16 |
 | SPI0 CS0 | GP17 |
 | SPI0 CS1 | GP21 |
+| UART0 TX | GP0 |
+| UART0 RX | GP1 |
 
 All signals are 3.3 V only. Do not connect 5 V logic directly. I2C SDA and SCL
 need external pull-ups to 3.3 V; 2.2–4.7 kΩ is a common starting range, but the
@@ -38,6 +40,10 @@ I2C initially runs at 100 kHz. SPI accepts 50 kHz through 20 MHz, modes 0–3,
 and no-CS transfers. USB full-speed latency means this is a functional remote
 bus for development and integration tests, not a timing-equivalent substitute
 for a local controller.
+
+UART0 appears through Linux's `cdc_acm` driver as `/dev/ttyACM*`. It uses
+115200 baud, eight data bits, no parity, and one stop bit. Set the host terminal
+to the same format; CDC line-coding requests do not reconfigure the RP2350 UART.
 
 ## Build and flash the firmware
 
@@ -175,5 +181,5 @@ expectations use `chip_select`, `mode`, and a `segments` array; each segment has
 
 ## Current interface scope
 
-I2C and SPI are implemented. CDC ACM UART and the remote GPIO controller are
-specified follow-on interfaces and are not exposed by the current firmware.
+I2C, SPI, and CDC ACM UART are implemented. The remote GPIO controller is a
+specified follow-on interface and is not exposed by the current firmware.

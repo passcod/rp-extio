@@ -6,9 +6,12 @@ mod pico2;
 use core::panic::PanicInfo;
 
 use embassy_futures::join::join;
-use embassy_rp::{bind_interrupts, peripherals, usb};
+use embassy_rp::{bind_interrupts, peripherals, uart, usb};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State as CdcState};
+use embassy_usb::driver::Driver as UsbDriver;
 use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Config};
+use embedded_io_async::{Read, Write};
 use pico2::Pico2Board;
 use rp_extio_firmware::{Board, dispatch};
 use rp_extio_wire::{MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader, WireError};
@@ -21,6 +24,7 @@ const DEVELOPMENT_PID: u16 = 0x4010;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<peripherals::USB>;
+    UART0_IRQ => uart::BufferedInterruptHandler<peripherals::UART0>;
 });
 
 struct UsbBuffers {
@@ -59,6 +63,32 @@ impl BridgeBuffers {
 
 static USB_BUFFERS: StaticCell<UsbBuffers> = StaticCell::new();
 static BRIDGE_BUFFERS: StaticCell<BridgeBuffers> = StaticCell::new();
+static SERIAL_BYTES: StaticCell<[u8; 16]> = StaticCell::new();
+static CDC_STATE: StaticCell<CdcState<'static>> = StaticCell::new();
+static UART_TX_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
+static UART_RX_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
+
+struct RpTimerDriver;
+
+impl embassy_time_driver::Driver for RpTimerDriver {
+    fn now(&self) -> u64 {
+        loop {
+            let high = embassy_rp::pac::TIMER0.timerawh().read();
+            let low = embassy_rp::pac::TIMER0.timerawl().read();
+            if high == embassy_rp::pac::TIMER0.timerawh().read() {
+                return (u64::from(high) << 32) | u64::from(low);
+            }
+        }
+    }
+
+    fn schedule_wake(&self, _at: u64, waker: &core::task::Waker) {
+        // No firmware task currently awaits an Embassy timer. Keep the fallback correct by
+        // repolling if a dependency uses one; TIMER0-backed `now` determines expiry.
+        waker.wake_by_ref();
+    }
+}
+
+embassy_time_driver::time_driver_impl!(static TIME_DRIVER: RpTimerDriver = RpTimerDriver);
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
@@ -70,22 +100,19 @@ fn panic(_info: &PanicInfo<'_>) -> ! {
 #[embassy_executor::main]
 async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let peripherals = embassy_rp::init(Default::default());
-    let mut serial_bytes = [0; 16];
-    encode_serial(
-        embassy_rp::otp::get_chipid().unwrap_or(0),
-        &mut serial_bytes,
-    );
-    let serial = unsafe { core::str::from_utf8_unchecked(&serial_bytes) };
+    let serial_bytes = SERIAL_BYTES.init([0; 16]);
+    encode_serial(embassy_rp::otp::get_chipid().unwrap_or(0), serial_bytes);
+    let serial = unsafe { core::str::from_utf8_unchecked(serial_bytes) };
 
     let driver = usb::Driver::new(peripherals.USB, Irqs);
     let mut config = Config::new(DEVELOPMENT_VID, DEVELOPMENT_PID);
     config.manufacturer = Some("rp-extio");
-    config.product = Some("Pico 2 external I2C/SPI");
+    config.product = Some("Pico 2 external buses");
     config.serial_number = Some(serial);
-    config.device_class = 0;
-    config.device_sub_class = 0;
-    config.device_protocol = 0;
-    config.composite_with_iads = false;
+    config.device_class = 0xef;
+    config.device_sub_class = 0x02;
+    config.device_protocol = 0x01;
+    config.composite_with_iads = true;
 
     let usb_buffers = USB_BUFFERS.init(UsbBuffers::new());
     let mut builder = Builder::new(
@@ -104,7 +131,26 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         let in_endpoint = alternate.endpoint_bulk_in(None, USB_MAX_PACKET as u16);
         (out_endpoint, in_endpoint)
     };
+    let cdc = CdcAcmClass::new(
+        &mut builder,
+        CDC_STATE.init(CdcState::new()),
+        USB_MAX_PACKET as u16,
+    );
     let mut usb = builder.build();
+
+    let mut uart_config = uart::Config::default();
+    uart_config.baudrate = rp_extio_firmware::UART_BAUD;
+    let uart = uart::BufferedUart::new(
+        peripherals.UART0,
+        peripherals.PIN_0,
+        peripherals.PIN_1,
+        Irqs,
+        UART_TX_BUFFER.init([0; 256]),
+        UART_RX_BUFFER.init([0; 256]),
+        uart_config,
+    );
+    let (uart_tx, uart_rx) = uart.split();
+    let (cdc_tx, cdc_rx) = cdc.split();
 
     let mut board = Pico2Board::new(
         peripherals.PIN_4,
@@ -119,10 +165,51 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());
     join(
         usb.run(),
-        bridge(out_endpoint, in_endpoint, &mut board, bridge_buffers),
+        join(
+            bridge(out_endpoint, in_endpoint, &mut board, bridge_buffers),
+            join(cdc_to_uart(cdc_rx, uart_tx), uart_to_cdc(uart_rx, cdc_tx)),
+        ),
     )
     .await;
     unreachable!()
+}
+
+async fn cdc_to_uart<'d, D: UsbDriver<'d>>(
+    mut cdc: Receiver<'d, D>,
+    mut uart: uart::BufferedUartTx,
+) -> ! {
+    let mut packet = [0; USB_MAX_PACKET];
+    loop {
+        cdc.wait_connection().await;
+        while let Ok(length) = cdc.read_packet(&mut packet).await {
+            let mut written = 0;
+            while written < length {
+                match uart.write(&packet[written..length]).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => written += count,
+                }
+            }
+            let _ = uart.flush().await;
+        }
+    }
+}
+
+async fn uart_to_cdc<'d, D: UsbDriver<'d>>(
+    mut uart: uart::BufferedUartRx,
+    mut cdc: Sender<'d, D>,
+) -> ! {
+    let mut packet = [0; USB_MAX_PACKET];
+    loop {
+        cdc.wait_connection().await;
+        while let Ok(length) = uart.read(&mut packet).await {
+            if cdc.write_packet(&packet[..length]).await.is_err() {
+                break;
+            }
+            if length == USB_MAX_PACKET && cdc.write_packet(&[]).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 fn encode_serial(id: u64, output: &mut [u8; 16]) {
