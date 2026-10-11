@@ -1,6 +1,6 @@
 use super::Client;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -131,6 +131,9 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         };
         if key.kind != KeyEventKind::Press {
             continue;
+        }
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            break;
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,

@@ -65,9 +65,9 @@ the practical route to exhaustive protocol coverage.
 
 ## Default Pico wiring reference
 
-These are build defaults, not fixed firmware pins. If the UF2 was built with
-`RP_EXTIO_*` pin variables, wire the fixture to the pin map printed by the
-firmware build and reported in its capabilities.
+These are firmware startup defaults, not fixed pins. Runtime configuration can
+replace them without rebuilding. Always wire the fixture to the active map from
+`rp-extioctl show SERIAL`.
 
 | Interface | GPIO | Pico header pin |
 | --- | ---: | ---: |
@@ -115,6 +115,7 @@ i2cdetect -l
 ls -l /dev/spidev*
 gpioinfo
 systemctl status rp-extiod.service
+rp-extioctl list
 ```
 
 The board must have a stable USB serial, one CDC ACM device, one I2C adapter,
@@ -125,6 +126,33 @@ test before attaching a peripheral:
 cargo test -p rp-extiod negotiates_connected_bridge_and_reads_gpio_snapshot \
   -- --ignored --nocapture
 ```
+
+## Runtime routing
+
+Perform this section with one stock UF2; do not rebuild between routes.
+
+1. Record the startup map with `rp-extioctl show SERIAL`.
+2. Move I2C0 to GP12/GP13 with `rp-extioctl set SERIAL --i2c-sda GP12
+   --i2c-scl GP13`, rediscover the adapter, and read the attached I2C device.
+3. Move I2C0 to a second valid pair, move the wires, and repeat the read.
+4. Move SPI0 MISO/SCK/MOSI and both chip selects to another conflict-free map,
+   rediscover both spidev children, and repeat loopback and device-ID reads.
+5. Move UART0 TX/RX, reconnect the signal wires without reconnecting USB, and
+   verify both CDC-to-UART and UART-to-CDC traffic.
+6. Confirm that the GPIO line list changes to exactly the 17 unassigned header
+   pins after every map change.
+7. Attempt an invalid mux route and a duplicate assignment. The client or
+   firmware must reject each one while the previous buses and active map remain
+   usable.
+8. Start two `rp-extioctl set` operations from the same observed generation.
+   One may apply; the other must report a generation conflict.
+9. Restart the daemon and then reset the Pico. The persistent map must be
+   reapplied in both cases before Linux buses appear.
+10. Run `rp-extioctl default SERIAL`; the startup map must return, its
+    persistent entry must disappear, and Linux buses must be rediscovered.
+11. Run `rp-extioctl tui SERIAL`, exercise every signal selector, conflict
+    display, apply, refresh, reload, and default action, then exit with both `q`
+    and an interrupt and confirm the terminal is restored.
 
 ## GPIO fixture
 

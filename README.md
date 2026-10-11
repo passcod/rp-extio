@@ -77,8 +77,9 @@ rustup target add thumbv8m.main-none-eabihf
 ./scripts/build-uf2.sh
 ```
 
-Set pin environment variables on the build command to change the route. For
-example, this builds I2C0 on GP12/GP13:
+One firmware image supports every valid route at runtime. Pin environment
+variables only change the startup and recovery default. For example, this
+builds a recovery image whose default I2C0 route is GP12/GP13:
 
 ```sh
 RP_EXTIO_I2C_SDA=12 RP_EXTIO_I2C_SCL=13 ./scripts/build-uf2.sh
@@ -100,8 +101,8 @@ Supported variables and defaults are:
 
 I2C SDA/SCL must be a matching pair, and no pin can be assigned to two
 signals. Invalid or conflicting maps fail the firmware build with a diagnostic.
-Pin selection is currently a build-time interface; runtime daemon-controlled
-routing is planned separately.
+The daemon normally replaces this map after USB negotiation and reapplies its
+persistent map after every reconnect or firmware reset.
 
 Hold BOOTSEL while connecting the Pico 2, then copy
 `build/rp-extio-firmware.uf2` to the `RP2350` mass-storage volume. The firmware
@@ -144,6 +145,7 @@ Build and install the daemon and service:
 ```sh
 cargo build --release -p rp-extiod
 runzero install -m 0755 target/release/rp-extiod /usr/local/bin/rp-extiod
+runzero install -m 0755 target/release/rp-extioctl /usr/local/bin/rp-extioctl
 runzero install -m 0644 dist/rp-extiod.service \
   /etc/systemd/system/rp-extiod.service
 systemctl daemon-reload
@@ -166,6 +168,73 @@ that board's Linux buses. Non-idempotent transactions are never retried. A
 reconnected board is negotiated and registered again, potentially under new
 Linux bus numbers. The firmware bus deadline is five seconds, the daemon USB
 deadline is six seconds, and the kernel callback deadline is eight seconds.
+
+## Configure pin routing
+
+`rp-extiod` listens on `/run/rp-extiod.sock` and persists desired maps in
+`/etc/rp-extio/config.json`. The service creates the configuration directory.
+Direct invocations can select alternatives with `--socket` and `--config`.
+`--strict-config` rejects startup if the configuration names a board that is
+not currently connected. Without it, maps for disconnected boards remain
+available and are applied when their serial numbers appear.
+
+List boards and inspect the active map:
+
+```sh
+rp-extioctl list
+rp-extioctl show 125DBCCF0BCA4BEF
+```
+
+Change any subset of signals. The client fetches the active complete map,
+applies the requested edits, validates it, and submits it with the observed
+generation:
+
+```sh
+rp-extioctl set 125DBCCF0BCA4BEF --i2c-sda GP12 --i2c-scl GP13
+rp-extioctl set 125DBCCF0BCA4BEF \
+  --spi-miso GP4 --spi-sck GP6 --spi-mosi GP7 --spi-cs0 GP5 --spi-cs1 GP8
+```
+
+Every accepted change removes and recreates that board's Linux I2C, SPI, and
+GPIO instances, so rediscover their numbers afterward. A stale generation is
+rejected instead of overwriting a concurrent edit. Firmware validates the map
+before touching hardware; an invalid route or conflict leaves the prior map
+active.
+
+Use JSON responses in scripts, restore the firmware default, or launch the
+interactive editor:
+
+```sh
+rp-extioctl --json list
+rp-extioctl default 125DBCCF0BCA4BEF
+rp-extioctl reload
+rp-extioctl tui 125DBCCF0BCA4BEF
+```
+
+In the TUI, `[` and `]` select a board, arrow keys select a signal and pin,
+`a` applies, `d` restores defaults, `r` refreshes, `l` reloads the persistent
+file, and `q` exits. It displays conflicts before submission, the GPIO pins
+derived from the remaining header pins, and current Linux bus assignments.
+
+The persistent file is JSON and always contains complete maps:
+
+```json
+{
+  "version": 1,
+  "boards": {
+    "125DBCCF0BCA4BEF": {
+      "uart_tx": 0, "uart_rx": 1,
+      "i2c_sda": 12, "i2c_scl": 13,
+      "spi_miso": 16, "spi_sck": 18, "spi_mosi": 19,
+      "spi_cs0": 17, "spi_cs1": 21
+    }
+  }
+}
+```
+
+The socket is root-only by default. `rp-extiod --operator-group GROUP` changes
+it to group-writable and assigns it to `GROUP`, allowing operators to route
+pins without direct access to usbfs or `/dev/rp-extio-control`.
 
 Inspect assigned bus numbers with:
 
@@ -255,7 +324,8 @@ event when a consumer has requested the matching edge:
 input in addition to clearing expected and observed bus transactions.
 
 Reply status values are `0` OK, `1` NACK, `2` arbitration lost, `3` timeout,
-`4` disconnected, `5` unsupported, `6` bad frame, and `7` I/O error. SPI
+`4` disconnected, `5` unsupported, `6` bad frame, `7` I/O error, `8` invalid
+route, and `9` pin conflict. SPI
 expectations use `chip_select`, `mode`, and a `segments` array; each segment has
 `speed_hz`, `flags`, `word_delay_ns`, `delay_ns`, `cs_change_delay_ns`, and
 `tx`. A successful SPI reply supplies `completed`, concatenated RX bytes in
