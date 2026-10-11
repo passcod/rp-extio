@@ -223,17 +223,17 @@ some devices are disturbed by address scans.
 
 ### SCD41 demo
 
-With an SCD41 at its fixed address `0x62`, pass the live rp-extio adapter
-number to the demo script:
+With an SCD41 at its fixed address `0x62`, run the demo script:
 
 ```sh
-./scripts/read-scd41.sh 28
+./scripts/read-scd41.sh
 ```
 
-The script starts periodic measurement, waits for the first sample, validates
-all three Sensirion CRC bytes, prints CO2, temperature, and relative humidity,
-then stops periodic measurement. Find the current adapter number with
-`i2cdetect -l`; do not assume it remains the same after reconnecting the board.
+The script builds and starts `rp-extiod`, discovers the adapter created by that
+daemon session, starts periodic measurement, waits for the first sample,
+validates all three Sensirion CRC bytes, and prints CO2, temperature, and
+relative humidity. It then stops periodic measurement and the daemon. The
+privileged phase uses `runzero` and prompts through polkit.
 
 ### Register-device tests
 

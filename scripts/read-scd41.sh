@@ -1,41 +1,162 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if (($# != 1)); then
-  printf 'Usage: %s I2C_BUS\n' "$0" >&2
-  printf 'Example: %s 28\n' "$0" >&2
-  exit 2
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+repo_root=$(cd -- "$script_dir/.." && pwd)
+daemon=$repo_root/target/debug/rp-extiod
+
+usage() {
+  printf 'Usage: %s\n' "$0" >&2
+}
+
+if (($# != 0)); then
+  if (($# != 1)) || [[ $1 != --privileged ]]; then
+    usage
+    exit 2
+  fi
 fi
 
-bus=$1
-if [[ ! $bus =~ ^[0-9]+$ ]]; then
-  printf 'I2C_BUS must be a bus number, got %q\n' "$bus" >&2
-  exit 2
+if ((EUID != 0)); then
+  if (($# != 0)); then
+    printf '%s is an internal option\n' "$1" >&2
+    exit 2
+  fi
+  for command in cargo runzero; do
+    if ! command -v "$command" >/dev/null 2>&1; then
+      printf 'Required command not found: %s\n' "$command" >&2
+      exit 1
+    fi
+  done
+
+  printf 'Building rp-extiod...\n'
+  cargo build -p rp-extiod
+  exec runzero "$script_dir/read-scd41.sh" --privileged
 fi
 
-for command in i2ctransfer awk; do
+for command in awk i2ctransfer modprobe; do
   if ! command -v "$command" >/dev/null 2>&1; then
     printf 'Required command not found: %s\n' "$command" >&2
     exit 1
   fi
 done
 
-device=/dev/i2c-$bus
-if [[ ! -c $device ]]; then
-  printf 'I2C adapter does not exist: %s\n' "$device" >&2
+if [[ ! -x $daemon ]]; then
+  printf 'Daemon binary does not exist: %s\n' "$daemon" >&2
   exit 1
 fi
 
+if [[ ! -c /dev/rp-extio-control ]]; then
+  printf 'Loading rp_extio kernel module...\n'
+  if ! modprobe rp_extio; then
+    module=$repo_root/linux/rp_extio.ko
+    if [[ ! -f $module ]]; then
+      printf 'modprobe failed and the locally built module does not exist: %s\n' "$module" >&2
+      exit 1
+    fi
+    insmod "$module"
+  fi
+
+  if command -v udevadm >/dev/null 2>&1 && [[ -e /sys/class/misc/rp-extio-control ]]; then
+    udevadm trigger --action=add --settle /sys/class/misc/rp-extio-control
+  fi
+fi
+
+if [[ ! -c /dev/rp-extio-control ]]; then
+  printf 'Kernel module loaded without creating /dev/rp-extio-control\n' >&2
+  exit 1
+fi
+
+rp_extio_buses() {
+  local path name
+  shopt -s nullglob
+  for path in /sys/bus/i2c/devices/i2c-*; do
+    read -r name <"$path/name" || continue
+    if [[ $name == 'rp-extio virtual I2C' ]]; then
+      printf '%s\n' "${path##*-}"
+    fi
+  done
+  shopt -u nullglob
+}
+
+declare -A existing_buses=()
+while read -r existing; do
+  existing_buses[$existing]=1
+done < <(rp_extio_buses)
+
 readonly address=0x62
+bus=
+daemon_pid=
+daemon_log=$(mktemp /tmp/rp-extiod-scd41.XXXXXX)
 measuring=false
 
-stop_measurement() {
-  if $measuring; then
+cleanup() {
+  local status=$?
+  trap - EXIT INT TERM
+
+  if $measuring && [[ -n $bus ]]; then
     i2ctransfer -y "$bus" w2@"$address" 0x3f 0x86 >/dev/null || true
     measuring=false
+    sleep 0.5
   fi
+
+  if [[ -n $daemon_pid ]] && kill -0 "$daemon_pid" 2>/dev/null; then
+    printf 'Stopping rp-extiod...\n'
+    kill -TERM "$daemon_pid" 2>/dev/null || true
+    for _ in {1..20}; do
+      if ! kill -0 "$daemon_pid" 2>/dev/null; then
+        break
+      fi
+      sleep 0.1
+    done
+    if kill -0 "$daemon_pid" 2>/dev/null; then
+      printf 'rp-extiod did not stop; process %s remains and log is %s\n' \
+        "$daemon_pid" "$daemon_log" >&2
+      exit 1
+    fi
+    wait "$daemon_pid" 2>/dev/null || true
+  fi
+
+  rm -f -- "$daemon_log"
+  exit "$status"
 }
-trap stop_measurement EXIT INT TERM
+trap cleanup EXIT INT TERM
+
+printf 'Starting rp-extiod...\n'
+"$daemon" --control /dev/rp-extio-control >"$daemon_log" 2>&1 &
+daemon_pid=$!
+
+for _ in {1..50}; do
+  if ! kill -0 "$daemon_pid" 2>/dev/null; then
+    printf 'rp-extiod exited during startup:\n' >&2
+    sed 's/^/  /' "$daemon_log" >&2
+    exit 1
+  fi
+
+  new_buses=()
+  while read -r candidate; do
+    if [[ ! -v existing_buses[$candidate] ]]; then
+      new_buses+=("$candidate")
+    fi
+  done < <(rp_extio_buses)
+
+  if ((${#new_buses[@]} == 1)) && [[ -c /dev/i2c-${new_buses[0]} ]]; then
+    bus=${new_buses[0]}
+    break
+  fi
+  if ((${#new_buses[@]} > 1)); then
+    printf 'rp-extiod registered multiple new I2C adapters; connect one demo board only\n' >&2
+    exit 1
+  fi
+  sleep 0.1
+done
+
+if [[ -z $bus ]]; then
+  printf 'Timed out waiting for rp-extiod to register an I2C adapter\n' >&2
+  if [[ -s $daemon_log ]]; then
+    sed 's/^/  /' "$daemon_log" >&2
+  fi
+  exit 1
+fi
 
 crc8() {
   local crc=255
@@ -86,9 +207,9 @@ co2=$((${response[0]} << 8 | ${response[1]}))
 temperature_raw=$((${response[3]} << 8 | ${response[4]}))
 humidity_raw=$((${response[6]} << 8 | ${response[7]}))
 
-stop_measurement
+i2ctransfer -y "$bus" w2@"$address" 0x3f 0x86
+measuring=false
 sleep 0.5
-trap - EXIT INT TERM
 
 awk \
   -v co2="$co2" \
