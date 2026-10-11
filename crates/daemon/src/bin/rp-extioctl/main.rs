@@ -103,8 +103,19 @@ enum PwmCommand {
         duty_percent: f64,
         #[arg(long)]
         inverted: bool,
+        /// Save and reapply this PWM state whenever the daemon connects
+        #[arg(long)]
+        persist: bool,
     },
     Disable {
+        serial: String,
+        channel: u8,
+        /// Save and reapply the disabled state whenever the daemon connects
+        #[arg(long)]
+        persist: bool,
+    },
+    /// Forget a saved PWM startup state without changing the live channel
+    Forget {
         serial: String,
         channel: u8,
     },
@@ -478,6 +489,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     frequency_hz,
                     duty_percent,
                     inverted,
+                    persist,
                 } => {
                     if frequency_hz == 0 {
                         return Err("PWM frequency must be greater than zero".into());
@@ -492,27 +504,40 @@ fn main() -> Result<(), Box<dyn Error>> {
                     if period_ns == 0 {
                         return Err("PWM frequency is too high".into());
                     }
-                    ControlRequest::PwmApply {
-                        serial,
-                        pwm: PwmInfo {
-                            channel,
-                            enabled: true,
-                            inverted,
-                            period_ns,
-                            duty_ns: (period_ns as f64 * duty_percent / 100.0).round() as u64,
-                        },
+                    let pwm = PwmInfo {
+                        channel,
+                        enabled: true,
+                        inverted,
+                        period_ns,
+                        duty_ns: (period_ns as f64 * duty_percent / 100.0).round() as u64,
+                    };
+                    if persist {
+                        ControlRequest::PwmStartupSet { serial, pwm }
+                    } else {
+                        ControlRequest::PwmApply { serial, pwm }
                     }
                 }
-                PwmCommand::Disable { serial, channel } => ControlRequest::PwmApply {
+                PwmCommand::Disable {
                     serial,
-                    pwm: PwmInfo {
+                    channel,
+                    persist,
+                } => {
+                    let pwm = PwmInfo {
                         channel,
                         enabled: false,
                         inverted: false,
                         period_ns: 0,
                         duty_ns: 0,
-                    },
-                },
+                    };
+                    if persist {
+                        ControlRequest::PwmStartupSet { serial, pwm }
+                    } else {
+                        ControlRequest::PwmApply { serial, pwm }
+                    }
+                }
+                PwmCommand::Forget { serial, channel } => {
+                    ControlRequest::PwmStartupClear { serial, channel }
+                }
             };
             output(client.request(&request)?, cli.json)
         }
@@ -851,6 +876,19 @@ fn print_board(board: &BoardInfo) {
             }
         }
     }
+    if !board.pwm_startup.is_empty() {
+        println!("PWM startup:");
+        for pwm in &board.pwm_startup {
+            println!(
+                "  PWM{} {} period={}ns duty={}ns polarity={}",
+                pwm.channel,
+                if pwm.enabled { "enabled" } else { "disabled" },
+                pwm.period_ns,
+                pwm.duty_ns,
+                if pwm.inverted { "inverted" } else { "normal" }
+            );
+        }
+    }
 }
 
 fn gpio_bias_name(bias: GpioBias) -> &'static str {
@@ -1127,6 +1165,22 @@ mod tests {
             ])
             .is_ok()
         );
+        assert!(
+            Cli::try_parse_from([
+                "rp-extioctl",
+                "pwm",
+                "set",
+                "ABC",
+                "6",
+                "--frequency-hz",
+                "1000",
+                "--duty-percent",
+                "25",
+                "--persist",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["rp-extioctl", "pwm", "forget", "ABC", "6"]).is_ok());
         assert!(
             Cli::try_parse_from([
                 "rp-extioctl",
