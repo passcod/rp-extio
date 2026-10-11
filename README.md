@@ -88,9 +88,9 @@ To build, flash, verify, and reboot the attached Pico 2 in one command:
 just flash
 ```
 
-This works immediately when the board is in BOOTSEL mode. `picotool` also asks
-compatible running firmware to reboot into BOOTSEL automatically; firmware
-without that reset support must first be put into BOOTSEL manually.
+This works immediately when the board is in BOOTSEL mode. This firmware also
+exposes Raspberry Pi's standard USB reset interface, so `picotool` can reboot a
+running board into BOOTSEL automatically for later flashes.
 The firmware returns to BOOTSEL if it panics during startup or operation, so a
 bad image remains recoverable over USB.
 

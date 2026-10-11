@@ -170,15 +170,18 @@ Perform this section with one stock UF2; do not rebuild between routes.
    One may apply; the other must report a generation conflict.
 15. Restart the daemon and then reset the Pico. The persistent map must be
    reapplied in both cases before Linux buses appear.
-16. Run `rp-extioctl default SERIAL`; the startup map must return, its
+16. Run `just flash` while the current firmware is running. Confirm `picotool`
+    resets the board into BOOTSEL, updates it, and executes the new image without
+    touching BOOTSEL or disconnecting the cable.
+17. Run `rp-extioctl default SERIAL`; the startup map must return, its
     persistent entry must disappear, and Linux buses must be rediscovered.
-17. Run `rp-extioctl tui SERIAL`, exercise every signal selector, grouped moves
+18. Run `rp-extioctl tui SERIAL`, exercise every signal selector, grouped moves
     within both hardware instances, the `e` enable toggle, conflict display,
     apply, refresh, reload, and default action. Press `f` and confirm the board
     mirrors left-to-right as viewed belly up, without exchanging the USB and
     SWD ends, and that arrow navigation remains screen-relative. Exit with both
     `q` and an interrupt and confirm the terminal is restored.
-18. With UART0 on GP0/GP1, assign SPI0 SCK to GP2 in grouped mode. Confirm the
+19. With UART0 on GP0/GP1, assign SPI0 SCK to GP2 in grouped mode. Confirm the
     TUI falls back to changing SCK alone, retains the existing MISO/MOSI routes,
     and leaves the draft valid.
 

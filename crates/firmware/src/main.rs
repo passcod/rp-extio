@@ -8,9 +8,11 @@ use core::panic::PanicInfo;
 use embassy_futures::{join::join, yield_now};
 use embassy_rp::{bind_interrupts, gpio::Flex, peripherals, usb};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State as CdcState};
+use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
 use embassy_usb::driver::Driver as UsbDriver;
 use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
-use embassy_usb::{Builder, Config};
+use embassy_usb::types::InterfaceNumber;
+use embassy_usb::{Builder, Config, Handler};
 use pico2::Pico2Board;
 use rp_extio_firmware::{Board, dispatch};
 use rp_extio_wire::{MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader, WireError};
@@ -65,6 +67,29 @@ static USB_BUFFERS: StaticCell<UsbBuffers> = StaticCell::new();
 static BRIDGE_BUFFERS: StaticCell<BridgeBuffers> = StaticCell::new();
 static SERIAL_BYTES: StaticCell<[u8; 16]> = StaticCell::new();
 static CDC_STATES: [StaticCell<CdcState<'static>>; 2] = [StaticCell::new(), StaticCell::new()];
+static RESET_HANDLER: StaticCell<ResetToBootsel> = StaticCell::new();
+
+struct ResetToBootsel {
+    interface: InterfaceNumber,
+}
+
+impl Handler for ResetToBootsel {
+    fn control_out(&mut self, request: Request, data: &[u8]) -> Option<OutResponse> {
+        if request.request_type == RequestType::Class
+            && request.recipient == Recipient::Interface
+            && request.index == u16::from(self.interface.0)
+            && request.request == 1
+            && data.is_empty()
+        {
+            // Raspberry Pi's standard runtime-reset interface passes the BOOTSEL interface
+            // disable mask in the low two bits of wValue. picotool uses this interface to make
+            // `picotool load --force` work without physical access to BOOTSEL.
+            embassy_rp::rom_data::reset_to_usb_boot(0, u32::from(request.value & 0x3));
+            return Some(OutResponse::Accepted);
+        }
+        None
+    }
+}
 
 struct RpTimerDriver;
 
@@ -132,6 +157,16 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         let in_endpoint = alternate.endpoint_bulk_in(None, USB_MAX_PACKET as u16);
         (out_endpoint, in_endpoint)
     };
+    let reset_interface = {
+        let mut function = builder.function(0xff, 0, 1);
+        let mut interface = function.interface();
+        let number = interface.interface_number();
+        interface.alt_setting(0xff, 0, 1, None);
+        number
+    };
+    builder.handler(RESET_HANDLER.init(ResetToBootsel {
+        interface: reset_interface,
+    }));
     let cdc0 = CdcAcmClass::new(
         &mut builder,
         CDC_STATES[0].init(CdcState::new()),
