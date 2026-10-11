@@ -465,7 +465,9 @@ impl Request {
                     value: payload[2],
                 }
             }
-            Operation::Hello | Operation::ConfigurePins => unreachable!(),
+            Operation::Hello | Operation::ConfigurePins | Operation::AdcRead | Operation::Pwm => {
+                unreachable!()
+            }
         };
         Ok(Self {
             operation,

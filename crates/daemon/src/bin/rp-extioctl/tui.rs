@@ -228,10 +228,7 @@ impl App {
         };
         let auto_enabled = !map.is_signal_enabled(signal);
         if auto_enabled {
-            map.set_enabled(signal.peripheral(), true);
-            if let Some(bus) = cs1_bus(signal) {
-                map.set_spi_cs1_enabled(bus, true);
-            }
+            map.set_signal_enabled(signal, true);
         }
         let (candidate, moved_group) = match preferred_routed_map(map, signal, gpio, self.grouped) {
             Ok(candidate) => candidate,
@@ -302,23 +299,17 @@ impl App {
 
     fn toggle_selected_enabled(&mut self) {
         let signal = self.selected_signal();
-        let peripheral = signal.peripheral();
         let Some(mut candidate) = self.edited else {
             self.message = "board is disconnected".into();
             self.message_error = true;
             return;
         };
-        let cs1_bus = cs1_bus(signal);
         let enabled = signal_toggle_enabled(candidate, signal);
-        if let Some(bus) = cs1_bus {
-            candidate.set_spi_cs1_enabled(bus, !enabled);
-        } else {
-            candidate.set_enabled(peripheral, !enabled);
-        }
+        candidate.set_signal_enabled(signal, !enabled);
         if !enabled && let Err(error) = candidate.validate() {
             self.message = format!(
                 "cannot enable {}: {}",
-                cs1_bus.map_or_else(|| peripheral_name(peripheral), |_| display_signal(signal)),
+                enable_target(signal),
                 rp_extiod::control::format_validation(error)
             );
             self.message_error = true;
@@ -328,7 +319,7 @@ impl App {
         self.default_pending = false;
         self.message = format!(
             "{} {}; press a to apply",
-            cs1_bus.map_or_else(|| peripheral_name(peripheral), |_| display_signal(signal)),
+            enable_target(signal),
             if enabled { "disabled" } else { "enabled" }
         );
         self.message_error = false;
@@ -899,32 +890,36 @@ fn find_gpio(gpio: u8) -> Option<(usize, usize)> {
 }
 
 fn coupled_signal(signal: PinSignal) -> bool {
-    !matches!(
+    matches!(
         signal,
-        PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1
+        PinSignal::Uart0Tx
+            | PinSignal::Uart0Rx
+            | PinSignal::Uart1Tx
+            | PinSignal::Uart1Rx
+            | PinSignal::I2c0Sda
+            | PinSignal::I2c0Scl
+            | PinSignal::I2c1Sda
+            | PinSignal::I2c1Scl
+            | PinSignal::Spi0Miso
+            | PinSignal::Spi0Sck
+            | PinSignal::Spi0Mosi
+            | PinSignal::Spi1Miso
+            | PinSignal::Spi1Sck
+            | PinSignal::Spi1Mosi
     )
-}
-
-fn cs1_bus(signal: PinSignal) -> Option<usize> {
-    match signal {
-        PinSignal::Spi0Cs1 => Some(0),
-        PinSignal::Spi1Cs1 => Some(1),
-        _ => None,
-    }
 }
 
 fn enable_target(signal: PinSignal) -> &'static str {
-    cs1_bus(signal).map_or_else(
-        || peripheral_name(signal.peripheral()),
-        |_| display_signal(signal),
-    )
+    if matches!(signal, PinSignal::Spi0Cs1 | PinSignal::Spi1Cs1) {
+        return display_signal(signal);
+    }
+    signal
+        .serial_peripheral()
+        .map_or_else(|| display_signal(signal), peripheral_name)
 }
 
 fn signal_toggle_enabled(map: PinMap, signal: PinSignal) -> bool {
-    cs1_bus(signal).map_or_else(
-        || map.is_enabled(signal.peripheral()),
-        |bus| map.spi_cs1_enabled(bus),
-    )
+    map.is_signal_enabled(signal)
 }
 
 fn routed_map(
@@ -1001,7 +996,31 @@ fn routed_map(
             (PinSignal::Spi1Sck, pin.saturating_sub(1)),
             (PinSignal::Spi1Mosi, pin),
         ],
-        PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1 => {
+        PinSignal::Spi0Cs0
+        | PinSignal::Spi0Cs1
+        | PinSignal::Spi1Cs0
+        | PinSignal::Spi1Cs1
+        | PinSignal::Adc0
+        | PinSignal::Adc1
+        | PinSignal::Adc2
+        | PinSignal::Pwm0A
+        | PinSignal::Pwm0B
+        | PinSignal::Pwm1A
+        | PinSignal::Pwm1B
+        | PinSignal::Pwm2A
+        | PinSignal::Pwm2B
+        | PinSignal::Pwm3A
+        | PinSignal::Pwm3B
+        | PinSignal::Pwm4A
+        | PinSignal::Pwm4B
+        | PinSignal::Pwm5A
+        | PinSignal::Pwm5B
+        | PinSignal::Pwm6A
+        | PinSignal::Pwm6B
+        | PinSignal::Pwm7A
+        | PinSignal::Pwm7B
+        | PinSignal::Clock0
+        | PinSignal::Clock1 => {
             unreachable!()
         }
     };
@@ -1025,6 +1044,7 @@ fn routed_map(
             PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1 => {
                 unreachable!()
             }
+            _ => unreachable!(),
         });
     }
     for &(signal, pin) in routes {
@@ -1090,6 +1110,27 @@ fn display_signal(signal: PinSignal) -> &'static str {
         PinSignal::Spi1Mosi => "SPI1 MOSI",
         PinSignal::Spi1Cs0 => "SPI1 CS0",
         PinSignal::Spi1Cs1 => "SPI1 CS1",
+        PinSignal::Adc0 => "ADC0",
+        PinSignal::Adc1 => "ADC1",
+        PinSignal::Adc2 => "ADC2",
+        PinSignal::Pwm0A => "PWM0 A",
+        PinSignal::Pwm0B => "PWM0 B",
+        PinSignal::Pwm1A => "PWM1 A",
+        PinSignal::Pwm1B => "PWM1 B",
+        PinSignal::Pwm2A => "PWM2 A",
+        PinSignal::Pwm2B => "PWM2 B",
+        PinSignal::Pwm3A => "PWM3 A",
+        PinSignal::Pwm3B => "PWM3 B",
+        PinSignal::Pwm4A => "PWM4 A",
+        PinSignal::Pwm4B => "PWM4 B",
+        PinSignal::Pwm5A => "PWM5 A",
+        PinSignal::Pwm5B => "PWM5 B",
+        PinSignal::Pwm6A => "PWM6 A",
+        PinSignal::Pwm6B => "PWM6 B",
+        PinSignal::Pwm7A => "PWM7 A",
+        PinSignal::Pwm7B => "PWM7 B",
+        PinSignal::Clock0 => "CLOCK0",
+        PinSignal::Clock1 => "CLOCK1",
     }
 }
 
@@ -1113,6 +1154,27 @@ fn short_signal(signal: PinSignal) -> &'static str {
         PinSignal::Spi1Mosi => "S1-MO",
         PinSignal::Spi1Cs0 => "S1-C0",
         PinSignal::Spi1Cs1 => "S1-C1",
+        PinSignal::Adc0 => "ADC0",
+        PinSignal::Adc1 => "ADC1",
+        PinSignal::Adc2 => "ADC2",
+        PinSignal::Pwm0A => "P0-A",
+        PinSignal::Pwm0B => "P0-B",
+        PinSignal::Pwm1A => "P1-A",
+        PinSignal::Pwm1B => "P1-B",
+        PinSignal::Pwm2A => "P2-A",
+        PinSignal::Pwm2B => "P2-B",
+        PinSignal::Pwm3A => "P3-A",
+        PinSignal::Pwm3B => "P3-B",
+        PinSignal::Pwm4A => "P4-A",
+        PinSignal::Pwm4B => "P4-B",
+        PinSignal::Pwm5A => "P5-A",
+        PinSignal::Pwm5B => "P5-B",
+        PinSignal::Pwm6A => "P6-A",
+        PinSignal::Pwm6B => "P6-B",
+        PinSignal::Pwm7A => "P7-A",
+        PinSignal::Pwm7B => "P7-B",
+        PinSignal::Clock0 => "CLK0",
+        PinSignal::Clock1 => "CLK1",
     }
 }
 
@@ -1134,6 +1196,24 @@ fn signal_style(signal: PinSignal) -> Style {
         | PinSignal::Spi1Mosi
         | PinSignal::Spi1Cs0
         | PinSignal::Spi1Cs1 => Color::Yellow,
+        PinSignal::Adc0 | PinSignal::Adc1 | PinSignal::Adc2 => Color::Green,
+        PinSignal::Pwm0A
+        | PinSignal::Pwm0B
+        | PinSignal::Pwm1A
+        | PinSignal::Pwm1B
+        | PinSignal::Pwm2A
+        | PinSignal::Pwm2B
+        | PinSignal::Pwm3A
+        | PinSignal::Pwm3B
+        | PinSignal::Pwm4A
+        | PinSignal::Pwm4B
+        | PinSignal::Pwm5A
+        | PinSignal::Pwm5B
+        | PinSignal::Pwm6A
+        | PinSignal::Pwm6B
+        | PinSignal::Pwm7A
+        | PinSignal::Pwm7B => Color::Blue,
+        PinSignal::Clock0 | PinSignal::Clock1 => Color::Red,
     })
 }
 

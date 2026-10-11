@@ -1,4 +1,6 @@
-use rp_extio_wire::{Peripheral, PinMap, PinSignal, PinValidationError, PinValidationKind};
+use rp_extio_wire::{
+    ClockSource, Peripheral, PinMap, PinSignal, PinValidationError, PinValidationKind,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -9,6 +11,66 @@ use std::{
 
 const fn enabled_by_default() -> bool {
     true
+}
+
+const fn default_adc_pins() -> [u8; 3] {
+    rp_extio_wire::DEFAULT_PIN_MAP.adc_pins
+}
+
+const fn default_pwm_pins() -> [u8; 16] {
+    rp_extio_wire::DEFAULT_PIN_MAP.pwm_pins
+}
+
+const fn default_clock_pins() -> [u8; 2] {
+    rp_extio_wire::DEFAULT_PIN_MAP.clock_pins
+}
+
+const fn default_clock_sources() -> [ClockSourceConfig; 2] {
+    [ClockSourceConfig::System; 2]
+}
+
+const fn default_clock_hz() -> [u32; 2] {
+    rp_extio_wire::DEFAULT_PIN_MAP.clock_hz
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClockSourceConfig {
+    System,
+    Reference,
+    Usb,
+    Adc,
+    Crystal,
+    RingOscillator,
+    LowPowerOscillator,
+}
+
+impl From<ClockSource> for ClockSourceConfig {
+    fn from(source: ClockSource) -> Self {
+        match source {
+            ClockSource::System => Self::System,
+            ClockSource::Reference => Self::Reference,
+            ClockSource::Usb => Self::Usb,
+            ClockSource::Adc => Self::Adc,
+            ClockSource::Crystal => Self::Crystal,
+            ClockSource::RingOscillator => Self::RingOscillator,
+            ClockSource::LowPowerOscillator => Self::LowPowerOscillator,
+        }
+    }
+}
+
+impl From<ClockSourceConfig> for ClockSource {
+    fn from(source: ClockSourceConfig) -> Self {
+        match source {
+            ClockSourceConfig::System => Self::System,
+            ClockSourceConfig::Reference => Self::Reference,
+            ClockSourceConfig::Usb => Self::Usb,
+            ClockSourceConfig::Adc => Self::Adc,
+            ClockSourceConfig::Crystal => Self::Crystal,
+            ClockSourceConfig::RingOscillator => Self::RingOscillator,
+            ClockSourceConfig::LowPowerOscillator => Self::LowPowerOscillator,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,6 +104,22 @@ pub struct PinMapConfig {
     #[serde(default = "enabled_by_default")]
     pub spi1_cs1_enabled: bool,
     pub spi1_cs1: u8,
+    #[serde(default)]
+    pub adc_enabled: [bool; 3],
+    #[serde(default = "default_adc_pins")]
+    pub adc_pins: [u8; 3],
+    #[serde(default)]
+    pub pwm_enabled: [bool; 16],
+    #[serde(default = "default_pwm_pins")]
+    pub pwm_pins: [u8; 16],
+    #[serde(default)]
+    pub clock_enabled: [bool; 2],
+    #[serde(default = "default_clock_pins")]
+    pub clock_pins: [u8; 2],
+    #[serde(default = "default_clock_sources")]
+    pub clock_sources: [ClockSourceConfig; 2],
+    #[serde(default = "default_clock_hz")]
+    pub clock_hz: [u32; 2],
 }
 
 impl From<PinMap> for PinMapConfig {
@@ -73,6 +151,14 @@ impl From<PinMap> for PinMapConfig {
             spi1_cs0: map.spi_chip_selects[1][0],
             spi1_cs1_enabled: map.spi_cs1_enabled(1),
             spi1_cs1: map.spi_chip_selects[1][1],
+            adc_enabled: core::array::from_fn(|channel| map.adc_enabled & (1 << channel) != 0),
+            adc_pins: map.adc_pins,
+            pwm_enabled: core::array::from_fn(|channel| map.pwm_enabled & (1 << channel) != 0),
+            pwm_pins: map.pwm_pins,
+            clock_enabled: core::array::from_fn(|output| map.clock_enabled & (1 << output) != 0),
+            clock_pins: map.clock_pins,
+            clock_sources: map.clock_sources.map(Into::into),
+            clock_hz: map.clock_hz,
         }
     }
 }
@@ -102,6 +188,32 @@ impl From<PinMapConfig> for PinMap {
             spi_mosi: [map.spi0_mosi, map.spi1_mosi],
             spi_chip_selects: [[map.spi0_cs0, map.spi0_cs1], [map.spi1_cs0, map.spi1_cs1]],
             enabled,
+            adc_pins: map.adc_pins,
+            adc_enabled: map
+                .adc_enabled
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (channel, enabled)| {
+                    mask | (u8::from(enabled) << channel)
+                }),
+            pwm_pins: map.pwm_pins,
+            pwm_enabled: map
+                .pwm_enabled
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (channel, enabled)| {
+                    mask | (u16::from(enabled) << channel)
+                }),
+            clock_pins: map.clock_pins,
+            clock_enabled: map
+                .clock_enabled
+                .into_iter()
+                .enumerate()
+                .fold(0, |mask, (output, enabled)| {
+                    mask | (u8::from(enabled) << output)
+                }),
+            clock_sources: map.clock_sources.map(Into::into),
+            clock_hz: map.clock_hz,
         };
         pins.set_spi_cs1_enabled(0, map.spi0_cs1_enabled);
         pins.set_spi_cs1_enabled(1, map.spi1_cs1_enabled);
@@ -277,10 +389,10 @@ impl ConfigStore {
                             .map(|(serial, map)| (serial, map.into()))
                             .collect()
                     }
-                    2 => {
+                    2 | 3 => {
                         let config: ConfigFile =
                             serde_json::from_value(value).map_err(invalid_data)?;
-                        debug_assert_eq!(config.version, 2);
+                        debug_assert!(matches!(config.version, 2 | 3));
                         config
                             .boards
                             .into_iter()
@@ -371,7 +483,7 @@ impl ConfigStore {
                 .create_new(true)
                 .open(&temporary)?;
             let config = ConfigFile {
-                version: 2,
+                version: 3,
                 boards: self
                     .boards
                     .iter()
@@ -411,6 +523,27 @@ pub fn signal_name(signal: PinSignal) -> &'static str {
         PinSignal::Spi1Mosi => "spi1_mosi",
         PinSignal::Spi1Cs0 => "spi1_cs0",
         PinSignal::Spi1Cs1 => "spi1_cs1",
+        PinSignal::Adc0 => "adc0",
+        PinSignal::Adc1 => "adc1",
+        PinSignal::Adc2 => "adc2",
+        PinSignal::Pwm0A => "pwm0a",
+        PinSignal::Pwm0B => "pwm0b",
+        PinSignal::Pwm1A => "pwm1a",
+        PinSignal::Pwm1B => "pwm1b",
+        PinSignal::Pwm2A => "pwm2a",
+        PinSignal::Pwm2B => "pwm2b",
+        PinSignal::Pwm3A => "pwm3a",
+        PinSignal::Pwm3B => "pwm3b",
+        PinSignal::Pwm4A => "pwm4a",
+        PinSignal::Pwm4B => "pwm4b",
+        PinSignal::Pwm5A => "pwm5a",
+        PinSignal::Pwm5B => "pwm5b",
+        PinSignal::Pwm6A => "pwm6a",
+        PinSignal::Pwm6B => "pwm6b",
+        PinSignal::Pwm7A => "pwm7a",
+        PinSignal::Pwm7B => "pwm7b",
+        PinSignal::Clock0 => "clock0",
+        PinSignal::Clock1 => "clock1",
     }
 }
 
@@ -567,8 +700,12 @@ mod tests {
 
         store.set("ABC".into(), map).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(saved["version"], 2);
+        assert_eq!(saved["version"], 3);
         assert_eq!(saved["boards"]["ABC"]["uart1_enabled"], false);
+        assert_eq!(
+            saved["boards"]["ABC"]["adc_enabled"],
+            serde_json::json!([false, false, false])
+        );
     }
 
     #[test]
@@ -592,5 +729,8 @@ mod tests {
         assert!(config.spi1_cs1_enabled);
         let map = PinMap::from(config);
         assert_eq!(map.enabled, rp_extio_wire::DEFAULT_PIN_MAP.enabled);
+        assert_eq!(map.adc_enabled, 0);
+        assert_eq!(map.pwm_enabled, 0);
+        assert_eq!(map.clock_enabled, 0);
     }
 }
