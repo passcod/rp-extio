@@ -221,7 +221,6 @@ impl App {
     fn load_current(&mut self) {
         self.edited = self.active_map();
         self.default_pending = false;
-        self.signal = 0;
         self.move_to_signal_pin();
         self.clear_message();
     }
@@ -2081,6 +2080,22 @@ mod tests {
         app.undo();
         assert!(!app.default_pending);
         assert!(!app.dirty());
+    }
+
+    #[test]
+    fn reloading_current_board_preserves_the_selected_signal() {
+        let mut app = app();
+        app.signal = PinSignal::Adc2 as usize;
+        app.cursor_row = 0;
+        app.cursor_side = 0;
+
+        app.load_current();
+
+        assert_eq!(app.selected_signal(), PinSignal::Adc2);
+        assert_eq!(
+            (app.cursor_row, app.cursor_side),
+            find_gpio(DEFAULT_PIN_MAP.adc_pins[2]).unwrap()
+        );
     }
 
     #[test]
