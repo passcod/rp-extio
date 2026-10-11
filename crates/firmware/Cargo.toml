@@ -15,6 +15,9 @@ required-features = ["firmware"]
 [dependencies]
 rp-extio-wire = { path = "../wire" }
 
+[build-dependencies]
+rp-extio-wire = { path = "../wire" }
+
 [features]
 default = []
 firmware = []

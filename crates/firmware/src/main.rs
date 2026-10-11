@@ -5,13 +5,12 @@ mod pico2;
 
 use core::panic::PanicInfo;
 
-use embassy_futures::join::join;
-use embassy_rp::{bind_interrupts, peripherals, uart, usb};
+use embassy_futures::{join::join, yield_now};
+use embassy_rp::{bind_interrupts, gpio::Flex, peripherals, usb};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State as CdcState};
 use embassy_usb::driver::Driver as UsbDriver;
 use embassy_usb::driver::{EndpointError, EndpointIn, EndpointOut};
 use embassy_usb::{Builder, Config};
-use embedded_io_async::{Read, Write};
 use pico2::Pico2Board;
 use rp_extio_firmware::{Board, dispatch};
 use rp_extio_wire::{MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader, WireError};
@@ -26,7 +25,6 @@ const DEVELOPMENT_PID: u16 = 0x4010;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => usb::InterruptHandler<peripherals::USB>;
-    UART0_IRQ => uart::BufferedInterruptHandler<peripherals::UART0>;
 });
 
 struct UsbBuffers {
@@ -67,8 +65,6 @@ static USB_BUFFERS: StaticCell<UsbBuffers> = StaticCell::new();
 static BRIDGE_BUFFERS: StaticCell<BridgeBuffers> = StaticCell::new();
 static SERIAL_BYTES: StaticCell<[u8; 16]> = StaticCell::new();
 static CDC_STATE: StaticCell<CdcState<'static>> = StaticCell::new();
-static UART_TX_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
-static UART_RX_BUFFER: StaticCell<[u8; 256]> = StaticCell::new();
 
 struct RpTimerDriver;
 
@@ -140,72 +136,78 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     );
     let mut usb = builder.build();
 
-    let mut uart_config = uart::Config::default();
-    uart_config.baudrate = rp_extio_firmware::UART_BAUD;
-    let uart = uart::BufferedUart::new(
-        peripherals.UART0,
-        configured_uart_tx!(peripherals),
-        configured_uart_rx!(peripherals),
-        Irqs,
-        UART_TX_BUFFER.init([0; 256]),
-        UART_RX_BUFFER.init([0; 256]),
-        uart_config,
-    );
-    let (uart_tx, uart_rx) = uart.split();
     let (cdc_tx, cdc_rx) = cdc.split();
 
     let mut board = Pico2Board::new(
-        configured_i2c_sda!(peripherals),
-        configured_i2c_scl!(peripherals),
-        configured_spi_miso!(peripherals),
-        configured_spi_cs0!(peripherals),
-        configured_spi_sck!(peripherals),
-        configured_spi_mosi!(peripherals),
-        configured_spi_cs1!(peripherals),
+        [
+            Flex::new(peripherals.PIN_0),
+            Flex::new(peripherals.PIN_1),
+            Flex::new(peripherals.PIN_2),
+            Flex::new(peripherals.PIN_3),
+            Flex::new(peripherals.PIN_4),
+            Flex::new(peripherals.PIN_5),
+            Flex::new(peripherals.PIN_6),
+            Flex::new(peripherals.PIN_7),
+            Flex::new(peripherals.PIN_8),
+            Flex::new(peripherals.PIN_9),
+            Flex::new(peripherals.PIN_10),
+            Flex::new(peripherals.PIN_11),
+            Flex::new(peripherals.PIN_12),
+            Flex::new(peripherals.PIN_13),
+            Flex::new(peripherals.PIN_14),
+            Flex::new(peripherals.PIN_15),
+            Flex::new(peripherals.PIN_16),
+            Flex::new(peripherals.PIN_17),
+            Flex::new(peripherals.PIN_18),
+            Flex::new(peripherals.PIN_19),
+            Flex::new(peripherals.PIN_20),
+            Flex::new(peripherals.PIN_21),
+            Flex::new(peripherals.PIN_22),
+            Flex::new(peripherals.PIN_26),
+            Flex::new(peripherals.PIN_27),
+            Flex::new(peripherals.PIN_28),
+        ],
         peripherals.SPI0,
-        configured_gpio!(peripherals),
-        &PIN_CONFIG,
+        peripherals.UART0,
+        PIN_MAP,
     );
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());
     join(
         usb.run(),
         join(
             bridge(out_endpoint, in_endpoint, &mut board, bridge_buffers),
-            join(cdc_to_uart(cdc_rx, uart_tx), uart_to_cdc(uart_rx, cdc_tx)),
+            join(cdc_to_uart(cdc_rx), uart_to_cdc(cdc_tx)),
         ),
     )
     .await;
     unreachable!()
 }
 
-async fn cdc_to_uart<'d, D: UsbDriver<'d>>(
-    mut cdc: Receiver<'d, D>,
-    mut uart: uart::BufferedUartTx,
-) -> ! {
+async fn cdc_to_uart<'d, D: UsbDriver<'d>>(mut cdc: Receiver<'d, D>) -> ! {
     let mut packet = [0; USB_MAX_PACKET];
     loop {
         cdc.wait_connection().await;
         while let Ok(length) = cdc.read_packet(&mut packet).await {
-            let mut written = 0;
-            while written < length {
-                match uart.write(&packet[written..length]).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(count) => written += count,
+            for &byte in &packet[..length] {
+                while Pico2Board::uart_tx_full() {
+                    yield_now().await;
                 }
+                Pico2Board::uart_write(byte);
             }
-            let _ = uart.flush().await;
         }
     }
 }
 
-async fn uart_to_cdc<'d, D: UsbDriver<'d>>(
-    mut uart: uart::BufferedUartRx,
-    mut cdc: Sender<'d, D>,
-) -> ! {
+async fn uart_to_cdc<'d, D: UsbDriver<'d>>(mut cdc: Sender<'d, D>) -> ! {
     let mut packet = [0; USB_MAX_PACKET];
     loop {
         cdc.wait_connection().await;
-        while let Ok(length) = uart.read(&mut packet).await {
+        loop {
+            let mut length = Pico2Board::uart_read(&mut packet);
+            while length == 0 {
+                yield_now().await;
+                length = Pico2Board::uart_read(&mut packet);
+            }
             if cdc.write_packet(&packet[..length]).await.is_err() {
                 break;
             }
