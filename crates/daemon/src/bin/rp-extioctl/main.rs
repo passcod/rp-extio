@@ -72,15 +72,16 @@ enum Command {
         #[arg(long)]
         active_low: bool,
     },
-    /// Configure a button input and wait for a level or transition
+    /// Wait for a configured button level or transition
     Button {
         serial: String,
         #[arg(value_parser = parse_pin)]
         pin: u8,
         #[arg(long, value_enum, default_value_t = ButtonWait::Pressed)]
         wait: ButtonWait,
-        #[arg(long, value_enum, default_value_t = BiasArg::PullUp)]
-        pull: BiasArg,
+        /// Reconfigure the pin as an input with this bias before waiting
+        #[arg(long, value_enum)]
+        pull: Option<BiasArg>,
         /// Override the saved button configuration and interpret low as pressed
         #[arg(long, conflicts_with = "active_high")]
         active_low: bool,
@@ -618,7 +619,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 &serial,
                 pin,
                 wait,
-                pull.into(),
+                pull.map(Into::into),
                 active_low,
                 timeout_ms,
                 cli.json,
@@ -662,23 +663,31 @@ fn wait_for_button(
     serial: &str,
     pin: u8,
     wait: ButtonWait,
-    bias: GpioBias,
+    bias: Option<GpioBias>,
     active_low: bool,
     timeout_ms: Option<u64>,
     json: bool,
 ) -> Result<(), Box<dyn Error>> {
-    match client.request(&ControlRequest::GpioInput {
-        serial: serial.into(),
-        pin,
-        bias,
-    })? {
-        ControlResponse::Gpio { .. } => {}
-        response => return Err(response_error(response).into()),
+    if let Some(bias) = bias {
+        match client.request(&ControlRequest::GpioInput {
+            serial: serial.into(),
+            pin,
+            bias,
+        })? {
+            ControlResponse::Gpio { .. } => {}
+            response => return Err(response_error(response).into()),
+        }
     }
     let started = std::time::Instant::now();
     let mut previous = None;
     loop {
         let gpio = snapshot_pin(client, serial, pin)?;
+        if gpio.output {
+            return Err(format!(
+                "GP{pin} is configured as an output; configure it as an input or pass --pull"
+            )
+            .into());
+        }
         let logical = gpio.level != active_low;
         let triggered = match (wait, previous) {
             (ButtonWait::Pressed, _) => logical,
@@ -1246,19 +1255,34 @@ mod tests {
             .is_ok()
         );
         assert!(Cli::try_parse_from(["rp-extioctl", "pwm", "forget", "ABC", "6"]).is_ok());
-        assert!(
-            Cli::try_parse_from([
-                "rp-extioctl",
-                "button",
-                "ABC",
-                "GP22",
-                "--wait",
-                "falling",
-                "--timeout-ms",
-                "1000",
-            ])
-            .is_ok()
-        );
+        let cli = Cli::try_parse_from([
+            "rp-extioctl",
+            "button",
+            "ABC",
+            "GP22",
+            "--wait",
+            "falling",
+            "--timeout-ms",
+            "1000",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Button { pull: None, .. }));
+        let cli = Cli::try_parse_from([
+            "rp-extioctl",
+            "button",
+            "ABC",
+            "GP22",
+            "--pull",
+            "pull-down",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Button {
+                pull: Some(BiasArg::PullDown),
+                ..
+            }
+        ));
     }
 
     #[test]

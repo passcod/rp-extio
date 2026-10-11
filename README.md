@@ -525,6 +525,9 @@ rp-extioctl button 125DBCCF0BCA4BEF GP28 --wait pressed --timeout-ms 10000
 The button command uses the polarity saved for that board and pin by the TUI.
 If no button role is saved, it reports an error instead of guessing. For an
 ad-hoc invocation, `--active-low` or `--active-high` overrides the saved role.
+Without `--pull`, it only reads an already-configured input and does not require
+authorization. Supplying `--pull pull-up`, `--pull pull-down`, or `--pull none`
+first changes the pin's direction and bias, so Polkit authorizes that operation.
 
 Without `--persist`, daemon-owned output state lasts until another command
 changes it, the pin map is reconfigured, or the device disconnects. Persisted
