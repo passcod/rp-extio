@@ -3,8 +3,8 @@ mod tui;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use rp_extio_wire::{ClockSource, Peripheral, PinMap, PinSignal};
 use rp_extiod::control::{
-    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, PinMapConfig, PwmInfo,
-    signal_name,
+    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup, PinMapConfig,
+    PwmInfo, signal_name,
 };
 use std::{
     error::Error,
@@ -120,6 +120,9 @@ enum GpioCommand {
         #[arg(value_parser = parse_pin)]
         pin: u8,
         level: LevelArg,
+        /// Save and reapply this output level whenever the daemon connects
+        #[arg(long)]
+        persist: bool,
     },
     Input {
         serial: String,
@@ -127,6 +130,15 @@ enum GpioCommand {
         pin: u8,
         #[arg(long, value_enum, default_value_t = BiasArg::None)]
         pull: BiasArg,
+        /// Save and reapply this input bias whenever the daemon connects
+        #[arg(long)]
+        persist: bool,
+    },
+    /// Forget a saved startup state without changing the live pin
+    Forget {
+        serial: String,
+        #[arg(value_parser = parse_pin)]
+        pin: u8,
     },
 }
 
@@ -507,16 +519,41 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Gpio { command } => {
             let request = match command {
                 GpioCommand::Snapshot { serial } => ControlRequest::GpioSnapshot { serial },
-                GpioCommand::Set { serial, pin, level } => ControlRequest::GpioOutput {
+                GpioCommand::Set {
                     serial,
                     pin,
-                    value: matches!(level, LevelArg::High),
-                },
-                GpioCommand::Input { serial, pin, pull } => ControlRequest::GpioInput {
+                    level,
+                    persist,
+                } => {
+                    let value = matches!(level, LevelArg::High);
+                    if persist {
+                        ControlRequest::GpioStartupSet {
+                            serial,
+                            startup: GpioStartup::Output { pin, value },
+                        }
+                    } else {
+                        ControlRequest::GpioOutput { serial, pin, value }
+                    }
+                }
+                GpioCommand::Input {
                     serial,
                     pin,
-                    bias: pull.into(),
-                },
+                    pull,
+                    persist,
+                } => {
+                    let bias = pull.into();
+                    if persist {
+                        ControlRequest::GpioStartupSet {
+                            serial,
+                            startup: GpioStartup::Input { pin, bias },
+                        }
+                    } else {
+                        ControlRequest::GpioInput { serial, pin, bias }
+                    }
+                }
+                GpioCommand::Forget { serial, pin } => {
+                    ControlRequest::GpioStartupClear { serial, pin }
+                }
             };
             output(client.request(&request)?, cli.json)
         }
@@ -800,6 +837,28 @@ fn print_board(board: &BoardInfo) {
     {
         print_map("desired", map);
     }
+    if !board.gpio_startup.is_empty() {
+        println!("GPIO startup:");
+        for startup in &board.gpio_startup {
+            match startup {
+                GpioStartup::Output { pin, value } => println!(
+                    "  GP{pin:<2} output {}",
+                    if *value { "high" } else { "low" }
+                ),
+                GpioStartup::Input { pin, bias } => {
+                    println!("  GP{pin:<2} input bias={}", gpio_bias_name(*bias))
+                }
+            }
+        }
+    }
+}
+
+fn gpio_bias_name(bias: GpioBias) -> &'static str {
+    match bias {
+        GpioBias::None => "none",
+        GpioBias::PullUp => "pull-up",
+        GpioBias::PullDown => "pull-down",
+    }
 }
 
 fn print_map(label: &str, config: PinMapConfig) {
@@ -1081,6 +1140,45 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn parses_persisted_gpio_commands() {
+        let cli = Cli::try_parse_from([
+            "rp-extioctl",
+            "gpio",
+            "set",
+            "ABC",
+            "GP22",
+            "high",
+            "--persist",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Gpio {
+                command: GpioCommand::Set {
+                    pin: 22,
+                    persist: true,
+                    ..
+                }
+            }
+        ));
+
+        assert!(
+            Cli::try_parse_from([
+                "rp-extioctl",
+                "gpio",
+                "input",
+                "ABC",
+                "GP28",
+                "--pull",
+                "pull-up",
+                "--persist",
+            ])
+            .is_ok()
+        );
+        assert!(Cli::try_parse_from(["rp-extioctl", "gpio", "forget", "ABC", "GP22"]).is_ok());
     }
 
     #[test]
