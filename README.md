@@ -242,10 +242,18 @@ rp-extioctl reload
 rp-extioctl tui 125DBCCF0BCA4BEF
 ```
 
-In the TUI, `[` and `]` select a board, arrow keys select a signal and pin,
-`a` applies, `d` restores defaults, `r` refreshes, `l` reloads the persistent
-file, and `q` exits. It displays conflicts before submission, the GPIO pins
-derived from the remaining header pins, and current Linux bus assignments.
+The TUI presents the physical Pico 2 headers with pin 1 opposite pin 40 at the
+USB end. Arrow keys move between physical pins, Tab and Shift-Tab select a
+peripheral signal, and Enter or Space assigns that signal to the highlighted
+GPIO in the draft. Valid routes are highlighted; conflicts, mismatched I2C
+pairs, changed pins, exported GPIO lines, power pins, grounds, and current Linux
+bus assignments remain visible on the board.
+
+`a` applies the complete draft atomically, `d` loads the firmware defaults into
+the draft, and `u` discards edits and restores the active map. `[` and `]`
+select a board, `r` refreshes, `l` reloads the persistent file, and `q` exits.
+Short terminals scroll the physical pin rows around the cursor, while wide
+terminals also show a complete signal legend.
 
 The persistent file is JSON and always contains complete maps:
 

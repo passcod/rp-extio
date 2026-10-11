@@ -7,13 +7,91 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use rp_extio_wire::{PinMap, PinSignal};
+use rp_extio_wire::{DEFAULT_PIN_MAP, PinMap, PinSignal};
 use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, signal_name};
 use std::{error::Error, io::stdout};
+
+const HEADER_ROWS: usize = 20;
+const MIN_WIDTH: u16 = 54;
+const MIN_HEIGHT: u16 = 12;
+const WIDE_WIDTH: u16 = 92;
+const CENTER_WIDTH: u16 = 8;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeaderPin {
+    physical: u8,
+    label: &'static str,
+    gpio: Option<u8>,
+}
+
+impl HeaderPin {
+    const fn gpio(physical: u8, gpio: u8, label: &'static str) -> Self {
+        Self {
+            physical,
+            label,
+            gpio: Some(gpio),
+        }
+    }
+
+    const fn fixed(physical: u8, label: &'static str) -> Self {
+        Self {
+            physical,
+            label,
+            gpio: None,
+        }
+    }
+}
+
+const LEFT_HEADER: [HeaderPin; HEADER_ROWS] = [
+    HeaderPin::gpio(1, 0, "GP0"),
+    HeaderPin::gpio(2, 1, "GP1"),
+    HeaderPin::fixed(3, "GND"),
+    HeaderPin::gpio(4, 2, "GP2"),
+    HeaderPin::gpio(5, 3, "GP3"),
+    HeaderPin::gpio(6, 4, "GP4"),
+    HeaderPin::gpio(7, 5, "GP5"),
+    HeaderPin::fixed(8, "GND"),
+    HeaderPin::gpio(9, 6, "GP6"),
+    HeaderPin::gpio(10, 7, "GP7"),
+    HeaderPin::gpio(11, 8, "GP8"),
+    HeaderPin::gpio(12, 9, "GP9"),
+    HeaderPin::fixed(13, "GND"),
+    HeaderPin::gpio(14, 10, "GP10"),
+    HeaderPin::gpio(15, 11, "GP11"),
+    HeaderPin::gpio(16, 12, "GP12"),
+    HeaderPin::gpio(17, 13, "GP13"),
+    HeaderPin::fixed(18, "GND"),
+    HeaderPin::gpio(19, 14, "GP14"),
+    HeaderPin::gpio(20, 15, "GP15"),
+];
+
+const RIGHT_HEADER: [HeaderPin; HEADER_ROWS] = [
+    HeaderPin::fixed(40, "VBUS"),
+    HeaderPin::fixed(39, "VSYS"),
+    HeaderPin::fixed(38, "GND"),
+    HeaderPin::fixed(37, "3V3_EN"),
+    HeaderPin::fixed(36, "3V3_OUT"),
+    HeaderPin::fixed(35, "ADC_VREF"),
+    HeaderPin::gpio(34, 28, "GP28/ADC2"),
+    HeaderPin::fixed(33, "AGND"),
+    HeaderPin::gpio(32, 27, "GP27/ADC1"),
+    HeaderPin::gpio(31, 26, "GP26/ADC0"),
+    HeaderPin::fixed(30, "RUN"),
+    HeaderPin::gpio(29, 22, "GP22"),
+    HeaderPin::fixed(28, "GND"),
+    HeaderPin::gpio(27, 21, "GP21"),
+    HeaderPin::gpio(26, 20, "GP20"),
+    HeaderPin::gpio(25, 19, "GP19"),
+    HeaderPin::gpio(24, 18, "GP18"),
+    HeaderPin::fixed(23, "GND"),
+    HeaderPin::gpio(22, 17, "GP17"),
+    HeaderPin::gpio(21, 16, "GP16"),
+];
 
 struct TerminalGuard;
 
@@ -36,8 +114,12 @@ struct App {
     boards: Vec<BoardInfo>,
     board: usize,
     signal: usize,
+    cursor_row: usize,
+    cursor_side: usize,
     edited: Option<PinMap>,
+    default_pending: bool,
     message: String,
+    message_error: bool,
 }
 
 impl App {
@@ -45,12 +127,38 @@ impl App {
         self.boards.get(self.board)
     }
 
-    fn load_current(&mut self) {
-        self.edited = self
-            .current()
-            .and_then(|board| board.active.map(Into::into));
-        self.signal = 0;
+    fn active_map(&self) -> Option<PinMap> {
+        self.current()
+            .and_then(|board| board.active.map(Into::into))
+    }
+
+    fn selected_signal(&self) -> PinSignal {
+        PinSignal::ALL[self.signal]
+    }
+
+    fn selected_pin(&self) -> HeaderPin {
+        if self.cursor_side == 0 {
+            LEFT_HEADER[self.cursor_row]
+        } else {
+            RIGHT_HEADER[self.cursor_row]
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.default_pending || self.edited != self.active_map()
+    }
+
+    fn clear_message(&mut self) {
         self.message.clear();
+        self.message_error = false;
+    }
+
+    fn load_current(&mut self) {
+        self.edited = self.active_map();
+        self.default_pending = false;
+        self.signal = 0;
+        self.move_to_signal_pin();
+        self.clear_message();
     }
 
     fn switch_board(&mut self, delta: isize) {
@@ -61,23 +169,82 @@ impl App {
         self.load_current();
     }
 
-    fn cycle_pin(&mut self, delta: isize) {
-        let Some(map) = self.edited.as_mut() else {
+    fn cycle_signal(&mut self, delta: isize) {
+        self.signal =
+            (self.signal as isize + delta).rem_euclid(PinSignal::ALL.len() as isize) as usize;
+        self.move_to_signal_pin();
+        self.clear_message();
+    }
+
+    fn move_to_signal_pin(&mut self) {
+        let Some(map) = self.edited else {
             return;
         };
-        let signal = PinSignal::ALL[self.signal];
-        let candidates = signal.valid_pins();
-        let current = candidates
-            .iter()
-            .position(|&pin| pin == map.pin(signal))
-            .unwrap_or(0);
-        let next = (current as isize + delta).rem_euclid(candidates.len() as isize) as usize;
-        map.set_pin(signal, candidates[next]);
-        self.message = map
-            .validate()
-            .err()
-            .map(rp_extiod::control::format_validation)
-            .unwrap_or_else(|| "ready to apply".into());
+        let gpio = map.pin(self.selected_signal());
+        if let Some((row, side)) = find_gpio(gpio) {
+            self.cursor_row = row;
+            self.cursor_side = side;
+        }
+    }
+
+    fn move_cursor(&mut self, row_delta: isize, side_delta: isize) {
+        self.cursor_row =
+            (self.cursor_row as isize + row_delta).clamp(0, HEADER_ROWS as isize - 1) as usize;
+        self.cursor_side = (self.cursor_side as isize + side_delta).clamp(0, 1) as usize;
+        self.clear_message();
+    }
+
+    fn assign_selected(&mut self) {
+        let pin = self.selected_pin();
+        let signal = self.selected_signal();
+        let Some(gpio) = pin.gpio else {
+            self.message = format!(
+                "physical pin {} ({}) cannot carry a route",
+                pin.physical, pin.label
+            );
+            self.message_error = true;
+            return;
+        };
+        if !signal.valid_pins().contains(&gpio) {
+            self.message = format!("GP{gpio} is not a valid route for {}", signal_name(signal));
+            self.message_error = true;
+            return;
+        }
+        let Some(map) = self.edited.as_mut() else {
+            self.message = "board is disconnected".into();
+            self.message_error = true;
+            return;
+        };
+        map.set_pin(signal, gpio);
+        self.default_pending = false;
+        if let Err(error) = map.validate() {
+            self.message = rp_extiod::control::format_validation(error);
+            self.message_error = true;
+        } else {
+            self.message = "draft route updated; press a to apply".into();
+            self.message_error = false;
+        }
+    }
+
+    fn load_default(&mut self) {
+        if self.edited.is_none() {
+            self.message = "board is disconnected".into();
+            self.message_error = true;
+            return;
+        }
+        self.edited = Some(DEFAULT_PIN_MAP);
+        self.default_pending = true;
+        self.move_to_signal_pin();
+        self.message = "firmware defaults loaded into draft; press a to apply".into();
+        self.message_error = false;
+    }
+
+    fn undo(&mut self) {
+        self.edited = self.active_map();
+        self.default_pending = false;
+        self.move_to_signal_pin();
+        self.message = "draft restored from active map".into();
+        self.message_error = false;
     }
 
     fn refresh(
@@ -117,8 +284,12 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         boards,
         board,
         signal: 0,
+        cursor_row: 0,
+        cursor_side: 0,
         edited: None,
+        default_pending: false,
         message: String::new(),
+        message_error: false,
     };
     app.load_current();
 
@@ -139,25 +310,37 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::Char('q') | KeyCode::Esc => break,
             KeyCode::Char('[') => app.switch_board(-1),
             KeyCode::Char(']') => app.switch_board(1),
-            KeyCode::Up => app.signal = app.signal.saturating_sub(1),
-            KeyCode::Down => app.signal = (app.signal + 1).min(PinSignal::ALL.len() - 1),
-            KeyCode::Left => app.cycle_pin(-1),
-            KeyCode::Right => app.cycle_pin(1),
+            KeyCode::Up => app.move_cursor(-1, 0),
+            KeyCode::Down => app.move_cursor(1, 0),
+            KeyCode::Left => app.move_cursor(0, -1),
+            KeyCode::Right => app.move_cursor(0, 1),
+            KeyCode::Tab => app.cycle_signal(1),
+            KeyCode::BackTab => app.cycle_signal(-1),
+            KeyCode::Enter | KeyCode::Char(' ') => app.assign_selected(),
+            KeyCode::Char('u') => app.undo(),
+            KeyCode::Char('d') => app.load_default(),
             KeyCode::Char('r') => {
                 let serial = app.current().map(|board| board.serial.clone());
                 app.refresh(client, serial.as_deref())?;
                 app.message = "refreshed".into();
+                app.message_error = false;
             }
             KeyCode::Char('l') => match client.request(&ControlRequest::Reload)? {
                 ControlResponse::Ok => {
                     app.refresh(client, None)?;
                     app.message = "configuration reloaded".into();
+                    app.message_error = false;
                 }
-                ControlResponse::Error { message, .. } => app.message = message,
-                _ => app.message = "unexpected daemon response".into(),
+                ControlResponse::Error { message, .. } => {
+                    app.message = message;
+                    app.message_error = true;
+                }
+                _ => {
+                    app.message = "unexpected daemon response".into();
+                    app.message_error = true;
+                }
             },
             KeyCode::Char('a') => apply(client, &mut app)?,
-            KeyCode::Char('d') => restore_default(client, &mut app)?,
             _ => {}
         }
     }
@@ -171,166 +354,541 @@ fn apply(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
     let Some(map) = app.edited else {
         return Ok(());
     };
+    if !app.dirty() {
+        app.message = "draft already matches the active map".into();
+        app.message_error = false;
+        return Ok(());
+    }
     if let Err(error) = map.validate() {
         app.message = rp_extiod::control::format_validation(error);
+        app.message_error = true;
         return Ok(());
     }
     let Some(generation) = board.generation else {
         app.message = "board is disconnected".into();
+        app.message_error = true;
         return Ok(());
     };
-    match client.request(&ControlRequest::Set {
-        serial: board.serial.clone(),
-        generation,
-        map: map.into(),
-    })? {
+    let default_pending = app.default_pending;
+    let request = if default_pending {
+        ControlRequest::Default {
+            serial: board.serial.clone(),
+            generation,
+        }
+    } else {
+        ControlRequest::Set {
+            serial: board.serial.clone(),
+            generation,
+            map: map.into(),
+        }
+    };
+    match client.request(&request)? {
         ControlResponse::Applied { .. } => {
             app.refresh(client, Some(&board.serial))?;
-            app.message = "pin map applied".into();
+            app.message = if default_pending {
+                "firmware defaults restored"
+            } else {
+                "pin map applied"
+            }
+            .into();
+            app.message_error = false;
         }
-        ControlResponse::Error { message, .. } => app.message = message,
-        _ => app.message = "unexpected daemon response".into(),
-    }
-    Ok(())
-}
-
-fn restore_default(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
-    let Some(board) = app.current().cloned() else {
-        return Ok(());
-    };
-    let Some(generation) = board.generation else {
-        app.message = "board is disconnected".into();
-        return Ok(());
-    };
-    match client.request(&ControlRequest::Default {
-        serial: board.serial.clone(),
-        generation,
-    })? {
-        ControlResponse::Applied { .. } => {
-            app.refresh(client, Some(&board.serial))?;
-            app.message = "firmware default restored".into();
+        ControlResponse::Error { message, .. } => {
+            app.message = message;
+            app.message_error = true;
         }
-        ControlResponse::Error { message, .. } => app.message = message,
-        _ => app.message = "unexpected daemon response".into(),
+        _ => {
+            app.message = "unexpected daemon response".into();
+            app.message_error = true;
+        }
     }
     Ok(())
 }
 
 fn draw(frame: &mut Frame<'_>, app: &App) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        frame.render_widget(
+            Paragraph::new(format!(
+                "Terminal too small for the Pico 2 pinout\nneed at least {MIN_WIDTH}×{MIN_HEIGHT}, have {}×{}",
+                area.width, area.height
+            ))
+            .block(Block::default().title("rp-extio").borders(Borders::ALL)),
+            area,
+        );
+        return;
+    }
+
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(3),
-            Constraint::Min(12),
+            Constraint::Min(5),
             Constraint::Length(3),
             Constraint::Length(2),
         ])
-        .split(frame.area());
-    frame.render_widget(
-        Paragraph::new("rp-extio pin routing  [/] board  ↑/↓ signal  ←/→ pin")
-            .block(Block::default().borders(Borders::ALL)),
-        rows[0],
-    );
-    let columns = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(32), Constraint::Percentage(68)])
-        .split(rows[1]);
-    let boards = app
-        .boards
-        .iter()
-        .enumerate()
-        .map(|(index, board)| {
-            let style = if index == app.board {
-                Style::default().fg(Color::Black).bg(Color::Cyan)
-            } else if !board.connected {
-                Style::default().fg(Color::DarkGray)
-            } else {
-                Style::default()
-            };
-            ListItem::new(format!(
-                "{} {}",
-                if board.connected { "●" } else { "○" },
-                board.serial
-            ))
-            .style(style)
-        })
-        .collect::<Vec<_>>();
-    frame.render_widget(
-        List::new(boards).block(Block::default().title("Boards").borders(Borders::ALL)),
-        columns[0],
-    );
+        .split(area);
+    draw_header(frame, rows[0], app);
 
-    let detail = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(11), Constraint::Min(3)])
-        .split(columns[1]);
-    let signals = PinSignal::ALL
-        .iter()
-        .enumerate()
-        .map(|(index, &signal)| {
-            let pin = app.edited.map(|map| map.pin(signal));
-            let style = if index == app.signal {
-                Style::default().add_modifier(Modifier::REVERSED)
-            } else {
-                Style::default()
-            };
-            ListItem::new(format!(
-                "{:<9} {}",
-                signal_name(signal),
-                pin.map_or_else(|| "-".into(), |pin| format!("GP{pin}"))
-            ))
-            .style(style)
-        })
-        .collect::<Vec<_>>();
+    if area.width >= WIDE_WIDTH {
+        let columns = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(27), Constraint::Min(MIN_WIDTH)])
+            .split(rows[1]);
+        draw_legend(frame, columns[0], app);
+        draw_pinout(frame, columns[1], app);
+    } else {
+        draw_pinout(frame, rows[1], app);
+    }
+    draw_status(frame, rows[2], app);
     frame.render_widget(
-        List::new(signals).block(Block::default().title("Signals").borders(Borders::ALL)),
-        detail[0],
-    );
-    let gpio = app
-        .edited
-        .and_then(|map| map.gpio_pins().ok())
-        .map(|pins| {
-            pins.into_iter()
-                .map(|pin| format!("GP{pin}"))
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_else(|| "invalid map".into());
-    let devices = app.current().map_or_else(
-        || "no boards".into(),
-        |board| {
-            format!(
-                "generation {}   I²C {}   SPI {}   GPIO instance {}\nGPIO: {gpio}",
-                option(board.generation),
-                option(board.i2c_bus),
-                option(board.spi_bus),
-                option(board.gpio_instance),
-            )
-        },
-    );
-    frame.render_widget(
-        Paragraph::new(devices).block(
-            Block::default()
-                .title("Active devices")
-                .borders(Borders::ALL),
+        Paragraph::new(
+            "arrows pin  Tab/Shift-Tab signal  Enter assign  a apply  d defaults  u undo\n[/] board  r refresh  l reload  q quit",
         ),
-        detail[1],
-    );
-    let valid = app.edited.is_some_and(|map| map.validate().is_ok());
-    frame.render_widget(
-        Paragraph::new(app.message.as_str()).style(if valid {
-            Style::default().fg(Color::Green)
-        } else {
-            Style::default().fg(Color::Red)
-        }),
-        rows[2],
-    );
-    frame.render_widget(
-        Paragraph::new("a apply   d default   r refresh   l reload config   q quit"),
         rows[3],
     );
 }
 
+fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let board = app.current();
+    let selected = app.selected_signal();
+    let route = app
+        .edited
+        .map(|map| format!("GP{}", map.pin(selected)))
+        .unwrap_or_else(|| "-".into());
+    let summary = board.map_or_else(
+        || "no boards".into(),
+        |board| {
+            format!(
+                "{} {}  gen {}  I²C {}  SPI {}",
+                if board.connected { "●" } else { "○" },
+                board.serial,
+                option(board.generation),
+                option(board.i2c_bus),
+                option(board.spi_bus),
+            )
+        },
+    );
+    let dirty = if app.dirty() { " • DRAFT" } else { "" };
+    frame.render_widget(
+        Paragraph::new(format!(
+            "{summary}  │  {} → {route}{dirty}",
+            display_signal(selected)
+        ))
+        .block(
+            Block::default()
+                .title("rp-extio · Pico 2 pin routing")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let active = app.active_map();
+    let items = PinSignal::ALL
+        .iter()
+        .enumerate()
+        .map(|(index, &signal)| {
+            let draft = app.edited.map(|map| map.pin(signal));
+            let active = active.map(|map| map.pin(signal));
+            let route = match (active, draft) {
+                (Some(old), Some(new)) if old != new => format!("GP{old} → GP{new}"),
+                (_, Some(pin)) => format!("GP{pin}"),
+                _ => "-".into(),
+            };
+            let style = if index == app.signal {
+                signal_style(signal).add_modifier(Modifier::REVERSED | Modifier::BOLD)
+            } else {
+                signal_style(signal)
+            };
+            ListItem::new(format!("{:<9} {route}", display_signal(signal))).style(style)
+        })
+        .collect::<Vec<_>>();
+    frame.render_widget(
+        List::new(items).block(
+            Block::default()
+                .title("Signals · Tab selects")
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let block = Block::default()
+        .title("Pico 2 · USB end ▲")
+        .borders(Borders::ALL);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width < MIN_WIDTH - 2 || inner.height < 3 {
+        frame.render_widget(Paragraph::new("pinout area too small"), inner);
+        return;
+    }
+
+    let visible = usize::from(inner.height.saturating_sub(2)).min(HEADER_ROWS);
+    let start = app
+        .cursor_row
+        .saturating_sub(visible / 2)
+        .min(HEADER_ROWS - visible);
+    let end = start + visible;
+    let mut lines = Vec::with_capacity(visible + 2);
+    let top = if visible == HEADER_ROWS {
+        "USB CONNECTOR".into()
+    } else if start == 0 {
+        format!("USB · header rows 1–{end} of {HEADER_ROWS}")
+    } else {
+        format!("▲ more · header rows {}–{end} of {HEADER_ROWS}", start + 1)
+    };
+    lines.push(centered_line(
+        inner.width,
+        top,
+        Style::default().fg(Color::Cyan),
+    ));
+    for row in start..end {
+        lines.push(pin_row(inner.width, row, app));
+    }
+    lines.push(centered_line(
+        inner.width,
+        if end == HEADER_ROWS {
+            "SWD DEBUG".into()
+        } else {
+            "▼ more header rows".into()
+        },
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn pin_row(width: u16, row: usize, app: &App) -> Line<'static> {
+    let cell_width = usize::from((width - CENTER_WIDTH) / 2);
+    let remainder = usize::from(width - CENTER_WIDTH) - cell_width * 2;
+    let left_width = cell_width;
+    let right_width = cell_width + remainder;
+    let center = match row {
+        8 => "│ PICO │",
+        9 => "│  2   │",
+        _ => "│      │",
+    };
+    Line::from(vec![
+        pin_cell(LEFT_HEADER[row], left_width, row, 0, app, false),
+        Span::styled(center, Style::default().fg(Color::DarkGray)),
+        pin_cell(RIGHT_HEADER[row], right_width, row, 1, app, true),
+    ])
+}
+
+fn pin_cell(
+    pin: HeaderPin,
+    width: usize,
+    row: usize,
+    side: usize,
+    app: &App,
+    right: bool,
+) -> Span<'static> {
+    let role_width = width.saturating_sub(16);
+    let (role, conflict, changed) = pin_role(pin, app);
+    let marker = if changed { "*" } else { " " };
+    let role = fit(&format!("{marker}{role}"), role_width);
+    let text = if right {
+        format!(
+            "● {role:<role_width$} {:>10} {:>2}",
+            pin.label, pin.physical
+        )
+    } else {
+        format!(
+            "{:>2} {:<10} {role:<role_width$} ●",
+            pin.physical, pin.label
+        )
+    };
+    let mut style = pin_style(pin, app, conflict);
+    if row == app.cursor_row && side == app.cursor_side {
+        style = style
+            .bg(Color::White)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD);
+    }
+    Span::styled(fit(&text, width), style)
+}
+
+fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
+    let Some(gpio) = pin.gpio else {
+        return (String::new(), false, false);
+    };
+    let Some(map) = app.edited else {
+        return ("GPIO".into(), false, false);
+    };
+    let signals = PinSignal::ALL
+        .into_iter()
+        .filter(|&signal| map.pin(signal) == gpio)
+        .collect::<Vec<_>>();
+    let role = if signals.is_empty() {
+        "GPIO".into()
+    } else {
+        signals
+            .iter()
+            .map(|&signal| short_signal(signal))
+            .collect::<Vec<_>>()
+            .join("+")
+    };
+    let changed = app.active_map().is_some_and(|active| {
+        PinSignal::ALL.into_iter().any(|signal| {
+            active.pin(signal) != map.pin(signal)
+                && (active.pin(signal) == gpio || map.pin(signal) == gpio)
+        })
+    });
+    (role, signals.len() > 1, changed)
+}
+
+fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
+    let Some(gpio) = pin.gpio else {
+        return Style::default().fg(Color::DarkGray);
+    };
+    if conflict {
+        return Style::default().fg(Color::Red).add_modifier(Modifier::BOLD);
+    }
+    let signal = app.selected_signal();
+    if app.edited.is_some_and(|map| map.pin(signal) == gpio) {
+        return signal_style(signal).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    }
+    if signal.valid_pins().contains(&gpio) {
+        return Style::default().fg(Color::Green);
+    }
+    if let Some(map) = app.edited
+        && let Some(assigned) = PinSignal::ALL
+            .into_iter()
+            .find(|&candidate| map.pin(candidate) == gpio)
+    {
+        return signal_style(assigned);
+    }
+    Style::default().fg(Color::Gray)
+}
+
+fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    let validation = app.edited.and_then(|map| map.validate().err());
+    let text = if !app.message.is_empty() {
+        app.message.clone()
+    } else if let Some(error) = validation {
+        rp_extiod::control::format_validation(error)
+    } else if app.dirty() {
+        "draft is valid; press a to apply".into()
+    } else {
+        "active map; move to a valid highlighted GPIO and press Enter to assign".into()
+    };
+    let style = if validation.is_some() || app.message_error {
+        Style::default().fg(Color::Red)
+    } else if app.dirty() {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Green)
+    };
+    frame.render_widget(
+        Paragraph::new(text)
+            .style(style)
+            .block(Block::default().title("Status").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn centered_line(width: u16, text: String, style: Style) -> Line<'static> {
+    let width = usize::from(width);
+    let text = text.chars().take(width).collect::<String>();
+    let text_width = text.chars().count();
+    let left = width.saturating_sub(text_width) / 2;
+    let right = width.saturating_sub(text_width + left);
+    Line::from(vec![
+        Span::raw(" ".repeat(left)),
+        Span::styled(text, style),
+        Span::raw(" ".repeat(right)),
+    ])
+}
+
+fn fit(text: &str, width: usize) -> String {
+    let mut text = text.chars().take(width).collect::<String>();
+    let length = text.chars().count();
+    if length < width {
+        text.push_str(&" ".repeat(width - length));
+    }
+    text
+}
+
+fn find_gpio(gpio: u8) -> Option<(usize, usize)> {
+    LEFT_HEADER
+        .iter()
+        .position(|pin| pin.gpio == Some(gpio))
+        .map(|row| (row, 0))
+        .or_else(|| {
+            RIGHT_HEADER
+                .iter()
+                .position(|pin| pin.gpio == Some(gpio))
+                .map(|row| (row, 1))
+        })
+}
+
+fn display_signal(signal: PinSignal) -> &'static str {
+    match signal {
+        PinSignal::UartTx => "UART TX",
+        PinSignal::UartRx => "UART RX",
+        PinSignal::I2cSda => "I²C SDA",
+        PinSignal::I2cScl => "I²C SCL",
+        PinSignal::SpiMiso => "SPI MISO",
+        PinSignal::SpiSck => "SPI SCK",
+        PinSignal::SpiMosi => "SPI MOSI",
+        PinSignal::SpiCs0 => "SPI CS0",
+        PinSignal::SpiCs1 => "SPI CS1",
+    }
+}
+
+fn short_signal(signal: PinSignal) -> &'static str {
+    match signal {
+        PinSignal::UartTx => "U-TX",
+        PinSignal::UartRx => "U-RX",
+        PinSignal::I2cSda => "I-SDA",
+        PinSignal::I2cScl => "I-SCL",
+        PinSignal::SpiMiso => "MISO",
+        PinSignal::SpiSck => "SCK",
+        PinSignal::SpiMosi => "MOSI",
+        PinSignal::SpiCs0 => "CS0",
+        PinSignal::SpiCs1 => "CS1",
+    }
+}
+
+fn signal_style(signal: PinSignal) -> Style {
+    Style::default().fg(match signal {
+        PinSignal::UartTx | PinSignal::UartRx => Color::Magenta,
+        PinSignal::I2cSda | PinSignal::I2cScl => Color::Cyan,
+        PinSignal::SpiMiso
+        | PinSignal::SpiSck
+        | PinSignal::SpiMosi
+        | PinSignal::SpiCs0
+        | PinSignal::SpiCs1 => Color::Yellow,
+    })
+}
+
 fn option(value: Option<impl ToString>) -> String {
     value.map_or_else(|| "-".into(), |value| value.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{Terminal, backend::TestBackend};
+    use rp_extio_wire::HEADER_PINS;
+
+    fn app() -> App {
+        App {
+            boards: vec![BoardInfo {
+                serial: "PICO2".into(),
+                connected: true,
+                active: Some(DEFAULT_PIN_MAP.into()),
+                desired: Some(DEFAULT_PIN_MAP.into()),
+                generation: Some(4),
+                i2c_bus: Some(27),
+                spi_bus: Some(0),
+                gpio_instance: Some(3),
+            }],
+            board: 0,
+            signal: 0,
+            cursor_row: 0,
+            cursor_side: 0,
+            edited: Some(DEFAULT_PIN_MAP),
+            default_pending: false,
+            message: String::new(),
+            message_error: false,
+        }
+    }
+
+    fn rendered(width: u16, height: u16, app: &App) -> String {
+        let backend = TestBackend::new(width, height);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, app)).unwrap();
+        terminal.backend().to_string()
+    }
+
+    #[test]
+    fn physical_headers_contain_every_exposed_gpio_once() {
+        let mut actual = LEFT_HEADER
+            .into_iter()
+            .chain(RIGHT_HEADER)
+            .filter_map(|pin| pin.gpio)
+            .collect::<Vec<_>>();
+        actual.sort_unstable();
+        assert_eq!(actual, HEADER_PINS);
+        assert_eq!(LEFT_HEADER[0].physical, 1);
+        assert_eq!(RIGHT_HEADER[0].physical, 40);
+        assert_eq!(LEFT_HEADER[19].physical, 20);
+        assert_eq!(RIGHT_HEADER[19].physical, 21);
+    }
+
+    #[test]
+    fn assignment_rejects_fixed_and_invalid_route_pins() {
+        let mut app = app();
+        app.cursor_row = 2;
+        app.assign_selected();
+        assert!(app.message.contains("cannot carry"));
+        assert!(app.message_error);
+
+        app.cursor_row = 5;
+        app.assign_selected();
+        assert!(app.message.contains("not a valid route"));
+        assert!(app.message_error);
+        assert_eq!(app.edited.unwrap(), DEFAULT_PIN_MAP);
+    }
+
+    #[test]
+    fn defaults_remain_dirty_until_applied_or_undone() {
+        let mut app = app();
+        app.load_default();
+        assert!(app.default_pending);
+        assert!(app.dirty());
+
+        app.undo();
+        assert!(!app.default_pending);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn valid_conflicting_assignment_remains_in_the_draft() {
+        let mut app = app();
+        app.signal = PinSignal::SpiMiso as usize;
+        app.cursor_row = 0;
+        app.assign_selected();
+        assert_eq!(app.edited.unwrap().spi_miso, 0);
+        assert!(app.message.contains("assigned to both"));
+        assert!(app.dirty());
+    }
+
+    #[test]
+    fn wide_render_contains_physical_orientation_and_routes() {
+        let output = rendered(120, 40, &app());
+        assert!(output.contains("USB CONNECTOR"));
+        assert!(output.contains(" 1 GP0"));
+        assert!(output.contains("VBUS 40"));
+        assert!(output.contains("UART TX"));
+        assert!(output.contains("SWD DEBUG"));
+    }
+
+    #[test]
+    fn compact_render_scrolls_around_selected_pin() {
+        let mut app = app();
+        app.cursor_row = 19;
+        let output = rendered(80, 20, &app);
+        assert!(output.contains("▲ more · header rows"));
+        assert!(output.contains("GP15"));
+        assert!(output.contains("GP16"));
+        assert!(output.contains("SWD DEBUG"));
+    }
+
+    #[test]
+    fn compact_render_marks_omitted_lower_rows() {
+        let output = rendered(80, 20, &app());
+        assert!(output.contains("USB · header rows 1–"));
+        assert!(output.contains("▼ more header rows"));
+        assert!(!output.contains("SWD DEBUG"));
+    }
+
+    #[test]
+    fn tiny_render_reports_minimum_size() {
+        let output = rendered(40, 8, &app());
+        assert!(output.contains("Terminal too small"));
+    }
 }
