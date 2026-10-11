@@ -127,6 +127,7 @@ fn main() {
                 mask
             }
         }),
+        ..DEFAULT_PIN_MAP
     };
     pins.set_spi_cs1_enabled(
         0,
@@ -151,6 +152,7 @@ fn main() {
              uart_tx: {:?}, uart_rx: {:?}, i2c_sda: {:?}, i2c_scl: {:?},\n\
              spi_miso: {:?}, spi_sck: {:?}, spi_mosi: {:?}, spi_chip_selects: {:?},\n\
              enabled: {},\n\
+             ..rp_extio_wire::DEFAULT_PIN_MAP\n\
              }};\n",
             pins.uart_tx,
             pins.uart_rx,

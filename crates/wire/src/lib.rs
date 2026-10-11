@@ -2,7 +2,7 @@
 
 pub const USB_MAGIC: [u8; 4] = *b"RPXB";
 pub const KERNEL_MAGIC: [u8; 4] = *b"RPKD";
-pub const VERSION_MAJOR: u8 = 2;
+pub const VERSION_MAJOR: u8 = 3;
 pub const VERSION_MINOR: u8 = 0;
 pub const USB_HEADER_LEN: usize = 24;
 pub const KERNEL_HEADER_LEN: usize = 32;
@@ -17,18 +17,33 @@ pub const CAP_SPI: u16 = 3;
 pub const CAP_UART: u16 = 4;
 pub const CAP_GPIO: u16 = 5;
 pub const CAP_PIN_CONFIG: u16 = 6;
+pub const CAP_ADC: u16 = 7;
+pub const CAP_PWM: u16 = 8;
+pub const CAP_CLOCK: u16 = 9;
 pub const GPIO_GET: u8 = 1;
 pub const GPIO_SET: u8 = 2;
 pub const GPIO_DIRECTION_INPUT: u8 = 3;
 pub const GPIO_DIRECTION_OUTPUT: u8 = 4;
 pub const GPIO_GET_DIRECTION: u8 = 5;
 pub const GPIO_SNAPSHOT: u8 = 6;
+pub const GPIO_SET_BIAS: u8 = 7;
+pub const GPIO_BIAS_NONE: u8 = 0;
+pub const GPIO_BIAS_PULL_UP: u8 = 1;
+pub const GPIO_BIAS_PULL_DOWN: u8 = 2;
+pub const PWM_GET: u8 = 1;
+pub const PWM_APPLY: u8 = 2;
+pub const PWM_ENABLED: u16 = 1 << 0;
+pub const PWM_INVERTED: u16 = 1 << 1;
+pub const PWM_STATE_LEN: usize = 20;
 pub const HEADER_PINS: [u8; 26] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28,
 ];
 pub const MAX_GPIO_LINES: usize = HEADER_PINS.len();
-pub const PIN_SIGNAL_COUNT: usize = 18;
-pub const PIN_MAP_LEN: usize = PIN_SIGNAL_COUNT + 1;
+pub const ADC_CHANNEL_COUNT: usize = 3;
+pub const PWM_CHANNEL_COUNT: usize = 16;
+pub const CLOCK_OUTPUT_COUNT: usize = 2;
+pub const PIN_SIGNAL_COUNT: usize = 39;
+pub const PIN_MAP_LEN: usize = PIN_SIGNAL_COUNT + 15;
 const SPI0_CS1_DISABLE_MASK: u8 = 1 << 6;
 const SPI1_CS1_DISABLE_MASK: u8 = 1 << 7;
 
@@ -40,6 +55,8 @@ pub enum Operation {
     SpiMessage = 3,
     GpioCommand = 4,
     ConfigurePins = 5,
+    AdcRead = 6,
+    Pwm = 7,
 }
 
 impl TryFrom<u8> for Operation {
@@ -51,6 +68,8 @@ impl TryFrom<u8> for Operation {
             3 => Ok(Self::SpiMessage),
             4 => Ok(Self::GpioCommand),
             5 => Ok(Self::ConfigurePins),
+            6 => Ok(Self::AdcRead),
+            7 => Ok(Self::Pwm),
             _ => Err(WireError::Unsupported),
         }
     }
@@ -69,6 +88,7 @@ pub enum Status {
     IoError = 7,
     InvalidRoute = 8,
     PinConflict = 9,
+    Busy = 10,
 }
 
 impl TryFrom<i32> for Status {
@@ -85,6 +105,7 @@ impl TryFrom<i32> for Status {
             7 => Ok(Self::IoError),
             8 => Ok(Self::InvalidRoute),
             9 => Ok(Self::PinConflict),
+            10 => Ok(Self::Busy),
             _ => Err(WireError::Invalid),
         }
     }
@@ -119,6 +140,27 @@ pub enum PinSignal {
     Spi1Mosi = 15,
     Spi1Cs0 = 16,
     Spi1Cs1 = 17,
+    Adc0 = 18,
+    Adc1 = 19,
+    Adc2 = 20,
+    Pwm0A = 21,
+    Pwm0B = 22,
+    Pwm1A = 23,
+    Pwm1B = 24,
+    Pwm2A = 25,
+    Pwm2B = 26,
+    Pwm3A = 27,
+    Pwm3B = 28,
+    Pwm4A = 29,
+    Pwm4B = 30,
+    Pwm5A = 31,
+    Pwm5B = 32,
+    Pwm6A = 33,
+    Pwm6B = 34,
+    Pwm7A = 35,
+    Pwm7B = 36,
+    Clock0 = 37,
+    Clock1 = 38,
 }
 
 impl PinSignal {
@@ -141,6 +183,27 @@ impl PinSignal {
         Self::Spi1Mosi,
         Self::Spi1Cs0,
         Self::Spi1Cs1,
+        Self::Adc0,
+        Self::Adc1,
+        Self::Adc2,
+        Self::Pwm0A,
+        Self::Pwm0B,
+        Self::Pwm1A,
+        Self::Pwm1B,
+        Self::Pwm2A,
+        Self::Pwm2B,
+        Self::Pwm3A,
+        Self::Pwm3B,
+        Self::Pwm4A,
+        Self::Pwm4B,
+        Self::Pwm5A,
+        Self::Pwm5B,
+        Self::Pwm6A,
+        Self::Pwm6B,
+        Self::Pwm7A,
+        Self::Pwm7B,
+        Self::Clock0,
+        Self::Clock1,
     ];
 
     pub const fn valid_pins(self) -> &'static [u8] {
@@ -160,11 +223,32 @@ impl PinSignal {
             Self::Spi1Sck => &[10, 14, 26],
             Self::Spi1Mosi => &[11, 15, 27],
             Self::Spi0Cs0 | Self::Spi0Cs1 | Self::Spi1Cs0 | Self::Spi1Cs1 => &HEADER_PINS,
+            Self::Adc0 => &[26],
+            Self::Adc1 => &[27],
+            Self::Adc2 => &[28],
+            Self::Pwm0A => &[0, 16],
+            Self::Pwm0B => &[1, 17],
+            Self::Pwm1A => &[2, 18],
+            Self::Pwm1B => &[3, 19],
+            Self::Pwm2A => &[4, 20],
+            Self::Pwm2B => &[5, 21],
+            Self::Pwm3A => &[6, 22],
+            Self::Pwm3B => &[7],
+            Self::Pwm4A => &[8],
+            Self::Pwm4B => &[9],
+            Self::Pwm5A => &[10, 26],
+            Self::Pwm5B => &[11, 27],
+            Self::Pwm6A => &[12, 28],
+            Self::Pwm6B => &[13],
+            Self::Pwm7A => &[14],
+            Self::Pwm7B => &[15],
+            Self::Clock0 => &[13, 21],
+            Self::Clock1 => &[15],
         }
     }
 
-    pub const fn peripheral(self) -> Peripheral {
-        match self {
+    pub const fn serial_peripheral(self) -> Option<Peripheral> {
+        Some(match self {
             Self::Uart0Tx | Self::Uart0Rx => Peripheral::Uart0,
             Self::Uart1Tx | Self::Uart1Rx => Peripheral::Uart1,
             Self::I2c0Sda | Self::I2c0Scl => Peripheral::I2c0,
@@ -175,6 +259,114 @@ impl PinSignal {
             Self::Spi1Miso | Self::Spi1Sck | Self::Spi1Mosi | Self::Spi1Cs0 | Self::Spi1Cs1 => {
                 Peripheral::Spi1
             }
+            _ => return None,
+        })
+    }
+
+    pub const fn adc_channel(self) -> Option<usize> {
+        let value = self as usize;
+        if value >= Self::Adc0 as usize && value <= Self::Adc2 as usize {
+            Some(value - Self::Adc0 as usize)
+        } else {
+            None
+        }
+    }
+
+    pub const fn pwm_channel(self) -> Option<usize> {
+        let value = self as usize;
+        if value >= Self::Pwm0A as usize && value <= Self::Pwm7B as usize {
+            Some(value - Self::Pwm0A as usize)
+        } else {
+            None
+        }
+    }
+
+    pub const fn clock_output(self) -> Option<usize> {
+        let value = self as usize;
+        if value >= Self::Clock0 as usize && value <= Self::Clock1 as usize {
+            Some(value - Self::Clock0 as usize)
+        } else {
+            None
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum ClockSource {
+    System = 0,
+    Reference = 1,
+    Usb = 2,
+    Adc = 3,
+    Crystal = 4,
+    RingOscillator = 5,
+    LowPowerOscillator = 6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PwmState {
+    pub channel: u8,
+    pub enabled: bool,
+    pub inverted: bool,
+    pub period_ns: u64,
+    pub duty_ns: u64,
+}
+
+impl PwmState {
+    pub fn encode(self, command: u8) -> [u8; PWM_STATE_LEN] {
+        let mut bytes = [0; PWM_STATE_LEN];
+        bytes[0] = command;
+        bytes[1] = self.channel;
+        let flags = u16::from(self.enabled) * PWM_ENABLED | u16::from(self.inverted) * PWM_INVERTED;
+        bytes[2..4].copy_from_slice(&flags.to_le_bytes());
+        bytes[4..12].copy_from_slice(&self.period_ns.to_le_bytes());
+        bytes[12..20].copy_from_slice(&self.duty_ns.to_le_bytes());
+        bytes
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<(u8, Self), WireError> {
+        if bytes.len() != PWM_STATE_LEN {
+            return Err(WireError::Truncated);
+        }
+        let command = bytes[0];
+        let channel = bytes[1];
+        let flags = read_u16(&bytes[2..4]);
+        let period_ns = read_u64(&bytes[4..12]);
+        let duty_ns = read_u64(&bytes[12..20]);
+        if !matches!(command, PWM_GET | PWM_APPLY)
+            || channel as usize >= PWM_CHANNEL_COUNT
+            || flags & !(PWM_ENABLED | PWM_INVERTED) != 0
+            || duty_ns > period_ns
+            || (flags & PWM_ENABLED != 0 && period_ns == 0)
+        {
+            return Err(WireError::Invalid);
+        }
+        Ok((
+            command,
+            Self {
+                channel,
+                enabled: flags & PWM_ENABLED != 0,
+                inverted: flags & PWM_INVERTED != 0,
+                period_ns,
+                duty_ns,
+            },
+        ))
+    }
+}
+
+impl TryFrom<u8> for ClockSource {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            0 => Ok(Self::System),
+            1 => Ok(Self::Reference),
+            2 => Ok(Self::Usb),
+            3 => Ok(Self::Adc),
+            4 => Ok(Self::Crystal),
+            5 => Ok(Self::RingOscillator),
+            6 => Ok(Self::LowPowerOscillator),
+            _ => Err(WireError::Invalid),
         }
     }
 }
@@ -315,6 +507,14 @@ pub struct PinMap {
     pub spi_mosi: [u8; 2],
     pub spi_chip_selects: [[u8; 2]; 2],
     pub enabled: u8,
+    pub adc_pins: [u8; ADC_CHANNEL_COUNT],
+    pub adc_enabled: u8,
+    pub pwm_pins: [u8; PWM_CHANNEL_COUNT],
+    pub pwm_enabled: u16,
+    pub clock_pins: [u8; CLOCK_OUTPUT_COUNT],
+    pub clock_enabled: u8,
+    pub clock_sources: [ClockSource; CLOCK_OUTPUT_COUNT],
+    pub clock_hz: [u32; CLOCK_OUTPUT_COUNT],
 }
 
 pub const DEFAULT_PIN_MAP: PinMap = PinMap {
@@ -327,6 +527,14 @@ pub const DEFAULT_PIN_MAP: PinMap = PinMap {
     spi_mosi: [19, 15],
     spi_chip_selects: [[17, 21], [13, 20]],
     enabled: Peripheral::Uart0.mask() | Peripheral::I2c0.mask() | Peripheral::Spi0.mask(),
+    adc_pins: [26, 27, 28],
+    adc_enabled: 0,
+    pwm_pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
+    pwm_enabled: 0,
+    clock_pins: [13, 15],
+    clock_enabled: 0,
+    clock_sources: [ClockSource::System, ClockSource::System],
+    clock_hz: [1_000_000, 1_000_000],
 };
 
 impl Default for PinMap {
@@ -337,27 +545,54 @@ impl Default for PinMap {
 
 impl PinMap {
     pub const fn encode(self) -> [u8; PIN_MAP_LEN] {
-        [
-            self.uart_tx[0],
-            self.uart_rx[0],
-            self.uart_tx[1],
-            self.uart_rx[1],
-            self.i2c_sda[0],
-            self.i2c_scl[0],
-            self.i2c_sda[1],
-            self.i2c_scl[1],
-            self.spi_miso[0],
-            self.spi_sck[0],
-            self.spi_mosi[0],
-            self.spi_chip_selects[0][0],
-            self.spi_chip_selects[0][1],
-            self.spi_miso[1],
-            self.spi_sck[1],
-            self.spi_mosi[1],
-            self.spi_chip_selects[1][0],
-            self.spi_chip_selects[1][1],
-            self.enabled,
-        ]
+        let mut bytes = [0; PIN_MAP_LEN];
+        bytes[0] = self.uart_tx[0];
+        bytes[1] = self.uart_rx[0];
+        bytes[2] = self.uart_tx[1];
+        bytes[3] = self.uart_rx[1];
+        bytes[4] = self.i2c_sda[0];
+        bytes[5] = self.i2c_scl[0];
+        bytes[6] = self.i2c_sda[1];
+        bytes[7] = self.i2c_scl[1];
+        bytes[8] = self.spi_miso[0];
+        bytes[9] = self.spi_sck[0];
+        bytes[10] = self.spi_mosi[0];
+        bytes[11] = self.spi_chip_selects[0][0];
+        bytes[12] = self.spi_chip_selects[0][1];
+        bytes[13] = self.spi_miso[1];
+        bytes[14] = self.spi_sck[1];
+        bytes[15] = self.spi_mosi[1];
+        bytes[16] = self.spi_chip_selects[1][0];
+        bytes[17] = self.spi_chip_selects[1][1];
+        bytes[18] = self.adc_pins[0];
+        bytes[19] = self.adc_pins[1];
+        bytes[20] = self.adc_pins[2];
+        let mut index = 0;
+        while index < PWM_CHANNEL_COUNT {
+            bytes[21 + index] = self.pwm_pins[index];
+            index += 1;
+        }
+        bytes[37] = self.clock_pins[0];
+        bytes[38] = self.clock_pins[1];
+        bytes[39] = self.enabled;
+        bytes[40] = self.adc_enabled;
+        let pwm_enabled = self.pwm_enabled.to_le_bytes();
+        bytes[41] = pwm_enabled[0];
+        bytes[42] = pwm_enabled[1];
+        bytes[43] = self.clock_enabled;
+        bytes[44] = self.clock_sources[0] as u8;
+        bytes[45] = self.clock_sources[1] as u8;
+        let clock0 = self.clock_hz[0].to_le_bytes();
+        bytes[46] = clock0[0];
+        bytes[47] = clock0[1];
+        bytes[48] = clock0[2];
+        bytes[49] = clock0[3];
+        let clock1 = self.clock_hz[1].to_le_bytes();
+        bytes[50] = clock1[0];
+        bytes[51] = clock1[1];
+        bytes[52] = clock1[2];
+        bytes[53] = clock1[3];
+        bytes
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
@@ -373,7 +608,18 @@ impl PinMap {
             spi_sck: [bytes[9], bytes[14]],
             spi_mosi: [bytes[10], bytes[15]],
             spi_chip_selects: [[bytes[11], bytes[12]], [bytes[16], bytes[17]]],
-            enabled: bytes[18],
+            adc_pins: [bytes[18], bytes[19], bytes[20]],
+            pwm_pins: bytes[21..37].try_into().unwrap(),
+            clock_pins: [bytes[37], bytes[38]],
+            enabled: bytes[39],
+            adc_enabled: bytes[40],
+            pwm_enabled: u16::from_le_bytes([bytes[41], bytes[42]]),
+            clock_enabled: bytes[43],
+            clock_sources: [
+                ClockSource::try_from(bytes[44])?,
+                ClockSource::try_from(bytes[45])?,
+            ],
+            clock_hz: [read_u32(&bytes[46..50]), read_u32(&bytes[50..54])],
         })
     }
 
@@ -401,6 +647,28 @@ impl PinMap {
             PinSignal::Spi1Mosi => self.spi_mosi[1] = pin,
             PinSignal::Spi1Cs0 => self.spi_chip_selects[1][0] = pin,
             PinSignal::Spi1Cs1 => self.spi_chip_selects[1][1] = pin,
+            PinSignal::Adc0 => self.adc_pins[0] = pin,
+            PinSignal::Adc1 => self.adc_pins[1] = pin,
+            PinSignal::Adc2 => self.adc_pins[2] = pin,
+            PinSignal::Pwm0A
+            | PinSignal::Pwm0B
+            | PinSignal::Pwm1A
+            | PinSignal::Pwm1B
+            | PinSignal::Pwm2A
+            | PinSignal::Pwm2B
+            | PinSignal::Pwm3A
+            | PinSignal::Pwm3B
+            | PinSignal::Pwm4A
+            | PinSignal::Pwm4B
+            | PinSignal::Pwm5A
+            | PinSignal::Pwm5B
+            | PinSignal::Pwm6A
+            | PinSignal::Pwm6B
+            | PinSignal::Pwm7A
+            | PinSignal::Pwm7B => self.pwm_pins[signal.pwm_channel().unwrap()] = pin,
+            PinSignal::Clock0 | PinSignal::Clock1 => {
+                self.clock_pins[signal.clock_output().unwrap()] = pin
+            }
         }
     }
 
@@ -434,17 +702,61 @@ impl PinMap {
     }
 
     pub const fn is_signal_enabled(self, signal: PinSignal) -> bool {
-        if !self.is_enabled(signal.peripheral()) {
-            return false;
+        if let Some(peripheral) = signal.serial_peripheral() {
+            return self.is_enabled(peripheral)
+                && match signal {
+                    PinSignal::Spi0Cs1 => self.spi_cs1_enabled(0),
+                    PinSignal::Spi1Cs1 => self.spi_cs1_enabled(1),
+                    _ => true,
+                };
         }
-        match signal {
-            PinSignal::Spi0Cs1 => self.spi_cs1_enabled(0),
-            PinSignal::Spi1Cs1 => self.spi_cs1_enabled(1),
-            _ => true,
+        if let Some(channel) = signal.adc_channel() {
+            return self.adc_enabled & (1 << channel) != 0;
+        }
+        if let Some(channel) = signal.pwm_channel() {
+            return self.pwm_enabled & (1 << channel) != 0;
+        }
+        if let Some(output) = signal.clock_output() {
+            return self.clock_enabled & (1 << output) != 0;
+        }
+        false
+    }
+
+    pub fn set_signal_enabled(&mut self, signal: PinSignal, enabled: bool) {
+        if let Some(peripheral) = signal.serial_peripheral() {
+            match signal {
+                PinSignal::Spi0Cs1 => self.set_spi_cs1_enabled(0, enabled),
+                PinSignal::Spi1Cs1 => self.set_spi_cs1_enabled(1, enabled),
+                _ => self.set_enabled(peripheral, enabled),
+            }
+        } else if let Some(channel) = signal.adc_channel() {
+            set_mask_bit_u8(&mut self.adc_enabled, channel, enabled);
+        } else if let Some(channel) = signal.pwm_channel() {
+            set_mask_bit_u16(&mut self.pwm_enabled, channel, enabled);
+        } else if let Some(output) = signal.clock_output() {
+            set_mask_bit_u8(&mut self.clock_enabled, output, enabled);
         }
     }
 
     pub fn validate(self) -> Result<(), PinValidationError> {
+        if self.adc_enabled & !0x07 != 0 || self.clock_enabled & !0x03 != 0 {
+            return Err(PinValidationError {
+                kind: PinValidationKind::InvalidEnableMask,
+                signal: PinSignal::Adc0,
+                other: None,
+                pin: 0,
+            });
+        }
+        for output in 0..CLOCK_OUTPUT_COUNT {
+            if self.clock_hz[output] == 0 {
+                return Err(PinValidationError {
+                    kind: PinValidationKind::InvalidRoute,
+                    signal: [PinSignal::Clock0, PinSignal::Clock1][output],
+                    other: None,
+                    pin: self.clock_pins[output],
+                });
+            }
+        }
         for signal in PinSignal::ALL {
             let pin = self.pin(signal);
             if !HEADER_PINS.contains(&pin) {
@@ -544,6 +856,22 @@ impl GpioPins {
 
     pub const fn into_array(self) -> [u8; MAX_GPIO_LINES] {
         self.pins
+    }
+}
+
+fn set_mask_bit_u8(mask: &mut u8, bit: usize, enabled: bool) {
+    if enabled {
+        *mask |= 1 << bit;
+    } else {
+        *mask &= !(1 << bit);
+    }
+}
+
+fn set_mask_bit_u16(mask: &mut u16, bit: usize, enabled: bool) {
+    if enabled {
+        *mask |= 1 << bit;
+    } else {
+        *mask &= !(1 << bit);
     }
 }
 
@@ -941,6 +1269,41 @@ mod tests {
         none_enabled.enabled = 0;
         assert_eq!(none_enabled.validate(), Ok(()));
         assert_eq!(none_enabled.gpio_pins().unwrap().as_slice(), &HEADER_PINS);
+
+        let mut auxiliary = none_enabled;
+        auxiliary.adc_enabled = 1;
+        auxiliary.pwm_enabled = 1 << 2;
+        auxiliary.clock_enabled = 1;
+        assert_eq!(PinMap::decode(&auxiliary.encode()), Ok(auxiliary));
+        assert_eq!(auxiliary.validate(), Ok(()));
+        assert!(!auxiliary.gpio_pins().unwrap().as_slice().contains(&26));
+        assert!(!auxiliary.gpio_pins().unwrap().as_slice().contains(&2));
+        assert!(!auxiliary.gpio_pins().unwrap().as_slice().contains(&13));
+
+        auxiliary.pwm_pins[2] = 26;
+        assert_eq!(
+            auxiliary.validate().unwrap_err().kind,
+            PinValidationKind::InvalidRoute
+        );
+    }
+
+    #[test]
+    fn pwm_states_round_trip_and_reject_invalid_duty() {
+        let state = PwmState {
+            channel: 3,
+            enabled: true,
+            inverted: false,
+            period_ns: 20_000_000,
+            duty_ns: 1_500_000,
+        };
+        assert_eq!(
+            PwmState::decode(&state.encode(PWM_APPLY)),
+            Ok((PWM_APPLY, state))
+        );
+
+        let mut invalid = state.encode(PWM_APPLY);
+        invalid[12..20].copy_from_slice(&21_000_000_u64.to_le_bytes());
+        assert_eq!(PwmState::decode(&invalid), Err(WireError::Invalid));
     }
 
     #[test]

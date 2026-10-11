@@ -215,6 +215,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         peripherals.SPI1,
         peripherals.UART0,
         peripherals.UART1,
+        peripherals.ADC,
         PIN_MAP,
     );
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());

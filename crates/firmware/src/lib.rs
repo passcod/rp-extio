@@ -1,9 +1,9 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD,
-    Operation, Peripheral, PinMap, PinValidationError, PinValidationKind, SPI_CS_CHANGE,
-    SpiRequest, Status, UsbHeader, WireError, Writer,
+    CAP_ADC, CAP_CLOCK, CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART,
+    I2cRequest, MAX_PAYLOAD, Operation, PWM_APPLY, PWM_GET, Peripheral, PinMap, PinValidationError,
+    PinValidationKind, PwmState, SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError, Writer,
 };
 
 pub use rp_extio_wire::DEFAULT_PIN_MAP;
@@ -76,6 +76,18 @@ pub trait Board {
     fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure>;
 
     fn gpio_snapshot(&mut self) -> Result<u32, BusFailure>;
+
+    fn gpio_directions(&self) -> u32;
+
+    fn gpio_pull_ups(&self) -> u32;
+
+    fn gpio_pull_downs(&self) -> u32;
+
+    fn adc_read(&mut self, channel: u8) -> Result<u16, BusFailure>;
+
+    fn pwm_state(&self, channel: u8) -> Result<PwmState, BusFailure>;
+
+    fn pwm_apply(&mut self, state: PwmState) -> Result<PwmState, BusFailure>;
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +115,8 @@ pub fn dispatch<B: Board>(
         Operation::I2cTransfer => i2c(payload, board, response),
         Operation::SpiMessage => spi(payload, board, response),
         Operation::GpioCommand => gpio(payload, board, response),
+        Operation::AdcRead => adc(payload, board, response),
+        Operation::Pwm => pwm(payload, board, response),
         Operation::ConfigurePins => unreachable!(),
     };
 
@@ -200,11 +214,53 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
         out.u16(0)?;
         out.extend(gpio_pins.as_slice())
     })?;
+    record(&mut out, CAP_ADC, 7, |out| {
+        out.push(rp_extio_wire::ADC_CHANNEL_COUNT as u8)?;
+        out.push(12)?;
+        out.u16(3_300)?;
+        out.extend(&pins.adc_pins)
+    })?;
+    record(
+        &mut out,
+        CAP_PWM,
+        (7 + rp_extio_wire::PWM_CHANNEL_COUNT) as u16,
+        |out| {
+            out.push(rp_extio_wire::PWM_CHANNEL_COUNT as u8)?;
+            out.u32(embassy_clock_hz())?;
+            out.u16(pins.pwm_enabled)?;
+            out.extend(&pins.pwm_pins)
+        },
+    )?;
+    record(&mut out, CAP_CLOCK, 14, |out| {
+        out.push(rp_extio_wire::CLOCK_OUTPUT_COUNT as u8)?;
+        out.push(pins.clock_enabled)?;
+        for output in 0..rp_extio_wire::CLOCK_OUTPUT_COUNT {
+            out.push(pins.clock_pins[output])?;
+            out.push(pins.clock_sources[output] as u8)?;
+            out.u32(pins.clock_hz[output])?;
+        }
+        Ok(())
+    })?;
     Ok(out.len())
 }
 
+fn embassy_clock_hz() -> u32 {
+    #[cfg(target_arch = "arm")]
+    {
+        embassy_rp::clocks::clk_sys_freq()
+    }
+    #[cfg(not(target_arch = "arm"))]
+    {
+        150_000_000
+    }
+}
+
 fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
-    if payload.len() != 4 || payload[2] > 1 || payload[3] != 0 {
+    if payload.len() != 4
+        || payload[3] != 0
+        || (payload[0] == rp_extio_wire::GPIO_SET_BIAS && payload[2] > 2)
+        || (payload[0] != rp_extio_wire::GPIO_SET_BIAS && payload[2] > 1)
+    {
         return Err(BusFailure::new(Status::BadFrame, 0));
     }
     if payload[0] == rp_extio_wire::GPIO_SNAPSHOT {
@@ -218,13 +274,42 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
             .len();
         response[..4].copy_from_slice(&(lines as u32).to_le_bytes());
         response[4..8].copy_from_slice(&board.gpio_snapshot()?.to_le_bytes());
-        return Ok(8);
+        response[8..12].copy_from_slice(&board.gpio_directions().to_le_bytes());
+        response[12..16].copy_from_slice(&board.gpio_pull_ups().to_le_bytes());
+        response[16..20].copy_from_slice(&board.gpio_pull_downs().to_le_bytes());
+        return Ok(20);
     }
     let value = board.gpio_command(payload[0], payload[1], payload[2])?;
     response[..4].copy_from_slice(&1_u32.to_le_bytes());
     response[4] = value;
     response[5..8].fill(0);
     Ok(8)
+}
+
+fn adc<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
+    if payload.len() != 4
+        || payload[0] as usize >= rp_extio_wire::ADC_CHANNEL_COUNT
+        || payload[1..] != [0, 0, 0]
+    {
+        return Err(BusFailure::new(Status::BadFrame, 0));
+    }
+    let channel = payload[0];
+    response[..2].copy_from_slice(&board.adc_read(channel)?.to_le_bytes());
+    response[2] = 12;
+    response[3] = channel;
+    Ok(4)
+}
+
+fn pwm<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
+    let (command, requested) =
+        PwmState::decode(payload).map_err(|_| BusFailure::new(Status::BadFrame, 0))?;
+    let state = match command {
+        PWM_GET => board.pwm_state(requested.channel)?,
+        PWM_APPLY => board.pwm_apply(requested)?,
+        _ => return Err(BusFailure::new(Status::BadFrame, 0)),
+    };
+    response[..rp_extio_wire::PWM_STATE_LEN].copy_from_slice(&state.encode(command));
+    Ok(rp_extio_wire::PWM_STATE_LEN)
 }
 
 fn configure_pins<B: Board>(
@@ -250,7 +335,7 @@ fn configure_pins<B: Board>(
         return error_reply(request, status, PinValidationError::ENCODED_LEN);
     }
     response[..8].copy_from_slice(&generation.to_le_bytes());
-    response[8..8 + rp_extio_wire::PIN_MAP_LEN].copy_from_slice(&map.encode());
+    response[8..8 + rp_extio_wire::PIN_MAP_LEN].copy_from_slice(&board.pin_map().encode());
     reply(request, Status::Ok, 8 + rp_extio_wire::PIN_MAP_LEN)
 }
 
@@ -359,6 +444,8 @@ mod tests {
     struct Stub {
         gpio_values: u32,
         gpio_outputs: u32,
+        gpio_pull_ups: u32,
+        gpio_pull_downs: u32,
         pin_map: PinMap,
         generation: u64,
     }
@@ -437,12 +524,59 @@ mod tests {
                     Ok(0)
                 }
                 rp_extio_wire::GPIO_GET_DIRECTION => Ok(u8::from(self.gpio_outputs & mask == 0)),
+                rp_extio_wire::GPIO_SET_BIAS => {
+                    self.gpio_pull_ups &= !mask;
+                    self.gpio_pull_downs &= !mask;
+                    if value == rp_extio_wire::GPIO_BIAS_PULL_UP {
+                        self.gpio_pull_ups |= mask;
+                    } else if value == rp_extio_wire::GPIO_BIAS_PULL_DOWN {
+                        self.gpio_pull_downs |= mask;
+                    }
+                    Ok(value)
+                }
                 _ => Err(BusFailure::new(Status::Unsupported, 0)),
             }
         }
 
         fn gpio_snapshot(&mut self) -> Result<u32, BusFailure> {
             Ok(self.gpio_values)
+        }
+
+        fn gpio_directions(&self) -> u32 {
+            self.gpio_outputs
+        }
+
+        fn gpio_pull_ups(&self) -> u32 {
+            self.gpio_pull_ups
+        }
+
+        fn gpio_pull_downs(&self) -> u32 {
+            self.gpio_pull_downs
+        }
+
+        fn adc_read(&mut self, channel: u8) -> Result<u16, BusFailure> {
+            if self.pin_map.adc_enabled & (1 << channel) == 0 {
+                return Err(BusFailure::new(Status::Unsupported, 0));
+            }
+            Ok(1000 + u16::from(channel))
+        }
+
+        fn pwm_state(&self, channel: u8) -> Result<PwmState, BusFailure> {
+            if self.pin_map.pwm_enabled & (1 << channel) == 0 {
+                return Err(BusFailure::new(Status::Unsupported, 0));
+            }
+            Ok(PwmState {
+                channel,
+                enabled: false,
+                inverted: false,
+                period_ns: 1_000_000,
+                duty_ns: 0,
+            })
+        }
+
+        fn pwm_apply(&mut self, state: PwmState) -> Result<PwmState, BusFailure> {
+            self.pwm_state(state.channel)?;
+            Ok(state)
         }
     }
 
@@ -487,6 +621,13 @@ mod tests {
                 .windows(2)
                 .any(|window| window == CAP_PIN_CONFIG.to_le_bytes())
         );
+        for capability in [CAP_ADC, CAP_PWM, CAP_CLOCK] {
+            assert!(
+                response[..reply.payload_len]
+                    .windows(2)
+                    .any(|window| window == capability.to_le_bytes())
+            );
+        }
     }
 
     #[test]
@@ -597,6 +738,58 @@ mod tests {
             &(DEFAULT_PIN_MAP.gpio_pins().unwrap().len() as u32).to_le_bytes()
         );
         assert_eq!(&response[4..8], &(1_u32 << 3).to_le_bytes());
+        assert_eq!(&response[8..12], &(1_u32 << 3).to_le_bytes());
+        assert_eq!(reply.payload_len, 20);
+    }
+
+    #[test]
+    fn adc_and_pwm_dispatch_require_enabled_channels() {
+        let mut response = [0; MAX_PAYLOAD];
+        let mut board = Stub::default();
+
+        let disabled = dispatch(
+            header(Operation::AdcRead, 4),
+            &[0, 0, 0, 0],
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(disabled.header.status, Status::Unsupported);
+        board.pin_map.adc_enabled = 1;
+        let reading = dispatch(
+            header(Operation::AdcRead, 4),
+            &[0, 0, 0, 0],
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(reading.header.status, Status::Ok);
+        assert_eq!(&response[..4], &[0xe8, 0x03, 12, 0]);
+
+        let state = PwmState {
+            channel: 2,
+            enabled: true,
+            inverted: false,
+            period_ns: 1_000_000,
+            duty_ns: 250_000,
+        };
+        let disabled = dispatch(
+            header(Operation::Pwm, rp_extio_wire::PWM_STATE_LEN),
+            &state.encode(PWM_APPLY),
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(disabled.header.status, Status::Unsupported);
+        board.pin_map.pwm_enabled = 1 << state.channel;
+        let applied = dispatch(
+            header(Operation::Pwm, rp_extio_wire::PWM_STATE_LEN),
+            &state.encode(PWM_APPLY),
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(applied.header.status, Status::Ok);
+        assert_eq!(
+            PwmState::decode(&response[..applied.payload_len]),
+            Ok((PWM_APPLY, state))
+        );
     }
 
     #[test]
