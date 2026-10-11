@@ -683,6 +683,11 @@ impl ConfigStore {
         entries.retain(|entry| entry.pin() != startup.pin());
         entries.push(startup);
         entries.sort_by_key(|entry| entry.pin());
+        if let Err(message) = validate_gpio_startup(&map, entries) {
+            restore_entry(&mut self.boards, &serial, previous_map);
+            restore_entry(&mut self.gpio_startup, &serial, previous);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
         if let Err(error) = self.save() {
             restore_entry(&mut self.boards, &serial, previous_map);
             restore_entry(&mut self.gpio_startup, &serial, previous);
