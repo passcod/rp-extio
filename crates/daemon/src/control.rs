@@ -896,6 +896,7 @@ pub fn validate_gpio_startup(map: &PinMap, entries: &[GpioStartup]) -> Result<()
 
 pub fn validate_pwm_startup(map: &PinMap, entries: &[PwmInfo]) -> Result<(), String> {
     let mut seen = Vec::new();
+    let mut slice_periods = [None; rp_extio_wire::PWM_CHANNEL_COUNT / 2];
     for pwm in entries {
         let channel = pwm.channel as usize;
         if channel >= rp_extio_wire::PWM_CHANNEL_COUNT {
@@ -915,6 +916,16 @@ pub fn validate_pwm_startup(map: &PinMap, entries: &[PwmInfo]) -> Result<(), Str
                 "PWM{} has more than one startup state",
                 pwm.channel
             ));
+        }
+        if pwm.enabled {
+            let slice = channel / 2;
+            if slice_periods[slice].is_some_and(|period| period != pwm.period_ns) {
+                return Err(format!(
+                    "PWM{} startup period conflicts with its enabled slice sibling",
+                    pwm.channel
+                ));
+            }
+            slice_periods[slice] = Some(pwm.period_ns);
         }
         seen.push(pwm.channel);
     }
@@ -1369,6 +1380,15 @@ mod tests {
             )
             .is_err()
         );
+        let sibling = PwmInfo {
+            channel: 7,
+            period_ns: 2_000_000,
+            duty_ns: 500_000,
+            ..pwm
+        };
+        let mut sibling_map = map;
+        sibling_map.pwm_enabled |= 1 << 7;
+        assert!(validate_pwm_startup(&sibling_map, &[pwm, sibling]).is_err());
     }
 
     #[test]
