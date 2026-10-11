@@ -119,6 +119,12 @@ enum UiMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OperateSelection {
+    Pin,
+    Signal,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct AdcReading {
     channel: u8,
     raw: u16,
@@ -159,6 +165,7 @@ struct App {
     grouped: bool,
     flipped: bool,
     mode: UiMode,
+    operate_selection: OperateSelection,
     gpio: Vec<GpioInfo>,
     adc: Option<AdcReading>,
     pwm: Option<PwmInfo>,
@@ -208,12 +215,25 @@ impl App {
     }
 
     fn selected_pwm_startup(&self) -> Option<PwmInfo> {
-        let channel = self.selected_signal().pwm_channel()? as u8;
+        let channel = self.operation_signal()?.pwm_channel()? as u8;
         self.current()?
             .pwm_startup
             .iter()
             .find(|pwm| pwm.channel == channel)
             .copied()
+    }
+
+    fn operation_signal(&self) -> Option<PinSignal> {
+        if self.operate_selection == OperateSelection::Signal {
+            return Some(self.selected_signal());
+        }
+        let pin = self.selected_pin().gpio?;
+        let map = self.active_map()?;
+        PinSignal::ALL.into_iter().find(|&signal| {
+            signal.serial_peripheral().is_none()
+                && map.is_signal_enabled(signal)
+                && map.pin(signal) == pin
+        })
     }
 
     fn screen_cursor_row(&self) -> usize {
@@ -234,6 +254,9 @@ impl App {
             UiMode::Route => UiMode::Operate,
             UiMode::Operate => UiMode::Route,
         };
+        if self.mode == UiMode::Operate {
+            self.operate_selection = OperateSelection::Pin;
+        }
         self.clear_message();
     }
 
@@ -256,6 +279,9 @@ impl App {
     fn cycle_signal(&mut self, delta: isize) {
         self.signal =
             (self.signal as isize + delta).rem_euclid(PinSignal::ALL.len() as isize) as usize;
+        if self.mode == UiMode::Operate {
+            self.operate_selection = OperateSelection::Signal;
+        }
         self.move_to_signal_pin();
         self.clear_message();
         self.adc = None;
@@ -282,6 +308,11 @@ impl App {
         self.cursor_row =
             (self.cursor_row as isize + row_delta).clamp(0, HEADER_ROWS as isize - 1) as usize;
         self.cursor_side = (self.cursor_side as isize + side_delta).clamp(0, 1) as usize;
+        if self.mode == UiMode::Operate {
+            self.operate_selection = OperateSelection::Pin;
+            self.adc = None;
+            self.pwm = None;
+        }
         self.clear_message();
     }
 
@@ -480,16 +511,21 @@ impl App {
     }
 
     fn open_pwm_editor(&mut self) {
-        let Some(channel) = self.selected_signal().pwm_channel() else {
+        let Some(signal) = self.operation_signal() else {
+            self.message = "select a PWM signal or its routed pin".into();
+            self.message_error = true;
+            return;
+        };
+        let Some(channel) = signal.pwm_channel() else {
             self.message = "select a PWM signal to edit its output".into();
             self.message_error = true;
             return;
         };
         if !self
             .active_map()
-            .is_some_and(|map| map.is_signal_enabled(self.selected_signal()))
+            .is_some_and(|map| map.is_signal_enabled(signal))
         {
-            self.message = format!("{} is not routed", display_signal(self.selected_signal()));
+            self.message = format!("{} is not routed", display_signal(signal));
             self.message_error = true;
             return;
         }
@@ -577,6 +613,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         grouped: true,
         flipped: false,
         mode: UiMode::Route,
+        operate_selection: OperateSelection::Pin,
         gpio: Vec::new(),
         adc: None,
         pwm: None,
@@ -632,10 +669,30 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
                 app.switch_board(1);
                 refresh_telemetry(client, &mut app);
             }
-            KeyCode::Up => app.move_cursor(-1, 0),
-            KeyCode::Down => app.move_cursor(1, 0),
-            KeyCode::Left => app.move_cursor(0, -1),
-            KeyCode::Right => app.move_cursor(0, 1),
+            KeyCode::Up => {
+                app.move_cursor(-1, 0);
+                if app.mode == UiMode::Operate {
+                    refresh_telemetry(client, &mut app);
+                }
+            }
+            KeyCode::Down => {
+                app.move_cursor(1, 0);
+                if app.mode == UiMode::Operate {
+                    refresh_telemetry(client, &mut app);
+                }
+            }
+            KeyCode::Left => {
+                app.move_cursor(0, -1);
+                if app.mode == UiMode::Operate {
+                    refresh_telemetry(client, &mut app);
+                }
+            }
+            KeyCode::Right => {
+                app.move_cursor(0, 1);
+                if app.mode == UiMode::Operate {
+                    refresh_telemetry(client, &mut app);
+                }
+            }
             KeyCode::Tab => {
                 app.cycle_signal(1);
                 refresh_telemetry(client, &mut app);
@@ -813,10 +870,11 @@ fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
                 app.telemetry_error.clone(),
             );
     };
-    let signal = app.selected_signal();
+    let signal = app.operation_signal();
     app.adc = None;
     app.pwm = None;
-    if let Some(channel) = signal.adc_channel()
+    if let Some(signal) = signal
+        && let Some(channel) = signal.adc_channel()
         && map.is_signal_enabled(signal)
     {
         match client.request(&ControlRequest::AdcRead {
@@ -840,7 +898,8 @@ fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
             Ok(_) => app.telemetry_error = Some("unexpected ADC response".into()),
             Err(error) => app.telemetry_error = Some(error.to_string()),
         }
-    } else if let Some(channel) = signal.pwm_channel()
+    } else if let Some(signal) = signal
+        && let Some(channel) = signal.pwm_channel()
         && map.is_signal_enabled(signal)
     {
         match client.request(&ControlRequest::PwmGet {
@@ -904,7 +963,7 @@ fn cycle_gpio_input(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Er
 }
 
 fn save_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
-    if let Some(channel) = app.selected_signal().pwm_channel() {
+    if let Some(channel) = app.operation_signal().and_then(PinSignal::pwm_channel) {
         let Some(pwm) = app.pwm.filter(|pwm| pwm.channel == channel as u8) else {
             set_app_error(
                 app,
@@ -923,7 +982,7 @@ fn save_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>
         );
         return Ok(());
     }
-    if let Some(output) = app.selected_signal().clock_output() {
+    if let Some(output) = app.operation_signal().and_then(PinSignal::clock_output) {
         app.message = format!(
             "CLOCK{output} enable, route, source, and frequency are already saved with the pin map"
         );
@@ -958,7 +1017,7 @@ fn save_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>
 }
 
 fn clear_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
-    if let Some(channel) = app.selected_signal().pwm_channel() {
+    if let Some(channel) = app.operation_signal().and_then(PinSignal::pwm_channel) {
         let Some(serial) = app.current().map(|board| board.serial.clone()) else {
             set_app_error(app, "no board selected");
             return Ok(());
@@ -973,7 +1032,7 @@ fn clear_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error
         );
         return Ok(());
     }
-    if let Some(output) = app.selected_signal().clock_output() {
+    if let Some(output) = app.operation_signal().and_then(PinSignal::clock_output) {
         app.message = format!(
             "CLOCK{output} has no separate startup state; disable it in route mode and apply"
         );
@@ -1011,9 +1070,17 @@ fn handle_startup_response(app: &mut App, response: ControlResponse, success: St
 }
 
 fn operate_default(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
-    if app.selected_signal().pwm_channel().is_some() {
+    if app
+        .operation_signal()
+        .and_then(PinSignal::pwm_channel)
+        .is_some()
+    {
         app.open_pwm_editor();
-    } else if app.selected_signal().adc_channel().is_some() {
+    } else if app
+        .operation_signal()
+        .and_then(PinSignal::adc_channel)
+        .is_some()
+    {
         refresh_telemetry(client, app);
         if app.adc.is_some() {
             app.message = "ADC sample refreshed".into();
@@ -1228,6 +1295,22 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             )
         })
         .unwrap_or_else(|| "-".into());
+    let selection = if app.mode == UiMode::Operate && app.operate_selection == OperateSelection::Pin
+    {
+        let pin = app.selected_pin();
+        match pin.gpio {
+            Some(gpio) => format!(
+                "GP{gpio} → {}",
+                app.operation_signal().map_or_else(
+                    || "GPIO".to_owned(),
+                    |signal| display_signal(signal).to_owned(),
+                )
+            ),
+            None => format!("pin {} → {}", pin.physical, pin.label),
+        }
+    } else {
+        format!("{} → {route}", display_signal(selected))
+    };
     let summary = board.map_or_else(
         || "no boards".into(),
         |board| {
@@ -1247,11 +1330,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         UiMode::Operate => "OPERATE",
     };
     frame.render_widget(
-        Paragraph::new(format!(
-            "{mode}  {summary}  │  {} → {route}{dirty}",
-            display_signal(selected)
-        ))
-        .block(
+        Paragraph::new(format!("{mode}  {summary}  │  {selection}{dirty}",)).block(
             Block::default()
                 .title("rp-extio · Pico 2")
                 .borders(Borders::ALL),
@@ -1601,14 +1680,15 @@ fn selected_runtime_detail(app: &App) -> String {
             if pwm.inverted { "inverted" } else { "normal" }
         );
     }
-    if let Some(output) = app.selected_signal().clock_output()
+    if let Some(signal) = app.operation_signal()
+        && let Some(output) = signal.clock_output()
         && let Some(map) = app.active_map()
     {
         return format!(
             "CLOCK{output}: {:?} · target {} Hz · {} · persisted in pin map",
             map.clock_sources[output],
             map.clock_hz[output],
-            if map.is_signal_enabled(app.selected_signal()) {
+            if map.is_signal_enabled(signal) {
                 "enabled"
             } else {
                 "disabled"
@@ -2131,6 +2211,7 @@ mod tests {
             grouped: true,
             flipped: false,
             mode: UiMode::Route,
+            operate_selection: OperateSelection::Pin,
             gpio: Vec::new(),
             adc: None,
             pwm: None,
@@ -2205,6 +2286,7 @@ mod tests {
         app.boards[0].active = Some(map.into());
         app.edited = Some(map);
         app.signal = PinSignal::Pwm1A as usize;
+        app.operate_selection = OperateSelection::Signal;
         app.pwm = Some(PwmInfo {
             channel: 2,
             enabled: true,
@@ -2230,6 +2312,7 @@ mod tests {
         let mut app = app();
         let mut map = DEFAULT_PIN_MAP;
         app.signal = PinSignal::Pwm1A as usize;
+        app.operate_selection = OperateSelection::Signal;
         map.set_signal_enabled(PinSignal::Pwm1A, true);
         app.boards[0].active = Some(map.into());
         app.edited = Some(map);
@@ -2247,6 +2330,32 @@ mod tests {
         assert_eq!(editor.duty_percent, "25.0");
         assert!(editor.enabled);
         assert!(editor.inverted);
+    }
+
+    #[test]
+    fn operate_mode_arrows_select_pin_roles_and_tab_selects_signals() {
+        let mut app = app();
+        let mut map = DEFAULT_PIN_MAP;
+        map.set_signal_enabled(PinSignal::Pwm5A, true);
+        app.boards[0].active = Some(map.into());
+        app.edited = Some(map);
+        app.mode = UiMode::Operate;
+        (app.cursor_row, app.cursor_side) = find_gpio(map.pin(PinSignal::Pwm5A)).unwrap();
+        app.move_cursor(0, 0);
+        assert_eq!(app.operate_selection, OperateSelection::Pin);
+        assert_eq!(app.operation_signal(), Some(PinSignal::Pwm5A));
+        assert!(rendered(120, 40, &app).contains("GP10 → PWM5 A"));
+
+        (app.cursor_row, app.cursor_side) = find_gpio(11).unwrap();
+        app.move_cursor(0, 0);
+        assert_eq!(app.operation_signal(), None);
+        assert!(rendered(120, 40, &app).contains("GP11 → GPIO"));
+
+        app.signal = PinSignal::Adc1 as usize;
+        app.cycle_signal(1);
+        assert_eq!(app.operate_selection, OperateSelection::Signal);
+        assert_eq!(app.operation_signal(), Some(PinSignal::Adc2));
+        assert!(rendered(120, 40, &app).contains("ADC2 → GP28"));
     }
 
     #[test]

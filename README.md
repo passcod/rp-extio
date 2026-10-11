@@ -362,7 +362,11 @@ Press `v` to switch from route mode to operate mode. The pinout then refreshes
 live state while idle and annotates every exported GPIO as input or output,
 high or low, and pull-up or pull-down. The status panel expands the highlighted
 pin's state and interprets it as a button; `b` switches between active-low and
-active-high button wiring. `0` and `1` drive the highlighted GPIO low or high,
+active-high button wiring. In this mode, arrow keys select the live function on
+the highlighted physical pin—including GPIO, ADC, PWM, or clock—while Tab and
+Shift-Tab explicitly select signals and move to their routed pins. Moving with
+an arrow afterward returns operation focus to the physical pin. `0` and `1`
+drive the highlighted GPIO low or high,
 `t`, Enter, or Space toggles it as a daemon-held LED/output, and `i` returns it
 to input while cycling through pull-up, pull-down, and no internal bias. These
 live changes last until the pin map changes or the board disconnects. Press
