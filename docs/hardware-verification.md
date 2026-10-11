@@ -100,6 +100,8 @@ Pico USB path:
 I2C0 / I2C1 adapters:
 SPI0 / SPI1 controllers and children:
 GPIO chip:
+IIO device:
+PWM chip:
 UART0 / UART1 CDC ACM devices:
 Peripheral parts and board revisions:
 Logic-analyser capture names:
@@ -113,15 +115,18 @@ ls -l /dev/serial/by-id/
 i2cdetect -l
 ls -l /dev/spidev*
 gpioinfo
+ls -d /sys/bus/iio/devices/iio:device*
+ls -d /sys/class/pwm/pwmchip*
 systemctl status rp-extiod.service
 rp-extioctl list
 ```
 
 With the startup map, the board must have a stable USB serial, two CDC ACM
-devices, one I2C0 adapter, two SPI0 `spidev` children, and one 17-line GPIO
-chip. UART1 remains enumerated over USB while disabled; I2C1 and SPI1 have no
-Linux buses until enabled. Run the ignored USB hardware test before attaching a
-peripheral:
+devices, one I2C0 adapter, two SPI0 `spidev` children, one 17-line GPIO chip,
+one three-channel IIO device, and one sixteen-channel PWM chip. UART1 remains
+enumerated over USB while disabled; disabled I2C/SPI instances have no Linux
+buses, while disabled ADC/PWM channels reject operations. Run the ignored USB
+hardware test before attaching a peripheral:
 
 ```sh
 cargo test -p rp-extiod negotiates_connected_bridge_and_reads_gpio_snapshot \
@@ -237,6 +242,15 @@ Verify that output-low turns the LED off, output-high turns it on, repeated
 toggles remain responsive, then explicitly reconfigure the line as an input
 and confirm the LED is no longer driven.
 
+Exercise the daemon-owned persistent output and LED polarity paths as well as
+libgpiod, replacing `SERIAL` and the free pin:
+
+```sh
+rp-extioctl gpio set SERIAL GP22 high
+rp-extioctl led SERIAL GP22 off
+rp-extioctl led SERIAL GP22 on --active-low
+```
+
 ### Button input circuit
 
 Use an active-low button with an external pull-up:
@@ -253,6 +267,19 @@ Verify an unpressed high level, a pressed low level, and both edge directions.
 A mechanical button can bounce, so it may produce several transitions. Use a
 loopback output for deterministic edge counts and the button for a physical
 input smoke test.
+
+Remove the external 10 kΩ pull-up and repeat with the RP2350 internal pull:
+
+```sh
+rp-extioctl gpio input SERIAL GP28 --pull pull-up
+rp-extioctl gpio snapshot SERIAL
+rp-extioctl button SERIAL GP28 --active-low --pull pull-up --wait pressed \
+  --timeout-ms 10000
+```
+
+Repeat with a button to 3.3 V and `--pull pull-down`. Confirm `gpioinfo` reports
+the requested bias and that a pin-map change clears daemon-owned direction and
+bias state.
 
 ### GPIO acceptance criteria
 
@@ -507,14 +534,11 @@ the equivalent manual path:
 runzero target/debug/rp-extioctl prepare --module linux/rp_extio.ko
 ```
 
-## ADC and PWM stretch fixtures
+## ADC fixture
 
-ADC and PWM are not exposed by the current USB protocol, daemon, or Linux
-kernel module. GP26, GP27, and GP28 currently appear only as digital GPIOs.
-Software-toggling those lines through the GPIO bridge is not a substitute for
-hardware PWM, and digital reads cannot verify ADC values.
-
-Keep these circuits as fixtures for separate ADC/IIO and PWM implementations.
+ADC0, ADC1, and ADC2 use GP26, GP27, and GP28 respectively. Enable each signal
+before reading it; an enabled ADC signal owns its pin and removes it from the
+GPIO controller.
 
 ### ADC potentiometer fixture
 
@@ -527,29 +551,104 @@ Connect the wiper through 1 kΩ to GP26, GP27, or GP28:
            wiper ---- 1 kΩ ---- ADC input
 ```
 
-Future ADC verification should measure ground, 3.3 V, midpoint, monotonic
-sweeps, repeated-sample noise, channel isolation, and conversion scaling
-through a Linux IIO device. Never let the wiper exceed 3.3 V.
+Never let the wiper exceed 3.3 V. For each channel:
+
+1. Route and enable it, for example `rp-extioctl set SERIAL --route adc0=GP26
+   --enable adc0`.
+2. Discover the board's `iio:deviceN` with `rp-extioctl show SERIAL`.
+3. Tie the input through 1 kΩ to ground. Read with `rp-extioctl adc SERIAL 0`
+   and `cat /sys/bus/iio/devices/iio:deviceN/in_voltage0_raw`; expect a value
+   near zero from both paths.
+4. Tie it through 1 kΩ to 3.3 V and expect a value near 4095.
+5. Restore the potentiometer and compare the CLI millivolt result with a
+   multimeter at low, midpoint, and high settings.
+6. Sweep slowly and confirm monotonic readings, then hold several points and
+   record the observed noise range.
+7. Hold the other two inputs at fixed distinct voltages and alternate reads to
+   check channel isolation.
+8. Disable the channel. Both direct CLI and IIO raw reads must fail as
+   unsupported, and the pin must return to the GPIO list.
+
+The IIO scale is expressed in millivolts per 12-bit count using the documented
+3.3 V reference. ADC acceptance requires agreement between CLI and IIO raw
+values, monotonic conversion across all three channels, bounded fixed-input
+noise, and clean pin release after disable.
+
+## PWM fixtures
+
+The exposed channels are PWM0A, PWM0B, through PWM7A, PWM7B. Each channel can
+select one of its valid header aliases, but A and B on the same hardware slice
+share a period. Use `rp-extioctl show SERIAL` to discover `pwmchipN` and the
+effective routed map.
 
 ### PWM LED fixture
 
-The GPIO LED circuit can become a PWM fixture. Future PWM verification should
-sweep duty cycle from 0% through 100%, check frequency and duty cycle with a
-logic analyser, confirm the visible brightness trend, and exercise multiple
-channels concurrently.
+The GPIO LED circuit can become a PWM fixture. Route and enable a channel on
+that pin, then sweep 0%, 10%, 50%, 90%, and 100% duty at 1 kHz:
+
+```sh
+rp-extioctl pwm set SERIAL CHANNEL --frequency-hz 1000 --duty-percent 50
+rp-extioctl pwm get SERIAL CHANNEL
+rp-extioctl pwm disable SERIAL CHANNEL
+```
+
+Confirm the visible brightness trend and measure effective frequency and duty
+with a logic analyser. Repeat with `--inverted`, several frequencies across
+the usable divider range, and an alias pin for a channel that has two routes.
+The disabled output must stop and the route remains owned until the signal is
+disabled in the pin map.
+
+Also export the channel under `/sys/class/pwm/pwmchipN`, set period,
+`duty_cycle`, polarity, and enable, and confirm the standard Linux path produces
+the same waveform. Use a privileged shell or appropriately delegated sysfs
+permissions; prefixing `echo` with an elevation command does not elevate shell
+redirection.
+
+Enable both channels of one slice with the same period and different duties;
+both must run concurrently. While A is active, request a different period on B
+and require a `busy` error without disturbing A. Disable A, change B's period,
+and confirm the change now succeeds.
 
 ### PWM servo fixture
 
 A small servo provides a pulse-width integration test, but power it from a
 separate suitable supply. Connect the supply ground to Pico ground and connect
 only the PWM signal to the Pico. Do not power a servo from the Pico 3.3 V pin.
-Future verification should test endpoint and centre pulse widths, frequency,
-update behaviour, and safe output state during disconnect.
+Test 50 Hz with 1.0 ms, 1.5 ms, and 2.0 ms pulses, staying within the servo's
+documented range. Verify endpoint/centre movement, live updates, and that USB
+disconnect, daemon stop, pin-map reconfiguration, and PWM disable stop the
+signal.
 
-Adding ADC requires a new board capability and transaction protocol plus a
-Linux IIO registration path. Adding PWM likewise requires a new capability,
-protocol operations, and Linux PWM controller. Those are separate feature
-designs rather than extensions of the current digital-GPIO test.
+### PWM acceptance criteria
+
+- CLI and standard Linux PWM control agree on enabled state and effective
+  period, duty, and polarity.
+- Logic-analyser measurements match the reported quantized values within one
+  PWM counter step.
+- All sixteen logical channels operate on at least one valid route; every alias
+  route muxes correctly.
+- Same-slice channels share a period and reject conflicting live changes
+  without altering the sibling.
+- Different slices run independently and survive concurrent ADC, serial-bus,
+  and GPIO activity.
+- Disable, reconfiguration, daemon stop, and disconnect leave no waveform.
+
+## Clock-output fixture
+
+Route CLOCK0 to GP13 or GP21 and CLOCK1 to GP15. Start with a 1 MHz system-clock
+source and measure it with a logic analyser or frequency counter:
+
+```sh
+rp-extioctl set SERIAL --route clock0=GP13 --enable clock0 \
+  --clock-source 0=system --clock-hz 0=1000000
+```
+
+Confirm `show` reports the effective quantized frequency. Repeat representative
+frequencies from each source: system, reference, USB, ADC, crystal, ring
+oscillator, and low-power oscillator. Reject zero, targets above the selected
+source, and divider-overflow targets without changing the active map. Move
+CLOCK0 to GP21, exercise CLOCK1 independently, then disable each output and
+confirm the pin returns to GPIO and the clock stops.
 
 ## Completion record
 
