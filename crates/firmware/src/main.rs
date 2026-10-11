@@ -90,6 +90,9 @@ embassy_time_driver::time_driver_impl!(static TIME_DRIVER: RpTimerDriver = RpTim
 
 #[panic_handler]
 fn panic(_info: &PanicInfo<'_>) -> ! {
+    // A startup panic happens before our USB device can enumerate. Return to BOOTSEL so a bad
+    // firmware image remains recoverable without needing physical access to the BOOTSEL button.
+    embassy_rp::rom_data::reset_to_usb_boot(0, 0);
     loop {
         core::hint::spin_loop();
     }

@@ -91,6 +91,8 @@ just flash
 This works immediately when the board is in BOOTSEL mode. `picotool` also asks
 compatible running firmware to reboot into BOOTSEL automatically; firmware
 without that reset support must first be put into BOOTSEL manually.
+The firmware returns to BOOTSEL if it panics during startup or operation, so a
+bad image remains recoverable over USB.
 
 One firmware image supports every valid route at runtime. Pin environment
 variables only change the startup and recovery default. For example, this
