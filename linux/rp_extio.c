@@ -821,11 +821,17 @@ static ssize_t rpe_read(struct file *file, char __user *buffer, size_t count,
 
 	if (count < RPE_HEADER_SIZE)
 		return -EMSGSIZE;
-	ret = wait_event_interruptible(session->read_wait,
-				       READ_ONCE(session->closing) ||
-				       atomic_read(&session->readable_requests));
-	if (ret)
-		return ret;
+	if (file->f_flags & O_NONBLOCK) {
+		if (!READ_ONCE(session->closing) &&
+		    !atomic_read(&session->readable_requests))
+			return -EAGAIN;
+	} else {
+		ret = wait_event_interruptible(session->read_wait,
+					       READ_ONCE(session->closing) ||
+					       atomic_read(&session->readable_requests));
+		if (ret)
+			return ret;
+	}
 	mutex_lock(&session->lock);
 	request = rpe_next_request(session);
 	if (!request) {
