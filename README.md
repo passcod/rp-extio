@@ -303,9 +303,10 @@ grounds, and current Linux bus assignments remain visible on the board.
 
 `e` toggles the selected signal's entire peripheral instance. Disabling it
 immediately previews its pins as GPIO; enabling validates all of its remembered
-routes before changing the draft. `f` rotates the diagram 180° for an
-upside-down board, placing SWD at the top and USB at the bottom while keeping
-arrow movement aligned with the screen. Orientation is not persisted.
+routes before changing the draft. `f` mirrors the diagram left-to-right for a
+board mounted belly up, keeping USB at the top while showing the pin headers as
+viewed from the back. Arrow movement remains aligned with the screen.
+Orientation is not persisted.
 
 `a` applies the complete draft atomically, `d` loads the firmware defaults into
 the draft, and `u` discards edits and restores the active map. `[` and `]`

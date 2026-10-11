@@ -147,11 +147,7 @@ impl App {
     }
 
     fn screen_cursor_row(&self) -> usize {
-        if self.flipped {
-            HEADER_ROWS - 1 - self.cursor_row
-        } else {
-            self.cursor_row
-        }
+        self.cursor_row
     }
 
     fn dirty(&self) -> bool {
@@ -198,10 +194,10 @@ impl App {
     }
 
     fn move_cursor(&mut self, row_delta: isize, side_delta: isize) {
-        let (row_delta, side_delta) = if self.flipped {
-            (-row_delta, -side_delta)
+        let side_delta = if self.flipped {
+            -side_delta
         } else {
-            (row_delta, side_delta)
+            side_delta
         };
         self.cursor_row =
             (self.cursor_row as isize + row_delta).clamp(0, HEADER_ROWS as isize - 1) as usize;
@@ -306,9 +302,9 @@ impl App {
     fn flip(&mut self) {
         self.flipped = !self.flipped;
         self.message = if self.flipped {
-            "board view rotated 180°"
+            "board view flipped to back (belly-up) side"
         } else {
-            "board view restored to USB-up orientation"
+            "board view restored to front (component) side"
         }
         .into();
         self.message_error = false;
@@ -641,9 +637,9 @@ fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
 fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .title(if app.flipped {
-            "Pico 2 · rotated · SWD end ▲"
+            "Pico 2 · back (belly up) · USB end ▲"
         } else {
-            "Pico 2 · USB end ▲"
+            "Pico 2 · front (components up) · USB end ▲"
         })
         .borders(Borders::ALL);
     let inner = block.inner(area);
@@ -660,16 +656,8 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .min(HEADER_ROWS - visible);
     let end = start + visible;
     let mut lines = Vec::with_capacity(visible + 2);
-    let top_end = if app.flipped {
-        "SWD DEBUG"
-    } else {
-        "USB CONNECTOR"
-    };
-    let bottom_end = if app.flipped {
-        "USB CONNECTOR"
-    } else {
-        "SWD DEBUG"
-    };
+    let top_end = "USB CONNECTOR";
+    let bottom_end = "SWD DEBUG";
     let top = if visible == HEADER_ROWS {
         top_end.into()
     } else if start == 0 {
@@ -707,11 +695,7 @@ fn pin_row(width: u16, screen_row: usize, app: &App) -> Line<'static> {
         9 => "│  2   │",
         _ => "│      │",
     };
-    let logical_row = if app.flipped {
-        HEADER_ROWS - 1 - screen_row
-    } else {
-        screen_row
-    };
+    let logical_row = screen_row;
     let (left, left_side, right, right_side) = if app.flipped {
         (RIGHT_HEADER[logical_row], 1, LEFT_HEADER[logical_row], 0)
     } else {
@@ -1288,25 +1272,37 @@ mod tests {
     }
 
     #[test]
-    fn flipped_view_rotates_headers_and_screen_navigation() {
+    fn flipped_view_mirrors_headers_and_horizontal_navigation() {
         let mut app = app();
+        let front = rendered(120, 40, &app);
+        let front_top_row = front
+            .lines()
+            .find(|line| line.contains("GP0") && line.contains("VBUS"))
+            .unwrap();
+        assert!(front_top_row.find("GP0").unwrap() < front_top_row.find("VBUS").unwrap());
+
         app.flip();
         let output = rendered(120, 40, &app);
-        assert!(output.contains("rotated · SWD end"));
-        assert!(output.find("SWD DEBUG").unwrap() < output.find("USB CONNECTOR").unwrap());
+        assert!(output.contains("back (belly up) · USB end"));
+        assert!(output.find("USB CONNECTOR").unwrap() < output.find("SWD DEBUG").unwrap());
+        let back_top_row = output
+            .lines()
+            .find(|line| line.contains("GP0") && line.contains("VBUS"))
+            .unwrap();
+        assert!(back_top_row.find("VBUS").unwrap() < back_top_row.find("GP0").unwrap());
         app.cursor_row = 19;
         app.cursor_side = 1;
         assert_eq!(app.selected_pin().physical, 21);
-        assert_eq!(app.screen_cursor_row(), 0);
+        assert_eq!(app.screen_cursor_row(), 19);
         app.cursor_row = 0;
         app.cursor_side = 0;
         assert_eq!(app.selected_pin().physical, 1);
-        assert_eq!(app.screen_cursor_row(), 19);
+        assert_eq!(app.screen_cursor_row(), 0);
 
         app.cursor_row = 10;
         app.cursor_side = 1;
         app.move_cursor(1, 0);
-        assert_eq!(app.cursor_row, 9);
+        assert_eq!(app.cursor_row, 11);
         app.move_cursor(0, 1);
         assert_eq!(app.cursor_side, 0);
     }

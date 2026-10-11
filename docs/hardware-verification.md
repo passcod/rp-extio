@@ -171,8 +171,9 @@ Perform this section with one stock UF2; do not rebuild between routes.
 16. Run `rp-extioctl tui SERIAL`, exercise every signal selector, grouped moves
     within both hardware instances, the `e` enable toggle, conflict display,
     apply, refresh, reload, and default action. Press `f` and confirm the board
-    rotates 180° with screen-relative arrow navigation. Exit with both `q` and
-    an interrupt and confirm the terminal is restored.
+    mirrors left-to-right as viewed belly up, without exchanging the USB and
+    SWD ends, and that arrow navigation remains screen-relative. Exit with both
+    `q` and an interrupt and confirm the terminal is restored.
 
 ## GPIO fixture
 
