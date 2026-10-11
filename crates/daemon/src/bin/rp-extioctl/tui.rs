@@ -117,6 +117,7 @@ struct App {
     cursor_row: usize,
     cursor_side: usize,
     edited: Option<PinMap>,
+    grouped: bool,
     default_pending: bool,
     message: String,
     message_error: bool,
@@ -210,20 +211,54 @@ impl App {
             self.message_error = true;
             return;
         }
-        let Some(map) = self.edited.as_mut() else {
+        let Some(map) = self.edited else {
             self.message = "board is disconnected".into();
             self.message_error = true;
             return;
         };
-        map.set_pin(signal, gpio);
+        let candidate = match routed_map(map, signal, gpio, self.grouped) {
+            Ok(candidate) => candidate,
+            Err(message) => {
+                self.message = message.into();
+                self.message_error = true;
+                return;
+            }
+        };
+        if self.grouped
+            && let Err(error) = candidate.validate()
+        {
+            self.message = format!(
+                "grouped move rejected: {}",
+                rp_extiod::control::format_validation(error)
+            );
+            self.message_error = true;
+            return;
+        }
+        self.edited = Some(candidate);
         self.default_pending = false;
-        if let Err(error) = map.validate() {
+        if let Err(error) = candidate.validate() {
             self.message = rp_extiod::control::format_validation(error);
             self.message_error = true;
         } else {
-            self.message = "draft route updated; press a to apply".into();
+            self.message = if self.grouped && coupled_signal(signal) {
+                "draft route group updated; press a to apply"
+            } else {
+                "draft route updated; press a to apply"
+            }
+            .into();
             self.message_error = false;
         }
+    }
+
+    fn toggle_grouped(&mut self) {
+        self.grouped = !self.grouped;
+        self.message = if self.grouped {
+            "grouped assignment enabled"
+        } else {
+            "individual assignment enabled; the draft may be temporarily invalid"
+        }
+        .into();
+        self.message_error = false;
     }
 
     fn load_default(&mut self) {
@@ -287,6 +322,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         cursor_row: 0,
         cursor_side: 0,
         edited: None,
+        grouped: true,
         default_pending: false,
         message: String::new(),
         message_error: false,
@@ -317,6 +353,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::Tab => app.cycle_signal(1),
             KeyCode::BackTab => app.cycle_signal(-1),
             KeyCode::Enter | KeyCode::Char(' ') => app.assign_selected(),
+            KeyCode::Char('g') => app.toggle_grouped(),
             KeyCode::Char('u') => app.undo(),
             KeyCode::Char('d') => app.load_default(),
             KeyCode::Char('r') => {
@@ -441,12 +478,17 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         draw_pinout(frame, rows[1], app);
     }
     draw_status(frame, rows[2], app);
-    frame.render_widget(
-        Paragraph::new(
-            "arrows pin  Tab/Shift-Tab signal  Enter assign  a apply  d defaults  u undo\n[/] board  r refresh  l reload  q quit",
-        ),
-        rows[3],
-    );
+    let assignment_mode = if app.grouped { "grouped" } else { "single" };
+    let help = if area.width >= 72 {
+        format!(
+            "arrows pin  Tab signal  Enter assign  g {assignment_mode}  a apply  d defaults  u undo\n[/] board  r refresh  l reload  q quit"
+        )
+    } else {
+        format!(
+            "arrows pin  Tab signal  Enter assign  g {assignment_mode}\na apply  d defaults  u undo  r refresh  q quit"
+        )
+    };
+    frame.render_widget(Paragraph::new(help), rows[3]);
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -650,7 +692,12 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
     if app.edited.is_some_and(|map| map.pin(signal) == gpio) {
         return signal_style(signal).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     }
-    if signal.valid_pins().contains(&gpio) {
+    if signal.valid_pins().contains(&gpio)
+        && app.edited.is_some_and(|map| {
+            routed_map(map, signal, gpio, app.grouped)
+                .is_ok_and(|candidate| !app.grouped || candidate.validate().is_ok())
+        })
+    {
         return Style::default().fg(Color::Green);
     }
     if let Some(map) = app.edited
@@ -724,6 +771,78 @@ fn find_gpio(gpio: u8) -> Option<(usize, usize)> {
         })
 }
 
+fn coupled_signal(signal: PinSignal) -> bool {
+    !matches!(signal, PinSignal::SpiCs0 | PinSignal::SpiCs1)
+}
+
+fn routed_map(
+    mut map: PinMap,
+    signal: PinSignal,
+    pin: u8,
+    grouped: bool,
+) -> Result<PinMap, &'static str> {
+    if !grouped || !coupled_signal(signal) {
+        map.set_pin(signal, pin);
+        return Ok(map);
+    }
+
+    let routes: &[(PinSignal, u8)] = match signal {
+        PinSignal::UartTx => &[
+            (PinSignal::UartTx, pin),
+            (PinSignal::UartRx, pin.saturating_add(1)),
+        ],
+        PinSignal::UartRx => &[
+            (PinSignal::UartTx, pin.saturating_sub(1)),
+            (PinSignal::UartRx, pin),
+        ],
+        PinSignal::I2cSda => &[
+            (PinSignal::I2cSda, pin),
+            (PinSignal::I2cScl, pin.saturating_add(1)),
+        ],
+        PinSignal::I2cScl => &[
+            (PinSignal::I2cSda, pin.saturating_sub(1)),
+            (PinSignal::I2cScl, pin),
+        ],
+        PinSignal::SpiMiso => &[
+            (PinSignal::SpiMiso, pin),
+            (PinSignal::SpiSck, pin.saturating_add(2)),
+            (PinSignal::SpiMosi, pin.saturating_add(3)),
+        ],
+        PinSignal::SpiSck => &[
+            (PinSignal::SpiMiso, pin.saturating_sub(2)),
+            (PinSignal::SpiSck, pin),
+            (PinSignal::SpiMosi, pin.saturating_add(1)),
+        ],
+        PinSignal::SpiMosi => &[
+            (PinSignal::SpiMiso, pin.saturating_sub(3)),
+            (PinSignal::SpiSck, pin.saturating_sub(1)),
+            (PinSignal::SpiMosi, pin),
+        ],
+        PinSignal::SpiCs0 | PinSignal::SpiCs1 => unreachable!(),
+    };
+    if routes
+        .iter()
+        .any(|(signal, pin)| !signal.valid_pins().contains(pin))
+    {
+        return Err(match signal {
+            PinSignal::UartTx | PinSignal::UartRx => {
+                "selected pin has no complete UART pair on the Pico 2 header"
+            }
+            PinSignal::I2cSda | PinSignal::I2cScl => {
+                "selected pin has no complete I²C pair on the Pico 2 header"
+            }
+            PinSignal::SpiMiso | PinSignal::SpiSck | PinSignal::SpiMosi => {
+                "selected pin has no complete SPI group on the Pico 2 header"
+            }
+            PinSignal::SpiCs0 | PinSignal::SpiCs1 => unreachable!(),
+        });
+    }
+    for &(signal, pin) in routes {
+        map.set_pin(signal, pin);
+    }
+    Ok(map)
+}
+
 fn display_signal(signal: PinSignal) -> &'static str {
     match signal {
         PinSignal::UartTx => "UART TX",
@@ -791,6 +910,7 @@ mod tests {
             cursor_row: 0,
             cursor_side: 0,
             edited: Some(DEFAULT_PIN_MAP),
+            grouped: true,
             default_pending: false,
             message: String::new(),
             message_error: false,
@@ -847,14 +967,77 @@ mod tests {
     }
 
     #[test]
-    fn valid_conflicting_assignment_remains_in_the_draft() {
+    fn grouped_assignment_moves_i2c_uart_and_spi_routes_together() {
         let mut app = app();
+
+        app.signal = PinSignal::I2cSda as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(8).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!((map.i2c_sda, map.i2c_scl), (8, 9));
+        assert!(map.validate().is_ok());
+
+        app.signal = PinSignal::UartRx as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(15).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!((map.uart_tx, map.uart_rx), (14, 15));
+        assert!(map.validate().is_ok());
+
+        app.signal = PinSignal::SpiSck as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(6).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!((map.spi_miso, map.spi_sck, map.spi_mosi), (4, 6, 7));
+        assert!(map.validate().is_ok());
+    }
+
+    #[test]
+    fn grouped_assignment_rejects_conflicts_without_changing_the_draft() {
+        let mut app = app();
+        app.signal = PinSignal::SpiMiso as usize;
+        app.cursor_row = 0;
+        app.assign_selected();
+        assert_eq!(app.edited.unwrap(), DEFAULT_PIN_MAP);
+        assert!(app.message.contains("grouped move rejected"));
+        assert!(app.message.contains("assigned to both"));
+        assert!(app.message_error);
+        assert!(!app.dirty());
+    }
+
+    #[test]
+    fn individual_assignment_retains_manual_invalid_drafts() {
+        let mut app = app();
+        app.toggle_grouped();
         app.signal = PinSignal::SpiMiso as usize;
         app.cursor_row = 0;
         app.assign_selected();
         assert_eq!(app.edited.unwrap().spi_miso, 0);
         assert!(app.message.contains("assigned to both"));
+        assert!(app.message_error);
         assert!(app.dirty());
+    }
+
+    #[test]
+    fn grouped_assignment_rejects_incomplete_header_groups() {
+        let mut app = app();
+        (app.cursor_row, app.cursor_side) = find_gpio(28).unwrap();
+        app.assign_selected();
+        assert_eq!(app.edited.unwrap(), DEFAULT_PIN_MAP);
+        assert!(app.message.contains("no complete UART pair"));
+        assert!(app.message_error);
+    }
+
+    #[test]
+    fn chip_selects_remain_individually_assignable_in_grouped_mode() {
+        let mut app = app();
+        app.signal = PinSignal::SpiCs0 as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(10).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!(map.spi_chip_selects, [10, 21]);
+        assert_eq!((map.spi_miso, map.spi_sck, map.spi_mosi), (16, 18, 19));
+        assert!(map.validate().is_ok());
     }
 
     #[test]

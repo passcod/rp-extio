@@ -245,9 +245,16 @@ rp-extioctl tui 125DBCCF0BCA4BEF
 The TUI presents the physical Pico 2 headers with pin 1 opposite pin 40 at the
 USB end. Arrow keys move between physical pins, Tab and Shift-Tab select a
 peripheral signal, and Enter or Space assigns that signal to the highlighted
-GPIO in the draft. Valid routes are highlighted; conflicts, mismatched I2C
-pairs, changed pins, exported GPIO lines, power pins, grounds, and current Linux
-bus assignments remain visible on the board.
+GPIO in the draft. Assignments move UART TX/RX, I2C SDA/SCL, or the SPI
+MISO/SCK/MOSI mux group together by default. A grouped move that would conflict
+with another signal or cannot fit on the exposed header is rejected without
+changing the draft. SPI chip selects remain individually assignable.
+
+Press `g` to switch between grouped and individual assignment. Individual mode
+allows unusual valid layouts without a complete exposed group, and can leave a
+temporarily invalid draft for manual correction. Valid routes are highlighted;
+conflicts, mismatched I2C pairs, changed pins, exported GPIO lines, power pins,
+grounds, and current Linux bus assignments remain visible on the board.
 
 `a` applies the complete draft atomically, `d` loads the firmware defaults into
 the draft, and `u` discards edits and restores the active map. `[` and `]`
