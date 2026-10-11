@@ -12,8 +12,18 @@ build: release module
 
 # Build and flash the Pico 2 firmware, then reboot into the application.
 flash:
+    #!/usr/bin/env bash
+    set -euo pipefail
     ./scripts/build-uf2.sh
-    picotool load --force --update --verify --execute build/rp-extio-firmware.uf2
+    runzero picotool reboot --usb --force --vid 51966 --pid 16400 || true
+    for _ in {1..50}; do
+        if lsusb -d 2e8a:000f >/dev/null 2>&1; then
+            break
+        fi
+        sleep 0.1
+    done
+    lsusb -d 2e8a:000f >/dev/null
+    runzero picotool load --force --update --verify --execute {{ root }}/build/rp-extio-firmware.uf2
 
 # Build optimized daemon and control binaries.
 release:
