@@ -82,6 +82,16 @@ rustup target add thumbv8m.main-none-eabihf
 ./scripts/build-uf2.sh
 ```
 
+To build, flash, verify, and reboot the attached Pico 2 in one command:
+
+```sh
+just flash
+```
+
+This works immediately when the board is in BOOTSEL mode. `picotool` also asks
+compatible running firmware to reboot into BOOTSEL automatically; firmware
+without that reset support must first be put into BOOTSEL manually.
+
 One firmware image supports every valid route at runtime. Pin environment
 variables only change the startup and recovery default. For example, this
 builds a recovery image whose default I2C0 route is GP12/GP13:
@@ -129,7 +139,7 @@ build with a diagnostic.
 The daemon normally replaces this map after USB negotiation and reapplies its
 persistent map after every reconnect or firmware reset.
 
-Hold BOOTSEL while connecting the Pico 2, then copy
+Alternatively, hold BOOTSEL while connecting the Pico 2 and copy
 `build/rp-extio-firmware.uf2` to the `RP2350` mass-storage volume. The firmware
 uses the RP2350 OTP chip ID as its USB serial number. That serial is the stable
 board identity; `/dev/i2c-N`, `/dev/spidevN.*`, and `/dev/gpiochipN` numbers can

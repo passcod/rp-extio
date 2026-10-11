@@ -10,6 +10,11 @@ default:
 # Build the host tools and kernel module.
 build: release module
 
+# Build and flash the Pico 2 firmware, then reboot into the application.
+flash:
+    ./scripts/build-uf2.sh
+    picotool load --force --update --verify --execute build/rp-extio-firmware.uf2
+
 # Build optimized daemon and control binaries.
 release:
     cargo build --release -p rp-extiod
