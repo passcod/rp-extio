@@ -256,6 +256,8 @@ pub struct BoardInfo {
     pub i2c_buses: [Option<i32>; 2],
     pub spi_buses: [Option<i32>; 2],
     pub gpio_instance: Option<u32>,
+    pub iio_device: Option<i32>,
+    pub pwm_chip: Option<i32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -634,6 +636,8 @@ mod tests {
                 i2c_buses: [Some(12), None],
                 spi_buses: [Some(4), None],
                 gpio_instance: Some(99),
+                iio_device: Some(2),
+                pwm_chip: Some(1),
             },
         };
         let encoded = serde_json::to_vec(&response).unwrap();

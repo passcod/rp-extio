@@ -233,6 +233,8 @@ fn board_info(device: &ConnectedDevice, desired: Option<PinMap>) -> BoardInfo {
         i2c_buses: device.registration.buses.i2c,
         spi_buses: device.registration.buses.spi,
         gpio_instance: Some(device.registration.gpio_instance_id()),
+        iio_device: device.registration.iio_device,
+        pwm_chip: device.registration.pwm_chip,
     }
 }
 
@@ -246,6 +248,8 @@ fn disconnected_info(serial: String, desired: PinMap) -> BoardInfo {
         i2c_buses: [None; 2],
         spi_buses: [None; 2],
         gpio_instance: None,
+        iio_device: None,
+        pwm_chip: None,
     }
 }
 

@@ -374,7 +374,7 @@ fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {
 
 fn board_summary(board: &BoardInfo) -> String {
     format!(
-        "{}  {:12}  generation={}  enabled={} i2c={} spi={}",
+        "{}  {:12}  generation={}  enabled={} i2c={} spi={} iio={} pwm={}",
         board.serial,
         if board.connected {
             "connected"
@@ -398,6 +398,12 @@ fn board_summary(board: &BoardInfo) -> String {
         ),
         bus_numbers(board.i2c_buses),
         bus_numbers(board.spi_buses),
+        board
+            .iio_device
+            .map_or_else(|| "-".into(), |number| format!("iio:device{number}")),
+        board
+            .pwm_chip
+            .map_or_else(|| "-".into(), |number| format!("pwmchip{number}")),
     )
 }
 
@@ -566,9 +572,13 @@ mod tests {
             i2c_buses: [Some(7), None],
             spi_buses: [Some(2), None],
             gpio_instance: Some(9),
+            iio_device: Some(4),
+            pwm_chip: Some(5),
         });
         assert!(summary.contains("enabled=uart0,i2c0,spi0"));
         assert!(summary.contains("i2c=0:7,1:-"));
         assert!(summary.contains("spi=0:2,1:-"));
+        assert!(summary.contains("iio=iio:device4"));
+        assert!(summary.contains("pwm=pwmchip5"));
     }
 }

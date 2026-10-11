@@ -1258,6 +1258,8 @@ mod tests {
                 i2c_buses: [Some(27), None],
                 spi_buses: [Some(0), None],
                 gpio_instance: Some(3),
+                iio_device: Some(0),
+                pwm_chip: Some(0),
             }],
             board: 0,
             signal: 0,

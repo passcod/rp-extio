@@ -14,7 +14,7 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-const ABI_MAJOR: u16 = 2;
+const ABI_MAJOR: u16 = 3;
 const IOC_MAGIC: u32 = b'R' as u32;
 const I2C_FUNCTIONALITY: u32 = 0x0eff_000b;
 
@@ -132,17 +132,40 @@ struct IocCreateGpio {
     reserved3: [u8; 6],
 }
 
+#[repr(C)]
+struct IocCreateAdc {
+    channels: u8,
+    resolution_bits: u8,
+    reference_mv: u16,
+    instance_id: u32,
+    device_num: i32,
+    reserved: u32,
+}
+
+#[repr(C)]
+struct IocCreatePwm {
+    channels: u16,
+    enabled: u16,
+    clock_hz: u32,
+    instance_id: u32,
+    chip_num: i32,
+}
+
 const _: () = assert!(size_of::<IocVersion>() == 16);
 const _: () = assert!(size_of::<IocCreateI2c>() == 20);
 const _: () = assert!(size_of::<IocCreateSpi>() == 24);
 const _: () = assert!(size_of::<IocDestroy>() == 8);
 const _: () = assert!(size_of::<IocCreateGpio>() == 48);
+const _: () = assert!(size_of::<IocCreateAdc>() == 16);
+const _: () = assert!(size_of::<IocCreatePwm>() == 16);
 
 const IOC_GET_VERSION: libc::Ioctl = libc::_IOR::<IocVersion>(IOC_MAGIC, 0x00);
 const IOC_CREATE_I2C: libc::Ioctl = libc::_IOWR::<IocCreateI2c>(IOC_MAGIC, 0x01);
 const IOC_CREATE_SPI: libc::Ioctl = libc::_IOWR::<IocCreateSpi>(IOC_MAGIC, 0x02);
 const IOC_DESTROY: libc::Ioctl = libc::_IOW::<IocDestroy>(IOC_MAGIC, 0x03);
 const IOC_CREATE_GPIO: libc::Ioctl = libc::_IOWR::<IocCreateGpio>(IOC_MAGIC, 0x04);
+const IOC_CREATE_ADC: libc::Ioctl = libc::_IOWR::<IocCreateAdc>(IOC_MAGIC, 0x05);
+const IOC_CREATE_PWM: libc::Ioctl = libc::_IOWR::<IocCreatePwm>(IOC_MAGIC, 0x06);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BusNumbers {
@@ -155,6 +178,8 @@ pub struct DeviceRegistration {
     instance_ids: Vec<u32>,
     gpio_instance_id: u32,
     pub buses: BusNumbers,
+    pub iio_device: Option<i32>,
+    pub pwm_chip: Option<i32>,
 }
 
 impl DeviceRegistration {
@@ -281,13 +306,58 @@ impl Kernel {
         self.backends
             .write()
             .unwrap()
-            .insert(gpio.instance_id, backend);
+            .insert(gpio.instance_id, backend.clone());
         instance_ids.push(gpio.instance_id);
+        let mut iio_device = None;
+        if let Some(registration) = config.adc {
+            let mut create = IocCreateAdc {
+                channels: registration.channels,
+                resolution_bits: registration.resolution_bits,
+                reference_mv: registration.reference_mv,
+                instance_id: 0,
+                device_num: -1,
+                reserved: 0,
+            };
+            if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_ADC, &mut create)
+            {
+                self.destroy_instances(&instance_ids);
+                return Err(error);
+            }
+            instance_ids.push(create.instance_id);
+            iio_device = Some(create.device_num);
+            self.backends
+                .write()
+                .unwrap()
+                .insert(create.instance_id, backend.clone());
+        }
+        let mut pwm_chip = None;
+        if let Some(registration) = config.pwm {
+            let mut create = IocCreatePwm {
+                channels: registration.channels.into(),
+                enabled: registration.enabled,
+                clock_hz: registration.clock_hz,
+                instance_id: 0,
+                chip_num: -1,
+            };
+            if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_PWM, &mut create)
+            {
+                self.destroy_instances(&instance_ids);
+                return Err(error);
+            }
+            instance_ids.push(create.instance_id);
+            pwm_chip = Some(create.chip_num);
+            self.backends
+                .write()
+                .unwrap()
+                .insert(create.instance_id, backend);
+        }
         Ok(DeviceRegistration {
             kernel: self.clone(),
             instance_ids,
             gpio_instance_id: gpio.instance_id,
             buses,
+            iio_device,
+            pwm_chip,
         })
     }
 
@@ -425,6 +495,8 @@ impl Request {
             2 => Operation::I2cTransfer,
             3 => Operation::SpiMessage,
             4 => Operation::GpioCommand,
+            6 => Operation::AdcRead,
+            7 => Operation::Pwm,
             _ => return invalid("unsupported kernel operation"),
         };
         let payload = &frame[KERNEL_HEADER_LEN..];
@@ -478,9 +550,14 @@ impl Request {
             Operation::GpioCommand => {
                 if payload.len() != 4
                     || payload[0] < rp_extio_wire::GPIO_GET
-                    || payload[0] > rp_extio_wire::GPIO_GET_DIRECTION
+                    || payload[0] > rp_extio_wire::GPIO_SET_BIAS
                     || payload[1] >= rp_extio_wire::MAX_GPIO_LINES as u8
-                    || payload[2] > 1
+                    || payload[2]
+                        > if payload[0] == rp_extio_wire::GPIO_SET_BIAS {
+                            rp_extio_wire::GPIO_BIAS_PULL_DOWN
+                        } else {
+                            1
+                        }
                     || payload[3] != 0
                 {
                     return invalid("invalid GPIO command payload");
@@ -491,9 +568,31 @@ impl Request {
                     value: payload[2],
                 }
             }
-            Operation::Hello | Operation::ConfigurePins | Operation::AdcRead | Operation::Pwm => {
-                unreachable!()
+            Operation::AdcRead => {
+                if payload.len() != 4
+                    || payload[0] as usize >= rp_extio_wire::ADC_CHANNEL_COUNT
+                    || payload[1..] != [0; 3]
+                {
+                    return invalid("invalid ADC command payload");
+                }
+                Transaction::Adc {
+                    channel: payload[0],
+                }
             }
+            Operation::Pwm => {
+                let (command, state) = rp_extio_wire::PwmState::decode(payload).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidData, "invalid PWM command payload")
+                })?;
+                Transaction::Pwm {
+                    command,
+                    channel: state.channel,
+                    enabled: state.enabled,
+                    inverted: state.inverted,
+                    period_ns: state.period_ns,
+                    duty_ns: state.duty_ns,
+                }
+            }
+            Operation::Hello | Operation::ConfigurePins => unreachable!(),
         };
         Ok(Self {
             operation,
@@ -708,6 +807,53 @@ mod tests {
     }
 
     #[test]
+    fn decodes_adc_and_pwm_requests_and_encodes_replies() {
+        let adc = Request::decode(&frame(Operation::AdcRead as u16, &[2, 0, 0, 0])).unwrap();
+        assert_eq!(adc.transaction, Transaction::Adc { channel: 2 });
+        let reply = adc.encode_reply(BackendReply {
+            status: Status::Ok as i32,
+            completed: 1,
+            data: 3072_u16.to_le_bytes().to_vec(),
+            effective_speeds: vec![],
+        });
+        assert_eq!(&reply[KERNEL_HEADER_LEN..], &3072_u16.to_le_bytes());
+
+        let state = rp_extio_wire::PwmState {
+            channel: 5,
+            enabled: true,
+            inverted: true,
+            period_ns: 20_000_000,
+            duty_ns: 1_500_000,
+        };
+        let pwm = Request::decode(&frame(
+            Operation::Pwm as u16,
+            &state.encode(rp_extio_wire::PWM_APPLY),
+        ))
+        .unwrap();
+        assert_eq!(
+            pwm.transaction,
+            Transaction::Pwm {
+                command: rp_extio_wire::PWM_APPLY,
+                channel: 5,
+                enabled: true,
+                inverted: true,
+                period_ns: 20_000_000,
+                duty_ns: 1_500_000,
+            }
+        );
+        let reply = pwm.encode_reply(BackendReply {
+            status: Status::Ok as i32,
+            completed: 1,
+            data: state.encode(rp_extio_wire::PWM_APPLY).to_vec(),
+            effective_speeds: vec![],
+        });
+        assert_eq!(
+            &reply[KERNEL_HEADER_LEN..],
+            &state.encode(rp_extio_wire::PWM_APPLY)
+        );
+    }
+
+    #[test]
     fn rejects_malformed_frames_and_backend_replies() {
         let mut bad_header = frame(2, &[0; 4]);
         bad_header[28] = 1;
@@ -731,8 +877,8 @@ mod tests {
         for payload in [
             &[rp_extio_wire::GPIO_GET, 0, 0][..],
             &[rp_extio_wire::GPIO_GET, 26, 0, 0],
-            &[rp_extio_wire::GPIO_SNAPSHOT, 0, 0, 0],
             &[rp_extio_wire::GPIO_GET, 0, 2, 0],
+            &[rp_extio_wire::GPIO_SET_BIAS, 0, 3, 0],
             &[rp_extio_wire::GPIO_GET, 0, 0, 1],
         ] {
             assert!(Request::decode(&frame(Operation::GpioCommand as u16, payload)).is_err());

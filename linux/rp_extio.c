@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 #include <linux/completion.h>
+#include <linux/bitmap.h>
 #include <linux/build_bug.h>
 #include <linux/device.h>
 #include <linux/fs.h>
 #include <linux/gpio/driver.h>
 #include <linux/i2c.h>
+#include <linux/iio/iio.h>
 #include <linux/idr.h>
 #include <linux/jiffies.h>
 #include <linux/kmod.h>
@@ -15,6 +17,8 @@
 #include <linux/irq.h>
 #include <linux/irqdomain.h>
 #include <linux/poll.h>
+#include <linux/pwm.h>
+#include <linux/pinctrl/pinconf-generic.h>
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/string.h>
@@ -32,13 +36,26 @@
 #define RPE_OP_SPI 3
 #define RPE_OP_GPIO 4
 #define RPE_OP_GPIO_EVENT 5
+#define RPE_OP_ADC 6
+#define RPE_OP_PWM 7
 
 #define RPE_GPIO_GET 1
 #define RPE_GPIO_SET 2
 #define RPE_GPIO_DIRECTION_INPUT 3
 #define RPE_GPIO_DIRECTION_OUTPUT 4
 #define RPE_GPIO_GET_DIRECTION 5
+#define RPE_GPIO_SNAPSHOT 6
+#define RPE_GPIO_SET_BIAS 7
+#define RPE_GPIO_BIAS_NONE 0
+#define RPE_GPIO_BIAS_PULL_UP 1
+#define RPE_GPIO_BIAS_PULL_DOWN 2
 #define RPE_MAX_GPIO_LINES 26
+
+#define RPE_PWM_GET 1
+#define RPE_PWM_APPLY 2
+#define RPE_PWM_ENABLED BIT(0)
+#define RPE_PWM_INVERTED BIT(1)
+#define RPE_PWM_STATE_SIZE 20
 
 #define RPE_STATUS_OK 0
 #define RPE_STATUS_NACK 1
@@ -48,6 +65,9 @@
 #define RPE_STATUS_UNSUPPORTED 5
 #define RPE_STATUS_BAD_FRAME 6
 #define RPE_STATUS_IO_ERROR 7
+#define RPE_STATUS_INVALID_ROUTE 8
+#define RPE_STATUS_PIN_CONFLICT 9
+#define RPE_STATUS_BUSY 10
 
 #define RPE_I2C_READ 1
 #define RPE_I2C_TEN_BIT 2
@@ -59,6 +79,8 @@ enum rpe_instance_type {
 	RPE_INSTANCE_I2C,
 	RPE_INSTANCE_SPI,
 	RPE_INSTANCE_GPIO,
+	RPE_INSTANCE_ADC,
+	RPE_INSTANCE_PWM,
 };
 
 struct rpe_session;
@@ -91,6 +113,18 @@ struct rpe_instance {
 			char names[RPE_MAX_GPIO_LINES][6];
 			const char *name_ptrs[RPE_MAX_GPIO_LINES];
 		} gpio;
+		struct {
+			struct iio_dev *device;
+			u8 channels;
+			u8 resolution_bits;
+			u16 reference_mv;
+		} adc;
+		struct {
+			struct pwm_chip *chip;
+			u16 enabled;
+			u32 clock_hz;
+			bool registering;
+		} pwm;
 	};
 };
 
@@ -128,6 +162,8 @@ static_assert(sizeof(struct rpe_ioc_create_i2c) == 20);
 static_assert(sizeof(struct rpe_ioc_create_spi) == 24);
 static_assert(sizeof(struct rpe_ioc_destroy) == 8);
 static_assert(sizeof(struct rpe_ioc_create_gpio) == 48);
+static_assert(sizeof(struct rpe_ioc_create_adc) == 16);
+static_assert(sizeof(struct rpe_ioc_create_pwm) == 16);
 
 static void rpe_put16(u8 *p, u16 value)
 {
@@ -195,6 +231,11 @@ static int rpe_status_errno(s32 status)
 		return -EPROTO;
 	case RPE_STATUS_IO_ERROR:
 		return -EIO;
+	case RPE_STATUS_INVALID_ROUTE:
+	case RPE_STATUS_PIN_CONFLICT:
+		return -EINVAL;
+	case RPE_STATUS_BUSY:
+		return -EBUSY;
 	default:
 		return -EPROTO;
 	}
@@ -457,7 +498,7 @@ static int rpe_gpio_call(struct rpe_instance *instance, u8 command,
 	INIT_LIST_HEAD(&request->node);
 	request->request[RPE_HEADER_SIZE] = command;
 	request->request[RPE_HEADER_SIZE + 1] = offset;
-	request->request[RPE_HEADER_SIZE + 2] = !!value;
+	request->request[RPE_HEADER_SIZE + 2] = value;
 	request->instance = instance;
 
 	mutex_lock(&instance->transaction_lock);
@@ -465,7 +506,8 @@ static int rpe_gpio_call(struct rpe_instance *instance, u8 command,
 	ret = rpe_submit(instance, request);
 	if (!ret) {
 		if (request->reply_len != 8 || rpe_get32(request->reply) != 1 ||
-		    request->reply[4] > 1 || request->reply[5] || request->reply[6] ||
+		    request->reply[4] > (command == RPE_GPIO_SET_BIAS ? 2 : 1) ||
+		    request->reply[5] || request->reply[6] ||
 		    request->reply[7])
 			ret = -EPROTO;
 		else
@@ -504,6 +546,60 @@ static int rpe_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	return rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_GET, offset, 0);
 }
 
+static int rpe_gpio_get_multiple(struct gpio_chip *chip, unsigned long *mask,
+				 unsigned long *bits)
+{
+	struct rpe_instance *instance = gpiochip_get_data(chip);
+	struct rpe_request *request;
+	u32 values;
+	int ret;
+
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&request->node);
+	request->request[RPE_HEADER_SIZE] = RPE_GPIO_SNAPSHOT;
+	request->instance = instance;
+	mutex_lock(&instance->transaction_lock);
+	rpe_make_header(request, RPE_OP_GPIO, 4);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		if (request->reply_len != 20 || rpe_get32(request->reply) != chip->ngpio)
+			ret = -EPROTO;
+		else {
+			values = rpe_get32(request->reply + 4);
+			bitmap_from_arr32(bits, &values, min_t(unsigned int, chip->ngpio, 32));
+			bitmap_and(bits, bits, mask, chip->ngpio);
+		}
+	}
+	mutex_unlock(&instance->transaction_lock);
+	kfree(request);
+	return ret;
+}
+
+static int rpe_gpio_set_config(struct gpio_chip *chip, unsigned int offset,
+			       unsigned long config)
+{
+	u8 bias;
+	int ret;
+
+	switch (pinconf_to_config_param(config)) {
+	case PIN_CONFIG_BIAS_DISABLE:
+		bias = RPE_GPIO_BIAS_NONE;
+		break;
+	case PIN_CONFIG_BIAS_PULL_UP:
+		bias = RPE_GPIO_BIAS_PULL_UP;
+		break;
+	case PIN_CONFIG_BIAS_PULL_DOWN:
+		bias = RPE_GPIO_BIAS_PULL_DOWN;
+		break;
+	default:
+		return -ENOTSUPP;
+	}
+	ret = rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_SET_BIAS, offset, bias);
+	return ret < 0 ? ret : 0;
+}
+
 static int rpe_gpio_set_result(struct gpio_chip *chip, unsigned int offset, int value)
 {
 	int ret = rpe_gpio_call(gpiochip_get_data(chip), RPE_GPIO_SET, offset, value);
@@ -522,6 +618,140 @@ static void rpe_gpio_set(struct gpio_chip *chip, unsigned int offset, int value)
 	rpe_gpio_set_result(chip, offset, value);
 }
 #endif
+
+static int rpe_adc_read_raw(struct iio_dev *device,
+			    const struct iio_chan_spec *channel, int *value,
+			    int *value2, long mask)
+{
+	struct rpe_instance *instance = *(struct rpe_instance **)iio_priv(device);
+	struct rpe_request *request;
+	int ret;
+
+	if (mask == IIO_CHAN_INFO_SCALE) {
+		*value = instance->adc.reference_mv;
+		*value2 = instance->adc.resolution_bits;
+		return IIO_VAL_FRACTIONAL_LOG2;
+	}
+	if (mask != IIO_CHAN_INFO_RAW || channel->channel >= instance->adc.channels)
+		return -EINVAL;
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&request->node);
+	request->request[RPE_HEADER_SIZE] = channel->channel;
+	request->instance = instance;
+	mutex_lock(&instance->transaction_lock);
+	rpe_make_header(request, RPE_OP_ADC, 4);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		if (request->reply_len != 2)
+			ret = -EPROTO;
+		else {
+			*value = rpe_get16(request->reply);
+			ret = IIO_VAL_INT;
+		}
+	}
+	mutex_unlock(&instance->transaction_lock);
+	kfree(request);
+	return ret;
+}
+
+static const struct iio_info rpe_adc_info = {
+	.read_raw = rpe_adc_read_raw,
+};
+
+#define RPE_ADC_CHANNEL(_index) { \
+	.type = IIO_VOLTAGE, \
+	.indexed = 1, \
+	.channel = (_index), \
+	.info_mask_separate = BIT(IIO_CHAN_INFO_RAW), \
+	.info_mask_shared_by_type = BIT(IIO_CHAN_INFO_SCALE), \
+}
+
+static const struct iio_chan_spec rpe_adc_channels[] = {
+	RPE_ADC_CHANNEL(0),
+	RPE_ADC_CHANNEL(1),
+	RPE_ADC_CHANNEL(2),
+};
+
+static int rpe_pwm_call(struct rpe_instance *instance, unsigned int channel,
+			u8 command, struct pwm_state *state)
+{
+	struct rpe_request *request;
+	u16 flags = 0;
+	int ret;
+
+	if (channel >= instance->pwm.chip->npwm ||
+	    !(instance->pwm.enabled & BIT(channel)))
+		return -EOPNOTSUPP;
+	if (READ_ONCE(instance->pwm.registering)) {
+		if (command != RPE_PWM_GET)
+			return -EBUSY;
+		memset(state, 0, sizeof(*state));
+		state->polarity = PWM_POLARITY_NORMAL;
+		return 0;
+	}
+	if (state->enabled)
+		flags |= RPE_PWM_ENABLED;
+	if (state->polarity == PWM_POLARITY_INVERSED)
+		flags |= RPE_PWM_INVERTED;
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		return -ENOMEM;
+	INIT_LIST_HEAD(&request->node);
+	request->request[RPE_HEADER_SIZE] = command;
+	request->request[RPE_HEADER_SIZE + 1] = channel;
+	rpe_put16(request->request + RPE_HEADER_SIZE + 2, flags);
+	rpe_put64(request->request + RPE_HEADER_SIZE + 4, state->period);
+	rpe_put64(request->request + RPE_HEADER_SIZE + 12, state->duty_cycle);
+	request->instance = instance;
+	mutex_lock(&instance->transaction_lock);
+	rpe_make_header(request, RPE_OP_PWM, RPE_PWM_STATE_SIZE);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		if (request->reply_len != RPE_PWM_STATE_SIZE ||
+		    request->reply[0] != command || request->reply[1] != channel ||
+		    (rpe_get16(request->reply + 2) & ~(RPE_PWM_ENABLED | RPE_PWM_INVERTED))) {
+			ret = -EPROTO;
+		} else {
+			flags = rpe_get16(request->reply + 2);
+			state->enabled = !!(flags & RPE_PWM_ENABLED);
+			state->polarity = flags & RPE_PWM_INVERTED ?
+				PWM_POLARITY_INVERSED : PWM_POLARITY_NORMAL;
+			state->period = rpe_get64(request->reply + 4);
+			state->duty_cycle = rpe_get64(request->reply + 12);
+			if (state->duty_cycle > state->period ||
+			    (state->enabled && !state->period))
+				ret = -EPROTO;
+		}
+	}
+	mutex_unlock(&instance->transaction_lock);
+	kfree(request);
+	return ret;
+}
+
+static int rpe_pwm_apply(struct pwm_chip *chip, struct pwm_device *pwm,
+			 const struct pwm_state *state)
+{
+	struct pwm_state applied = *state;
+
+	return rpe_pwm_call(pwmchip_get_drvdata(chip), pwm->hwpwm,
+			    RPE_PWM_APPLY, &applied);
+}
+
+static int rpe_pwm_get_state(struct pwm_chip *chip, struct pwm_device *pwm,
+			     struct pwm_state *state)
+{
+	memset(state, 0, sizeof(*state));
+	state->polarity = PWM_POLARITY_NORMAL;
+	return rpe_pwm_call(pwmchip_get_drvdata(chip), pwm->hwpwm,
+			    RPE_PWM_GET, state);
+}
+
+static const struct pwm_ops rpe_pwm_ops = {
+	.apply = rpe_pwm_apply,
+	.get_state = rpe_pwm_get_state,
+};
 
 static void rpe_gpio_irq_mask(struct irq_data *data)
 {
@@ -742,8 +972,14 @@ static void rpe_destroy_instance(struct rpe_instance *instance)
 				spi_unregister_device(instance->spi.children[i]);
 		spi_unregister_controller(instance->spi.controller);
 		kfree(instance->spi.children);
-	} else {
+	} else if (instance->type == RPE_INSTANCE_GPIO) {
 		gpiochip_remove(&instance->gpio.chip);
+	} else if (instance->type == RPE_INSTANCE_ADC) {
+		iio_device_unregister(instance->adc.device);
+		iio_device_free(instance->adc.device);
+	} else {
+		pwmchip_remove(instance->pwm.chip);
+		pwmchip_put(instance->pwm.chip);
 	}
 	ida_free(&instance->session->instance_ids, instance->id);
 	kfree(instance);
@@ -788,7 +1024,9 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 	instance->gpio.chip.direction_input = rpe_gpio_direction_input;
 	instance->gpio.chip.direction_output = rpe_gpio_direction_output;
 	instance->gpio.chip.get = rpe_gpio_get;
+	instance->gpio.chip.get_multiple = rpe_gpio_get_multiple;
 	instance->gpio.chip.set = rpe_gpio_set;
+	instance->gpio.chip.set_config = rpe_gpio_set_config;
 	instance->gpio.chip.base = -1;
 	instance->gpio.chip.ngpio = create.lines;
 	for (i = 0; i < create.lines; i++) {
@@ -818,6 +1056,121 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 	return 0;
 free_id:
 	ida_free(&session->instance_ids, instance->id);
+free_instance:
+	kfree(instance);
+	return ret;
+}
+
+static int rpe_create_adc(struct rpe_session *session, void __user *argument)
+{
+	struct rpe_ioc_create_adc create;
+	struct rpe_instance *instance;
+	struct iio_dev *device;
+	int ret;
+
+	if (copy_from_user(&create, argument, sizeof(create)))
+		return -EFAULT;
+	if (!create.channels || create.channels > ARRAY_SIZE(rpe_adc_channels) ||
+	    !create.resolution_bits || create.resolution_bits > 16 ||
+	    !create.reference_mv || create.reserved)
+		return -EINVAL;
+	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	if (!instance)
+		return -ENOMEM;
+	device = iio_device_alloc(rpe_misc.this_device, sizeof(struct rpe_instance *));
+	if (!device) {
+		ret = -ENOMEM;
+		goto free_instance;
+	}
+	instance->session = session;
+	instance->type = RPE_INSTANCE_ADC;
+	instance->adc.device = device;
+	instance->adc.channels = create.channels;
+	instance->adc.resolution_bits = create.resolution_bits;
+	instance->adc.reference_mv = create.reference_mv;
+	mutex_init(&instance->transaction_lock);
+	*(struct rpe_instance **)iio_priv(device) = instance;
+	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
+	if ((int)instance->id < 0) {
+		ret = (int)instance->id;
+		goto free_device;
+	}
+	device->name = "rp-extio-adc";
+	device->info = &rpe_adc_info;
+	device->modes = INDIO_DIRECT_MODE;
+	device->channels = rpe_adc_channels;
+	device->num_channels = create.channels;
+	ret = iio_device_register(device);
+	if (ret)
+		goto free_id;
+	list_add_tail(&instance->node, &session->instances);
+	create.instance_id = instance->id;
+	create.device_num = iio_device_id(device);
+	if (copy_to_user(argument, &create, sizeof(create))) {
+		rpe_destroy_instance(instance);
+		return -EFAULT;
+	}
+	return 0;
+free_id:
+	ida_free(&session->instance_ids, instance->id);
+free_device:
+	iio_device_free(device);
+free_instance:
+	kfree(instance);
+	return ret;
+}
+
+static int rpe_create_pwm(struct rpe_session *session, void __user *argument)
+{
+	struct rpe_ioc_create_pwm create;
+	struct rpe_instance *instance;
+	struct pwm_chip *chip;
+	int ret;
+
+	if (copy_from_user(&create, argument, sizeof(create)))
+		return -EFAULT;
+	if (!create.channels || create.channels > 16 ||
+	    (create.enabled & ~GENMASK(create.channels - 1, 0)) || !create.clock_hz)
+		return -EINVAL;
+	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	if (!instance)
+		return -ENOMEM;
+	chip = pwmchip_alloc(rpe_misc.this_device, create.channels, 0);
+	if (IS_ERR(chip)) {
+		ret = PTR_ERR(chip);
+		goto free_instance;
+	}
+	instance->session = session;
+	instance->type = RPE_INSTANCE_PWM;
+	instance->pwm.chip = chip;
+	instance->pwm.enabled = create.enabled;
+	instance->pwm.clock_hz = create.clock_hz;
+	instance->pwm.registering = true;
+	mutex_init(&instance->transaction_lock);
+	pwmchip_set_drvdata(chip, instance);
+	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
+	if ((int)instance->id < 0) {
+		ret = (int)instance->id;
+		goto put_chip;
+	}
+	chip->ops = &rpe_pwm_ops;
+	chip->atomic = false;
+	ret = pwmchip_add(chip);
+	if (ret)
+		goto free_id;
+	WRITE_ONCE(instance->pwm.registering, false);
+	list_add_tail(&instance->node, &session->instances);
+	create.instance_id = instance->id;
+	create.chip_num = chip->id;
+	if (copy_to_user(argument, &create, sizeof(create))) {
+		rpe_destroy_instance(instance);
+		return -EFAULT;
+	}
+	return 0;
+free_id:
+	ida_free(&session->instance_ids, instance->id);
+put_chip:
+	pwmchip_put(chip);
 free_instance:
 	kfree(instance);
 	return ret;
@@ -1006,6 +1359,12 @@ static long rpe_ioctl(struct file *file, unsigned int command, unsigned long arg
 		break;
 	case RPE_IOC_CREATE_GPIO:
 		ret = rpe_create_gpio(session, argument);
+		break;
+	case RPE_IOC_CREATE_ADC:
+		ret = rpe_create_adc(session, argument);
+		break;
+	case RPE_IOC_CREATE_PWM:
+		ret = rpe_create_pwm(session, argument);
 		break;
 	case RPE_IOC_DESTROY:
 		if (copy_from_user(&destroy, argument, sizeof(destroy))) {

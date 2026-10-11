@@ -5,7 +5,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define RPE_ABI_MAJOR 2
+#define RPE_ABI_MAJOR 3
 #define RPE_ABI_MINOR 0
 #define RPE_MAX_PAYLOAD 4096
 #define RPE_MAX_DATA 3584
@@ -54,11 +54,30 @@ struct rpe_ioc_create_gpio {
 	__u8 reserved3[6];
 };
 
+struct rpe_ioc_create_adc {
+	__u8 channels;
+	__u8 resolution_bits;
+	__u16 reference_mv;
+	__u32 instance_id;
+	__s32 device_num;
+	__u32 reserved;
+};
+
+struct rpe_ioc_create_pwm {
+	__u16 channels;
+	__u16 enabled;
+	__u32 clock_hz;
+	__u32 instance_id;
+	__s32 chip_num;
+};
+
 #define RPE_IOC_MAGIC 'R'
 #define RPE_IOC_GET_VERSION _IOR(RPE_IOC_MAGIC, 0x00, struct rpe_ioc_version)
 #define RPE_IOC_CREATE_I2C _IOWR(RPE_IOC_MAGIC, 0x01, struct rpe_ioc_create_i2c)
 #define RPE_IOC_CREATE_SPI _IOWR(RPE_IOC_MAGIC, 0x02, struct rpe_ioc_create_spi)
 #define RPE_IOC_DESTROY _IOW(RPE_IOC_MAGIC, 0x03, struct rpe_ioc_destroy)
 #define RPE_IOC_CREATE_GPIO _IOWR(RPE_IOC_MAGIC, 0x04, struct rpe_ioc_create_gpio)
+#define RPE_IOC_CREATE_ADC _IOWR(RPE_IOC_MAGIC, 0x05, struct rpe_ioc_create_adc)
+#define RPE_IOC_CREATE_PWM _IOWR(RPE_IOC_MAGIC, 0x06, struct rpe_ioc_create_pwm)
 
 #endif
