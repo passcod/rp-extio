@@ -414,7 +414,7 @@ impl Request {
                     value: payload[2],
                 }
             }
-            Operation::Hello => unreachable!(),
+            Operation::Hello | Operation::ConfigurePins => unreachable!(),
         };
         Ok(Self {
             operation,

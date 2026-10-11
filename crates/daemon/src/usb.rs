@@ -10,8 +10,8 @@ use nusb::{
     transfer::{Buffer, Bulk, Direction, In, Out},
 };
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, MAX_PAYLOAD, Operation, Status,
-    USB_HEADER_LEN, UsbHeader,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, MAX_PAYLOAD, Operation, PIN_MAP_LEN, PinMap,
+    PinValidationError, Status, USB_HEADER_LEN, UsbHeader,
 };
 use std::{
     collections::HashMap,
@@ -28,6 +28,30 @@ pub const DEVELOPMENT_VID: u16 = 0xcafe;
 pub const DEVELOPMENT_PID: u16 = 0x4010;
 const USB_DEADLINE: Duration = Duration::from_secs(6);
 const USB_DRAIN_QUIET: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NegotiatedConfig {
+    pub registration: RegistrationConfig,
+    pub pin_map: PinMap,
+    pub generation: u64,
+}
+
+#[derive(Debug)]
+pub enum ConfigureError {
+    Rejected(PinValidationError),
+    Transport(io::Error),
+}
+
+impl std::fmt::Display for ConfigureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(error) => write!(formatter, "firmware rejected pin map: {error:?}"),
+            Self::Transport(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for ConfigureError {}
 
 struct ConnectedDevice {
     backend: Arc<UsbBackend>,
@@ -95,14 +119,14 @@ async fn try_connect(
             return;
         }
     };
-    match kernel.register_device(backend.clone(), config) {
+    match kernel.register_device(backend.clone(), config.registration) {
         Ok(registration) => {
             let gpio_instance_id = registration.gpio_instance_id();
             let gpio_poll = tokio::spawn(poll_gpio(
                 backend.clone(),
                 kernel.clone(),
                 gpio_instance_id,
-                config.gpio_lines,
+                config.registration.gpio_lines,
             ));
             devices.insert(
                 id,
@@ -192,7 +216,7 @@ impl UsbBackend {
     pub async fn connect(
         info: &DeviceInfo,
         failed: mpsc::UnboundedSender<DeviceId>,
-    ) -> io::Result<(Arc<Self>, RegistrationConfig)> {
+    ) -> io::Result<(Arc<Self>, NegotiatedConfig)> {
         let interface_number = info
             .interfaces()
             .find(|interface| {
@@ -265,6 +289,63 @@ impl UsbBackend {
         }
         let capabilities = parse_capabilities(&hello.payload)?;
         Ok((backend, capabilities))
+    }
+
+    pub async fn configure_pins(
+        &self,
+        map: PinMap,
+        generation: u64,
+    ) -> Result<NegotiatedConfig, ConfigureError> {
+        map.validate().map_err(ConfigureError::Rejected)?;
+        let mut payload = Vec::with_capacity(8 + PIN_MAP_LEN);
+        payload.extend_from_slice(&generation.to_le_bytes());
+        payload.extend_from_slice(&map.encode());
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let reply = self
+            .exchange(Operation::ConfigurePins, request_id, payload)
+            .await
+            .map_err(|failure| ConfigureError::Transport(failure.error))?;
+        match reply.header.status {
+            Status::Ok => {
+                if reply.payload.len() != 8 + PIN_MAP_LEN
+                    || reply.payload[..8] != generation.to_le_bytes()
+                    || reply.payload[8..] != map.encode()
+                {
+                    return Err(ConfigureError::Transport(invalid(
+                        "invalid configure-pins reply",
+                    )));
+                }
+            }
+            Status::InvalidRoute | Status::PinConflict => {
+                let error = PinValidationError::decode(&reply.payload)
+                    .map_err(|_| ConfigureError::Transport(invalid("invalid pin rejection")))?;
+                return Err(ConfigureError::Rejected(error));
+            }
+            _ => {
+                return Err(ConfigureError::Transport(io::Error::other(format!(
+                    "configure-pins failed with {:?}",
+                    reply.header.status
+                ))));
+            }
+        }
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let hello = self
+            .exchange(Operation::Hello, request_id, Vec::new())
+            .await
+            .map_err(|failure| ConfigureError::Transport(failure.error))?;
+        if hello.header.status != Status::Ok {
+            return Err(ConfigureError::Transport(io::Error::other(format!(
+                "HELLO after pin configuration failed with {:?}",
+                hello.header.status
+            ))));
+        }
+        let negotiated = parse_capabilities(&hello.payload).map_err(ConfigureError::Transport)?;
+        if negotiated.pin_map != map || negotiated.generation != generation {
+            return Err(ConfigureError::Transport(invalid(
+                "firmware did not retain configured pin map",
+            )));
+        }
+        Ok(negotiated)
     }
 
     fn fail(&self) {
@@ -603,13 +684,13 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
     }
 }
 
-fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
+fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut offset = 0;
-    let mut general = false;
+    let mut generation = None;
     let mut i2c = None;
     let mut spi = None;
     let mut uart = None;
-    let mut gpio_pins = None;
+    let mut gpio_pins: Option<[u8; rp_extio_wire::GPIO_LINE_COUNT]> = None;
     while offset < payload.len() {
         if payload.len() - offset < 4 {
             return Err(invalid("truncated capability record"));
@@ -624,8 +705,8 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
         offset += length;
         match kind {
             CAP_GENERAL => {
-                if general
-                    || value.len() != 8
+                if generation.is_some()
+                    || value.len() != 16
                     || value[0] > rp_extio_wire::VERSION_MAJOR
                     || value[1] < rp_extio_wire::VERSION_MAJOR
                     || value[3] != 0
@@ -633,7 +714,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
                 {
                     return Err(invalid("incompatible general capability"));
                 }
-                general = true;
+                generation = Some(u64::from_le_bytes(value[8..16].try_into().unwrap()));
             }
             CAP_I2C => {
                 if i2c.is_some()
@@ -658,7 +739,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
                 if spi.is_some()
                     || value.len() < 16
                     || value[0] != 0
-                    || value[1] == 0
+                    || value[1] != 2
                     || value.len() != 15 + value[1] as usize
                 {
                     return Err(invalid("invalid SPI capability"));
@@ -710,49 +791,36 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<RegistrationConfig> {
     let (i2c_speed_hz, i2c_pins) = i2c.ok_or_else(|| invalid("I2C capability missing"))?;
     let uart_pins = uart.ok_or_else(|| invalid("UART capability missing"))?;
     let gpio_pins = gpio_pins.ok_or_else(|| invalid("GPIO capability missing"))?;
-    if !general {
-        return Err(invalid("general capability missing"));
+    let generation = generation.ok_or_else(|| invalid("general capability missing"))?;
+    let pin_map = PinMap {
+        uart_tx: uart_pins[0],
+        uart_rx: uart_pins[1],
+        i2c_sda: i2c_pins[0],
+        i2c_scl: i2c_pins[1],
+        spi_sck: spi_pins[0],
+        spi_mosi: spi_pins[1],
+        spi_miso: spi_pins[2],
+        spi_chip_selects: spi_pins[3..5].try_into().unwrap(),
+    };
+    pin_map
+        .validate()
+        .map_err(|_| invalid("invalid peripheral pin map"))?;
+    if pin_map.gpio_pins().unwrap() != gpio_pins {
+        return Err(invalid("GPIO capability does not match peripheral pins"));
     }
-    validate_pin_map(i2c_pins, &spi_pins, uart_pins, &gpio_pins)?;
-    Ok(RegistrationConfig {
-        i2c_speed_hz,
-        spi_mode_bits,
-        spi_min_speed_hz,
-        spi_max_speed_hz,
-        spi_chip_selects,
-        gpio_lines: gpio_pins.len() as u16,
-        gpio_pins,
+    Ok(NegotiatedConfig {
+        registration: RegistrationConfig {
+            i2c_speed_hz,
+            spi_mode_bits,
+            spi_min_speed_hz,
+            spi_max_speed_hz,
+            spi_chip_selects,
+            gpio_lines: gpio_pins.len() as u16,
+            gpio_pins,
+        },
+        pin_map,
+        generation,
     })
-}
-
-fn validate_pin_map(i2c: [u8; 2], spi: &[u8], uart: [u8; 2], gpio: &[u8; 17]) -> io::Result<()> {
-    const HEADER: [u8; 26] = [
-        0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27,
-        28,
-    ];
-    if ![0, 4, 8, 12, 16, 20].contains(&i2c[0]) || i2c[1] != i2c[0] + 1 {
-        return Err(invalid("invalid I2C0 pin route"));
-    }
-    if spi.len() != 5
-        || ![2, 6, 18, 22].contains(&spi[0])
-        || ![3, 7, 19].contains(&spi[1])
-        || ![0, 4, 16, 20].contains(&spi[2])
-        || ![0, 2, 12, 14, 16, 18, 28].contains(&uart[0])
-        || ![1, 3, 13, 15, 17, 19].contains(&uart[1])
-    {
-        return Err(invalid("invalid SPI0 or UART0 pin route"));
-    }
-    let mut used = [false; 29];
-    for &pin in i2c.iter().chain(spi).chain(&uart).chain(gpio) {
-        if !HEADER.contains(&pin) || used[pin as usize] {
-            return Err(invalid("duplicate or unavailable configured pin"));
-        }
-        used[pin as usize] = true;
-    }
-    if HEADER.iter().any(|&pin| !used[pin as usize]) {
-        return Err(invalid("configured pins do not cover Pico 2 headers"));
-    }
-    Ok(())
 }
 
 fn nusb_error(error: nusb::Error) -> io::Error {
@@ -780,9 +848,10 @@ mod tests {
     fn parses_firmware_capabilities() {
         let mut payload = Vec::new();
         payload.extend_from_slice(&CAP_GENERAL.to_le_bytes());
-        payload.extend_from_slice(&8_u16.to_le_bytes());
+        payload.extend_from_slice(&16_u16.to_le_bytes());
         payload.extend_from_slice(&[1, 1, 0, 0]);
         payload.extend_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
+        payload.extend_from_slice(&0_u64.to_le_bytes());
         payload.extend_from_slice(&CAP_I2C.to_le_bytes());
         payload.extend_from_slice(&16_u16.to_le_bytes());
         payload.extend_from_slice(&[0, 0]);
@@ -808,7 +877,11 @@ mod tests {
         payload.extend_from_slice(&rp_extio_firmware_gpio_pins());
         assert_eq!(
             parse_capabilities(&payload).unwrap(),
-            RegistrationConfig::PICO2
+            NegotiatedConfig {
+                registration: RegistrationConfig::PICO2,
+                pin_map: rp_extio_wire::DEFAULT_PIN_MAP,
+                generation: 0,
+            }
         );
     }
 
@@ -947,16 +1020,6 @@ mod tests {
         assert!(parse_capabilities(&payload).is_err());
     }
 
-    #[test]
-    fn validates_alternate_i2c_pin_map() {
-        let gpio = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 20, 22, 26, 27, 28];
-        assert!(validate_pin_map([12, 13], &[18, 19, 16, 17, 21], [0, 1], &gpio).is_ok());
-
-        let mut duplicate = gpio;
-        duplicate[0] = 12;
-        assert!(validate_pin_map([12, 13], &[18, 19, 16, 17, 21], [0, 1], &duplicate).is_err());
-    }
-
     fn rp_extio_firmware_gpio_pins() -> [u8; 17] {
         [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
     }
@@ -971,9 +1034,12 @@ mod tests {
             .expect("rp-extio Pico 2 not found");
         let (failed, _failures) = mpsc::unbounded_channel();
         let (backend, config) = UsbBackend::connect(&info, failed).await.unwrap();
-        assert_eq!(config.i2c_speed_hz, RegistrationConfig::PICO2.i2c_speed_hz);
-        assert_eq!(config.spi_chip_selects, 2);
-        assert_eq!(config.gpio_lines, 17);
+        assert_eq!(
+            config.registration.i2c_speed_hz,
+            RegistrationConfig::PICO2.i2c_speed_hz
+        );
+        assert_eq!(config.registration.spi_chip_selects, 2);
+        assert_eq!(config.registration.gpio_lines, 17);
 
         let snapshot = backend
             .transact(Transaction::Gpio {
