@@ -357,9 +357,18 @@ install the module and daemon, and flash the matching firmware, as one upgrade;
 the daemon rejects a version-1 module or firmware instead of registering an
 incompatible device.
 
-The socket is root-only by default. `rp-extiod --operator-group GROUP` changes
-it to group-writable and assigns it to `GROUP`, allowing operators to route
-pins without direct access to usbfs or `/dev/rp-extio-control`.
+The socket is mode `0666`, but access is enforced per request using the Unix
+peer credentials supplied by the kernel. Any local process can use `list`,
+`show`, and the read-only parts of the TUI. `set`, `default`, `reload`, and TUI
+actions that apply a change ask Polkit for `org.rp-extio.configure`; an active
+desktop session therefore receives its normal authentication dialog. A session
+without a Polkit authentication agent receives an authorization error instead.
+
+Root and members of the group selected with `rp-extiod --operator-group GROUP`
+may mutate configuration without a Polkit prompt. Group membership is checked
+by the daemon from the connecting process's kernel credentials and
+supplementary groups; it does not grant access to usbfs or
+`/dev/rp-extio-control`.
 
 Inspect assigned bus numbers with:
 

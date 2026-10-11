@@ -128,6 +128,12 @@ pub enum ControlRequest {
     Reload,
 }
 
+impl ControlRequest {
+    pub const fn requires_authorization(&self) -> bool {
+        !matches!(self, Self::List | Self::Show { .. })
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BoardInfo {
     pub serial: String,
@@ -501,6 +507,33 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<ControlResponse>(&encoded).unwrap(),
             response
+        );
+    }
+
+    #[test]
+    fn only_read_requests_bypass_authorization() {
+        assert!(!ControlRequest::List.requires_authorization());
+        assert!(
+            !ControlRequest::Show {
+                serial: "ABC".into()
+            }
+            .requires_authorization()
+        );
+        assert!(ControlRequest::Reload.requires_authorization());
+        assert!(
+            ControlRequest::Default {
+                serial: "ABC".into(),
+                generation: 1,
+            }
+            .requires_authorization()
+        );
+        assert!(
+            ControlRequest::Set {
+                serial: "ABC".into(),
+                generation: 1,
+                map: rp_extio_wire::DEFAULT_PIN_MAP.into(),
+            }
+            .requires_authorization()
         );
     }
 

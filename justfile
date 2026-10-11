@@ -61,6 +61,7 @@ install-userspace: release
     runzero install -m 0755 {{ root }}/target/release/rp-extiod /usr/local/bin/rp-extiod
     runzero install -m 0755 {{ root }}/target/release/rp-extioctl /usr/local/bin/rp-extioctl
     runzero install -m 0644 {{ root }}/dist/rp-extiod.service /etc/systemd/system/rp-extiod.service
+    runzero install -m 0644 {{ root }}/dist/org.rp-extio.policy /usr/share/polkit-1/actions/org.rp-extio.policy
 
 # Enable and start the installed daemon service.
 enable: install
