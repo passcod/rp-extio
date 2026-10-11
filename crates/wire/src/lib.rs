@@ -232,6 +232,12 @@ pub const DEFAULT_PIN_MAP: PinMap = PinMap {
     spi_chip_selects: [17, 21],
 };
 
+impl Default for PinMap {
+    fn default() -> Self {
+        DEFAULT_PIN_MAP
+    }
+}
+
 impl PinMap {
     pub const fn encode(self) -> [u8; PIN_MAP_LEN] {
         [

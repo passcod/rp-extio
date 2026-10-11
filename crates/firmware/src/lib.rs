@@ -1,9 +1,12 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD, Operation,
-    SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError, Writer,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD, Operation, PinMap,
+    PinValidationError, PinValidationKind, SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError,
+    Writer,
 };
+
+pub use rp_extio_wire::{DEFAULT_PIN_MAP, GPIO_LINE_COUNT};
 
 pub const I2C_BUS_ID: u8 = 0;
 pub const SPI_BUS_ID: u8 = 0;
@@ -11,34 +14,7 @@ pub const I2C_SPEED_HZ: u32 = 100_000;
 pub const SPI_MIN_SPEED_HZ: u32 = 50_000;
 pub const SPI_MAX_SPEED_HZ: u32 = 20_000_000;
 pub const SPI_CHIP_SELECTS: u8 = 2;
-pub const UART_TX_PIN: u8 = 0;
-pub const UART_RX_PIN: u8 = 1;
 pub const UART_BAUD: u32 = 115_200;
-pub const GPIO_LINE_COUNT: usize = 17;
-pub const DEFAULT_PIN_CONFIG: PinConfig = PinConfig {
-    uart_tx: 0,
-    uart_rx: 1,
-    i2c_sda: 4,
-    i2c_scl: 5,
-    spi_miso: 16,
-    spi_sck: 18,
-    spi_mosi: 19,
-    spi_chip_selects: [17, 21],
-    gpio_pins: [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28],
-};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PinConfig {
-    pub uart_tx: u8,
-    pub uart_rx: u8,
-    pub i2c_sda: u8,
-    pub i2c_scl: u8,
-    pub spi_miso: u8,
-    pub spi_sck: u8,
-    pub spi_mosi: u8,
-    pub spi_chip_selects: [u8; 2],
-    pub gpio_pins: [u8; GPIO_LINE_COUNT],
-}
 
 pub const SPI_CPHA: u16 = 1 << 0;
 pub const SPI_CPOL: u16 = 1 << 1;
@@ -80,7 +56,11 @@ impl Default for SpiOutcome {
 }
 
 pub trait Board {
-    fn pin_config(&self) -> &PinConfig;
+    fn pin_map(&self) -> &PinMap;
+
+    fn generation(&self) -> u64;
+
+    fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError>;
 
     fn i2c_transfer(
         &mut self,
@@ -117,11 +97,16 @@ pub fn dispatch<B: Board>(
         return error_reply(request, Status::BadFrame, 0);
     }
 
+    if request.operation == Operation::ConfigurePins {
+        return configure_pins(request, payload, board, response);
+    }
+
     let result = match request.operation {
         Operation::Hello => hello(payload, board, response),
         Operation::I2cTransfer => i2c(payload, board, response),
         Operation::SpiMessage => spi(payload, board, response),
         Operation::GpioCommand => gpio(payload, board, response),
+        Operation::ConfigurePins => unreachable!(),
     };
 
     match result {
@@ -155,14 +140,18 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
         return Err(BusFailure::new(Status::BadFrame, 0));
     }
 
-    let pins = board.pin_config();
+    let pins = board.pin_map();
+    let gpio_pins = pins
+        .gpio_pins()
+        .map_err(|_| BusFailure::new(Status::IoError, 0))?;
     let mut out = Writer::new(response);
-    record(&mut out, CAP_GENERAL, 8, |out| {
+    record(&mut out, CAP_GENERAL, 16, |out| {
         out.push(rp_extio_wire::VERSION_MAJOR)?;
         out.push(rp_extio_wire::VERSION_MAJOR)?;
         out.push(rp_extio_wire::VERSION_MINOR)?;
         out.push(0)?;
-        out.u32(MAX_PAYLOAD as u32)
+        out.u32(MAX_PAYLOAD as u32)?;
+        out.extend(&board.generation().to_le_bytes())
     })?;
     record(&mut out, CAP_I2C, 16, |out| {
         out.push(I2C_BUS_ID)?;
@@ -194,10 +183,10 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
         out.u32(0)
     })?;
     record(&mut out, CAP_GPIO, 21, |out| {
-        out.push(pins.gpio_pins.len() as u8)?;
+        out.push(gpio_pins.len() as u8)?;
         out.push(0)?;
         out.u16(0)?;
-        out.extend(&pins.gpio_pins)
+        out.extend(&gpio_pins)
     })?;
     Ok(out.len())
 }
@@ -210,7 +199,7 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
         if payload[1] != 0 || payload[2] != 0 {
             return Err(BusFailure::new(Status::BadFrame, 0));
         }
-        response[..4].copy_from_slice(&(board.pin_config().gpio_pins.len() as u32).to_le_bytes());
+        response[..4].copy_from_slice(&(GPIO_LINE_COUNT as u32).to_le_bytes());
         response[4..8].copy_from_slice(&board.gpio_snapshot()?.to_le_bytes());
         return Ok(8);
     }
@@ -219,6 +208,33 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
     response[4] = value;
     response[5..8].fill(0);
     Ok(8)
+}
+
+fn configure_pins<B: Board>(
+    request: UsbHeader,
+    payload: &[u8],
+    board: &mut B,
+    response: &mut [u8],
+) -> Reply {
+    let Some((generation, encoded_map)) = payload.split_first_chunk::<8>() else {
+        return error_reply(request, Status::BadFrame, 0);
+    };
+    let Ok(map) = PinMap::decode(encoded_map) else {
+        return error_reply(request, Status::BadFrame, 0);
+    };
+    let generation = u64::from_le_bytes(*generation);
+    if let Err(error) = board.configure_pins(map, generation) {
+        response[..PinValidationError::ENCODED_LEN].copy_from_slice(&error.encode());
+        let status = if error.kind == PinValidationKind::DuplicatePin {
+            Status::PinConflict
+        } else {
+            Status::InvalidRoute
+        };
+        return error_reply(request, status, PinValidationError::ENCODED_LEN);
+    }
+    response[..8].copy_from_slice(&generation.to_le_bytes());
+    response[8..8 + rp_extio_wire::PIN_MAP_LEN].copy_from_slice(&map.encode());
+    reply(request, Status::Ok, 8 + rp_extio_wire::PIN_MAP_LEN)
 }
 
 fn record(
@@ -312,11 +328,28 @@ mod tests {
     struct Stub {
         gpio_values: u32,
         gpio_outputs: u32,
+        pin_map: PinMap,
+        generation: u64,
     }
 
     impl Board for Stub {
-        fn pin_config(&self) -> &PinConfig {
-            &DEFAULT_PIN_CONFIG
+        fn pin_map(&self) -> &PinMap {
+            &self.pin_map
+        }
+
+        fn generation(&self) -> u64 {
+            self.generation
+        }
+
+        fn configure_pins(
+            &mut self,
+            map: PinMap,
+            generation: u64,
+        ) -> Result<(), PinValidationError> {
+            map.validate()?;
+            self.pin_map = map;
+            self.generation = generation;
+            Ok(())
         }
 
         fn i2c_transfer(
@@ -417,6 +450,61 @@ mod tests {
             response[..reply.payload_len]
                 .windows(2)
                 .any(|window| window == CAP_GPIO.to_le_bytes())
+        );
+    }
+
+    #[test]
+    fn configures_complete_pin_map_and_reports_generation() {
+        let mut board = Stub::default();
+        let mut response = [0; MAX_PAYLOAD];
+        let mut map = DEFAULT_PIN_MAP;
+        map.i2c_sda = 12;
+        map.i2c_scl = 13;
+        map.spi_chip_selects = [4, 5];
+        let mut payload = [0; 8 + rp_extio_wire::PIN_MAP_LEN];
+        payload[..8].copy_from_slice(&42_u64.to_le_bytes());
+        payload[8..].copy_from_slice(&map.encode());
+
+        let configured = dispatch(
+            header(Operation::ConfigurePins, payload.len()),
+            &payload,
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(configured.header.status, Status::Ok);
+        assert_eq!(&response[..configured.payload_len], &payload);
+        assert_eq!(board.pin_map, map);
+        assert_eq!(board.generation, 42);
+
+        let hello = dispatch(header(Operation::Hello, 0), &[], &mut board, &mut response);
+        assert_eq!(hello.header.status, Status::Ok);
+        assert_eq!(&response[12..20], &42_u64.to_le_bytes());
+    }
+
+    #[test]
+    fn rejected_pin_map_preserves_active_configuration() {
+        let mut board = Stub::default();
+        let mut response = [0; MAX_PAYLOAD];
+        let mut map = DEFAULT_PIN_MAP;
+        map.spi_chip_selects[0] = map.uart_tx;
+        let mut payload = [0; 8 + rp_extio_wire::PIN_MAP_LEN];
+        payload[..8].copy_from_slice(&7_u64.to_le_bytes());
+        payload[8..].copy_from_slice(&map.encode());
+
+        let reply = dispatch(
+            header(Operation::ConfigurePins, payload.len()),
+            &payload,
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(reply.header.status, Status::PinConflict);
+        assert_eq!(board.pin_map, DEFAULT_PIN_MAP);
+        assert_eq!(board.generation, 0);
+        assert_eq!(
+            PinValidationError::decode(&response[..reply.payload_len])
+                .unwrap()
+                .kind,
+            PinValidationKind::DuplicatePin
         );
     }
 
