@@ -902,6 +902,18 @@ mod tests {
             serde_json::from_slice::<ControlRequest>(&encoded).unwrap(),
             request
         );
+        let request = ControlRequest::GpioStartupSet {
+            serial: "ABC".into(),
+            startup: GpioStartup::Input {
+                pin: 28,
+                bias: GpioBias::PullDown,
+            },
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ControlRequest>(&encoded).unwrap(),
+            request
+        );
 
         let response = ControlResponse::Board {
             board: BoardInfo {
@@ -981,6 +993,13 @@ mod tests {
             }
             .requires_authorization()
         );
+        assert!(
+            ControlRequest::GpioStartupClear {
+                serial: "ABC".into(),
+                pin: 22,
+            }
+            .requires_authorization()
+        );
     }
 
     #[test]
@@ -1045,6 +1064,38 @@ mod tests {
         assert_eq!(map.adc_enabled, 0);
         assert_eq!(map.pwm_enabled, 0);
         assert_eq!(map.clock_enabled, 0);
+    }
+
+    #[test]
+    fn version_two_and_three_configurations_gain_empty_startup_state() {
+        for version in [2, 3] {
+            let directory = TemporaryDirectory::new(&format!("config-v{version}-migration"));
+            let path = directory.0.join("config.json");
+            fs::write(
+                &path,
+                serde_json::to_vec(&serde_json::json!({
+                    "version": version,
+                    "boards": {
+                        "ABC": PinMapConfig::from(rp_extio_wire::DEFAULT_PIN_MAP)
+                    }
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+
+            let mut store = ConfigStore::load(path.clone()).unwrap();
+            assert!(store.gpio_startup("ABC").is_empty());
+            store
+                .set("ABC".into(), rp_extio_wire::DEFAULT_PIN_MAP)
+                .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+            assert_eq!(saved["version"], 4);
+            assert_eq!(
+                saved["boards"]["ABC"]["gpio_startup"],
+                serde_json::json!([])
+            );
+        }
     }
 
     #[test]

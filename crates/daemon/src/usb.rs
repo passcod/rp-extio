@@ -789,11 +789,15 @@ async fn change_map(
             ),
         );
     }
-    if active.pin_map != map
-        && let Err(response) =
-            reconfigure(kernel, devices, id, map, store.gpio_startup(&serial)).await
-    {
-        return response;
+    if active.pin_map != map {
+        let startup = if remove_persistent {
+            &[][..]
+        } else {
+            store.gpio_startup(&serial)
+        };
+        if let Err(response) = reconfigure(kernel, devices, id, map, startup).await {
+            return response;
+        }
     }
 
     let persisted = if remove_persistent {
