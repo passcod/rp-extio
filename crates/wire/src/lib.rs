@@ -3,7 +3,7 @@
 pub const USB_MAGIC: [u8; 4] = *b"RPXB";
 pub const KERNEL_MAGIC: [u8; 4] = *b"RPKD";
 pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 2;
+pub const VERSION_MINOR: u8 = 3;
 pub const USB_HEADER_LEN: usize = 24;
 pub const KERNEL_HEADER_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 4096;
@@ -22,6 +22,11 @@ pub const GPIO_DIRECTION_INPUT: u8 = 3;
 pub const GPIO_DIRECTION_OUTPUT: u8 = 4;
 pub const GPIO_GET_DIRECTION: u8 = 5;
 pub const GPIO_SNAPSHOT: u8 = 6;
+pub const HEADER_PINS: [u8; 26] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28,
+];
+pub const GPIO_LINE_COUNT: usize = 17;
+pub const PIN_MAP_LEN: usize = 9;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -30,6 +35,7 @@ pub enum Operation {
     I2cTransfer = 2,
     SpiMessage = 3,
     GpioCommand = 4,
+    ConfigurePins = 5,
 }
 
 impl TryFrom<u8> for Operation {
@@ -40,6 +46,7 @@ impl TryFrom<u8> for Operation {
             2 => Ok(Self::I2cTransfer),
             3 => Ok(Self::SpiMessage),
             4 => Ok(Self::GpioCommand),
+            5 => Ok(Self::ConfigurePins),
             _ => Err(WireError::Unsupported),
         }
     }
@@ -56,6 +63,8 @@ pub enum Status {
     Unsupported = 5,
     BadFrame = 6,
     IoError = 7,
+    InvalidRoute = 8,
+    PinConflict = 9,
 }
 
 impl TryFrom<i32> for Status {
@@ -70,6 +79,8 @@ impl TryFrom<i32> for Status {
             5 => Ok(Self::Unsupported),
             6 => Ok(Self::BadFrame),
             7 => Ok(Self::IoError),
+            8 => Ok(Self::InvalidRoute),
+            9 => Ok(Self::PinConflict),
             _ => Err(WireError::Invalid),
         }
     }
@@ -81,6 +92,254 @@ pub enum WireError {
     Invalid,
     Unsupported,
     TooLarge,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PinSignal {
+    UartTx = 0,
+    UartRx = 1,
+    I2cSda = 2,
+    I2cScl = 3,
+    SpiMiso = 4,
+    SpiSck = 5,
+    SpiMosi = 6,
+    SpiCs0 = 7,
+    SpiCs1 = 8,
+}
+
+impl PinSignal {
+    pub const ALL: [Self; PIN_MAP_LEN] = [
+        Self::UartTx,
+        Self::UartRx,
+        Self::I2cSda,
+        Self::I2cScl,
+        Self::SpiMiso,
+        Self::SpiSck,
+        Self::SpiMosi,
+        Self::SpiCs0,
+        Self::SpiCs1,
+    ];
+
+    pub const fn valid_pins(self) -> &'static [u8] {
+        match self {
+            Self::UartTx => &[0, 2, 12, 14, 16, 18, 28],
+            Self::UartRx => &[1, 3, 13, 15, 17, 19],
+            Self::I2cSda => &[0, 4, 8, 12, 16, 20],
+            Self::I2cScl => &[1, 5, 9, 13, 17, 21],
+            Self::SpiMiso => &[0, 4, 16, 20],
+            Self::SpiSck => &[2, 6, 18, 22],
+            Self::SpiMosi => &[3, 7, 19],
+            Self::SpiCs0 | Self::SpiCs1 => &HEADER_PINS,
+        }
+    }
+}
+
+impl TryFrom<u8> for PinSignal {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        Self::ALL
+            .get(value as usize)
+            .copied()
+            .ok_or(WireError::Invalid)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum PinValidationKind {
+    UnavailablePin = 1,
+    InvalidRoute = 2,
+    MismatchedPair = 3,
+    DuplicatePin = 4,
+}
+
+impl TryFrom<u8> for PinValidationKind {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::UnavailablePin),
+            2 => Ok(Self::InvalidRoute),
+            3 => Ok(Self::MismatchedPair),
+            4 => Ok(Self::DuplicatePin),
+            _ => Err(WireError::Invalid),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinValidationError {
+    pub kind: PinValidationKind,
+    pub signal: PinSignal,
+    pub other: Option<PinSignal>,
+    pub pin: u8,
+}
+
+impl PinValidationError {
+    pub const ENCODED_LEN: usize = 4;
+
+    pub const fn encode(self) -> [u8; Self::ENCODED_LEN] {
+        [
+            self.kind as u8,
+            self.signal as u8,
+            match self.other {
+                Some(signal) => signal as u8,
+                None => u8::MAX,
+            },
+            self.pin,
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        if bytes.len() != Self::ENCODED_LEN {
+            return Err(WireError::Truncated);
+        }
+        Ok(Self {
+            kind: PinValidationKind::try_from(bytes[0])?,
+            signal: PinSignal::try_from(bytes[1])?,
+            other: if bytes[2] == u8::MAX {
+                None
+            } else {
+                Some(PinSignal::try_from(bytes[2])?)
+            },
+            pin: bytes[3],
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PinMap {
+    pub uart_tx: u8,
+    pub uart_rx: u8,
+    pub i2c_sda: u8,
+    pub i2c_scl: u8,
+    pub spi_miso: u8,
+    pub spi_sck: u8,
+    pub spi_mosi: u8,
+    pub spi_chip_selects: [u8; 2],
+}
+
+pub const DEFAULT_PIN_MAP: PinMap = PinMap {
+    uart_tx: 0,
+    uart_rx: 1,
+    i2c_sda: 4,
+    i2c_scl: 5,
+    spi_miso: 16,
+    spi_sck: 18,
+    spi_mosi: 19,
+    spi_chip_selects: [17, 21],
+};
+
+impl PinMap {
+    pub const fn encode(self) -> [u8; PIN_MAP_LEN] {
+        [
+            self.uart_tx,
+            self.uart_rx,
+            self.i2c_sda,
+            self.i2c_scl,
+            self.spi_miso,
+            self.spi_sck,
+            self.spi_mosi,
+            self.spi_chip_selects[0],
+            self.spi_chip_selects[1],
+        ]
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, WireError> {
+        if bytes.len() != PIN_MAP_LEN {
+            return Err(WireError::Truncated);
+        }
+        Ok(Self {
+            uart_tx: bytes[0],
+            uart_rx: bytes[1],
+            i2c_sda: bytes[2],
+            i2c_scl: bytes[3],
+            spi_miso: bytes[4],
+            spi_sck: bytes[5],
+            spi_mosi: bytes[6],
+            spi_chip_selects: [bytes[7], bytes[8]],
+        })
+    }
+
+    pub const fn pin(self, signal: PinSignal) -> u8 {
+        self.encode()[signal as usize]
+    }
+
+    pub fn set_pin(&mut self, signal: PinSignal, pin: u8) {
+        match signal {
+            PinSignal::UartTx => self.uart_tx = pin,
+            PinSignal::UartRx => self.uart_rx = pin,
+            PinSignal::I2cSda => self.i2c_sda = pin,
+            PinSignal::I2cScl => self.i2c_scl = pin,
+            PinSignal::SpiMiso => self.spi_miso = pin,
+            PinSignal::SpiSck => self.spi_sck = pin,
+            PinSignal::SpiMosi => self.spi_mosi = pin,
+            PinSignal::SpiCs0 => self.spi_chip_selects[0] = pin,
+            PinSignal::SpiCs1 => self.spi_chip_selects[1] = pin,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), PinValidationError> {
+        for signal in PinSignal::ALL {
+            let pin = self.pin(signal);
+            if !HEADER_PINS.contains(&pin) {
+                return Err(PinValidationError {
+                    kind: PinValidationKind::UnavailablePin,
+                    signal,
+                    other: None,
+                    pin,
+                });
+            }
+            if !signal.valid_pins().contains(&pin) {
+                return Err(PinValidationError {
+                    kind: PinValidationKind::InvalidRoute,
+                    signal,
+                    other: None,
+                    pin,
+                });
+            }
+        }
+        if self.i2c_scl != self.i2c_sda + 1 {
+            return Err(PinValidationError {
+                kind: PinValidationKind::MismatchedPair,
+                signal: PinSignal::I2cScl,
+                other: Some(PinSignal::I2cSda),
+                pin: self.i2c_scl,
+            });
+        }
+        for (index, signal) in PinSignal::ALL.iter().copied().enumerate() {
+            let pin = self.pin(signal);
+            if let Some(other) = PinSignal::ALL[..index]
+                .iter()
+                .copied()
+                .find(|&other| self.pin(other) == pin)
+            {
+                return Err(PinValidationError {
+                    kind: PinValidationKind::DuplicatePin,
+                    signal,
+                    other: Some(other),
+                    pin,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn gpio_pins(self) -> Result<[u8; GPIO_LINE_COUNT], PinValidationError> {
+        self.validate()?;
+        let assigned = self.encode();
+        let mut gpio = [0; GPIO_LINE_COUNT];
+        let mut output = 0;
+        for pin in HEADER_PINS {
+            if !assigned.contains(&pin) {
+                gpio[output] = pin;
+                output += 1;
+            }
+        }
+        Ok(gpio)
+    }
 }
 
 fn read_u16(bytes: &[u8]) -> u16 {
@@ -411,6 +670,57 @@ mod tests {
         let mut malformed = header.encode();
         malformed[20] = Status::Nack as u8;
         assert_eq!(UsbHeader::decode(&malformed), Err(WireError::Invalid));
+    }
+
+    #[test]
+    fn pin_maps_validate_routes_conflicts_and_gpio_derivation() {
+        assert_eq!(DEFAULT_PIN_MAP.validate(), Ok(()));
+        assert_eq!(
+            DEFAULT_PIN_MAP.gpio_pins().unwrap(),
+            [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
+        );
+
+        let mut alternate = DEFAULT_PIN_MAP;
+        alternate.i2c_sda = 12;
+        alternate.i2c_scl = 13;
+        alternate.spi_chip_selects = [4, 5];
+        assert_eq!(PinMap::decode(&alternate.encode()), Ok(alternate));
+        assert_eq!(alternate.validate(), Ok(()));
+
+        let mut invalid = alternate;
+        invalid.spi_sck = 3;
+        assert_eq!(
+            invalid.validate().unwrap_err(),
+            PinValidationError {
+                kind: PinValidationKind::InvalidRoute,
+                signal: PinSignal::SpiSck,
+                other: None,
+                pin: 3,
+            }
+        );
+
+        let mut duplicate = alternate;
+        duplicate.spi_chip_selects[0] = duplicate.uart_tx;
+        assert_eq!(
+            duplicate.validate().unwrap_err(),
+            PinValidationError {
+                kind: PinValidationKind::DuplicatePin,
+                signal: PinSignal::SpiCs0,
+                other: Some(PinSignal::UartTx),
+                pin: duplicate.uart_tx,
+            }
+        );
+    }
+
+    #[test]
+    fn pin_validation_errors_round_trip() {
+        let error = PinValidationError {
+            kind: PinValidationKind::MismatchedPair,
+            signal: PinSignal::I2cScl,
+            other: Some(PinSignal::I2cSda),
+            pin: 9,
+        };
+        assert_eq!(PinValidationError::decode(&error.encode()), Ok(error));
     }
 
     #[test]
