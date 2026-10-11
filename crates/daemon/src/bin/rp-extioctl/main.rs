@@ -81,8 +81,12 @@ enum Command {
         wait: ButtonWait,
         #[arg(long, value_enum, default_value_t = BiasArg::PullUp)]
         pull: BiasArg,
-        #[arg(long)]
+        /// Override the saved button configuration and interpret low as pressed
+        #[arg(long, conflicts_with = "active_high")]
         active_low: bool,
+        /// Override the saved button configuration and interpret high as pressed
+        #[arg(long, conflicts_with = "active_low")]
+        active_high: bool,
         #[arg(long)]
         timeout_ms: Option<u64>,
     },
@@ -604,18 +608,52 @@ fn main() -> Result<(), Box<dyn Error>> {
             wait,
             pull,
             active_low,
+            active_high,
             timeout_ms,
-        } => wait_for_button(
-            &mut client,
-            &serial,
-            pin,
-            wait,
-            pull.into(),
-            active_low,
-            timeout_ms,
-            cli.json,
-        ),
+        } => {
+            let active_low =
+                resolve_button_polarity(&mut client, &serial, pin, active_low, active_high)?;
+            wait_for_button(
+                &mut client,
+                &serial,
+                pin,
+                wait,
+                pull.into(),
+                active_low,
+                timeout_ms,
+                cli.json,
+            )
+        }
     }
+}
+
+fn resolve_button_polarity(
+    client: &mut Client,
+    serial: &str,
+    pin: u8,
+    active_low: bool,
+    active_high: bool,
+) -> Result<bool, Box<dyn Error>> {
+    if active_low || active_high {
+        return Ok(active_low);
+    }
+    let board = match client.request(&ControlRequest::Show {
+        serial: serial.into(),
+    })? {
+        ControlResponse::Board { board } => board,
+        response => return Err(response_error(response).into()),
+    };
+    board
+        .buttons
+        .iter()
+        .find(|button| button.pin == pin)
+        .map(|button| button.active_low)
+        .ok_or_else(|| {
+            format!(
+                "GP{pin} has no saved button configuration; configure it in the TUI or pass --active-low/--active-high"
+            )
+            .into()
+        })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -886,6 +924,16 @@ fn print_board(board: &BoardInfo) {
                 pwm.period_ns,
                 pwm.duty_ns,
                 if pwm.inverted { "inverted" } else { "normal" }
+            );
+        }
+    }
+    if !board.buttons.is_empty() {
+        println!("Buttons:");
+        for button in &board.buttons {
+            println!(
+                "  GP{:<2} active {}",
+                button.pin,
+                if button.active_low { "low" } else { "high" }
             );
         }
     }
@@ -1166,6 +1214,23 @@ mod tests {
             .is_ok()
         );
         assert!(
+            Cli::try_parse_from(["rp-extioctl", "button", "ABC", "GP22", "--active-low"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["rp-extioctl", "button", "ABC", "GP22", "--active-high"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rp-extioctl",
+                "button",
+                "ABC",
+                "GP22",
+                "--active-low",
+                "--active-high",
+            ])
+            .is_err()
+        );
+        assert!(
             Cli::try_parse_from([
                 "rp-extioctl",
                 "pwm",
@@ -1250,6 +1315,7 @@ mod tests {
             pwm_chip: Some(5),
             gpio_startup: vec![],
             pwm_startup: vec![],
+            buttons: vec![],
         });
         assert!(summary.contains("enabled=uart0,i2c0,spi0"));
         assert!(summary.contains("i2c=0:7,1:-"));

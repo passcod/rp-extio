@@ -1,8 +1,8 @@
 use crate::{
     backend::{Backend, BackendReply, Transaction},
     control::{
-        BoardInfo, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup,
-        PwmInfo, validate_gpio_startup, validate_pwm_startup,
+        BoardInfo, ButtonConfig, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo,
+        GpioStartup, PwmInfo, validate_buttons, validate_gpio_startup, validate_pwm_startup,
     },
     kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
 };
@@ -253,6 +253,7 @@ fn board_info(
     desired: Option<PinMap>,
     gpio_startup: &[GpioStartup],
     pwm_startup: &[PwmInfo],
+    buttons: &[ButtonConfig],
 ) -> BoardInfo {
     BoardInfo {
         serial: device.serial.clone(),
@@ -267,6 +268,7 @@ fn board_info(
         pwm_chip: device.registration.pwm_chip,
         gpio_startup: gpio_startup.to_vec(),
         pwm_startup: pwm_startup.to_vec(),
+        buttons: buttons.to_vec(),
     }
 }
 
@@ -275,6 +277,7 @@ fn disconnected_info(
     desired: PinMap,
     gpio_startup: &[GpioStartup],
     pwm_startup: &[PwmInfo],
+    buttons: &[ButtonConfig],
 ) -> BoardInfo {
     BoardInfo {
         serial,
@@ -289,6 +292,7 @@ fn disconnected_info(
         pwm_chip: None,
         gpio_startup: gpio_startup.to_vec(),
         pwm_startup: pwm_startup.to_vec(),
+        buttons: buttons.to_vec(),
     }
 }
 
@@ -314,6 +318,7 @@ async fn handle_control(
                         store.get(&device.serial),
                         store.gpio_startup(&device.serial),
                         store.pwm_startup(&device.serial),
+                        store.buttons(&device.serial),
                     )
                 })
                 .collect();
@@ -324,6 +329,7 @@ async fn handle_control(
                         *map,
                         store.gpio_startup(serial),
                         store.pwm_startup(serial),
+                        store.buttons(serial),
                     ));
                 }
             }
@@ -338,6 +344,7 @@ async fn handle_control(
                         store.get(&serial),
                         store.gpio_startup(&serial),
                         store.pwm_startup(&serial),
+                        store.buttons(&serial),
                     ),
                 }
             } else if let Some(map) = store.get(&serial) {
@@ -347,6 +354,7 @@ async fn handle_control(
                         map,
                         store.gpio_startup(&serial),
                         store.pwm_startup(&serial),
+                        store.buttons(&serial),
                     ),
                 }
             } else {
@@ -367,6 +375,9 @@ async fn handle_control(
             }
             if let Err(message) = validate_pwm_startup(&map, store.pwm_startup(&serial)) {
                 return ControlResponse::error("pwm_startup_conflict", message);
+            }
+            if let Err(message) = validate_buttons(&map, store.buttons(&serial)) {
+                return ControlResponse::error("button_conflict", message);
             }
             change_map(kernel, store, devices, serial, generation, map, false).await
         }
@@ -518,6 +529,7 @@ async fn handle_control(
                     store.get(&serial),
                     store.gpio_startup(&serial),
                     store.pwm_startup(&serial),
+                    store.buttons(&serial),
                 ),
             }
         }
@@ -538,6 +550,7 @@ async fn handle_control(
                         store.get(&serial),
                         store.gpio_startup(&serial),
                         store.pwm_startup(&serial),
+                        store.buttons(&serial),
                     ),
                 }
             } else {
@@ -547,6 +560,7 @@ async fn handle_control(
                         store.get(&serial).unwrap(),
                         store.gpio_startup(&serial),
                         store.pwm_startup(&serial),
+                        store.buttons(&serial),
                     ),
                 }
             }
@@ -655,6 +669,7 @@ async fn handle_control(
                     store.get(&serial),
                     store.gpio_startup(&serial),
                     store.pwm_startup(&serial),
+                    store.buttons(&serial),
                 ),
             }
         }
@@ -675,6 +690,7 @@ async fn handle_control(
                         store.get(&serial),
                         store.gpio_startup(&serial),
                         store.pwm_startup(&serial),
+                        store.buttons(&serial),
                     ),
                 }
             } else {
@@ -684,11 +700,61 @@ async fn handle_control(
                         store.get(&serial).unwrap(),
                         store.gpio_startup(&serial),
                         store.pwm_startup(&serial),
+                        store.buttons(&serial),
                     ),
                 }
             }
         }
+        ControlRequest::ButtonSet { serial, button } => {
+            if find_device(devices, &serial).is_none() && !store.contains_board(&serial) {
+                return ControlResponse::error(
+                    "unknown_board",
+                    format!("unknown rp-extio board {serial}"),
+                );
+            }
+            if let Err(error) = store.set_button(serial.clone(), button) {
+                return ControlResponse::error("configuration", error.to_string());
+            }
+            button_board_response(store, devices, serial)
+        }
+        ControlRequest::ButtonClear { serial, pin } => {
+            if find_device(devices, &serial).is_none() && !store.contains_board(&serial) {
+                return ControlResponse::error(
+                    "unknown_board",
+                    format!("unknown rp-extio board {serial}"),
+                );
+            }
+            if let Err(error) = store.clear_button(&serial, pin) {
+                return ControlResponse::error("configuration", error.to_string());
+            }
+            button_board_response(store, devices, serial)
+        }
     }
+}
+
+fn button_board_response(
+    store: &ConfigStore,
+    devices: &HashMap<DeviceId, ConnectedDevice>,
+    serial: String,
+) -> ControlResponse {
+    let board = if let Some(id) = find_device(devices, &serial) {
+        board_info(
+            &devices[&id],
+            store.get(&serial),
+            store.gpio_startup(&serial),
+            store.pwm_startup(&serial),
+            store.buttons(&serial),
+        )
+    } else {
+        disconnected_info(
+            serial.clone(),
+            store.get(&serial).unwrap(),
+            store.gpio_startup(&serial),
+            store.pwm_startup(&serial),
+            store.buttons(&serial),
+        )
+    };
+    ControlResponse::Board { board }
 }
 
 fn disconnected(serial: &str) -> ControlResponse {
@@ -1020,6 +1086,7 @@ async fn change_map(
             store.get(&serial),
             store.gpio_startup(&serial),
             store.pwm_startup(&serial),
+            store.buttons(&serial),
         ),
     }
 }

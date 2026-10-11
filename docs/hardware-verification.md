@@ -307,7 +307,13 @@ pull when the circuit needs a defined level throughout that interval.
 7. In TUI operate mode, confirm saved pins have a `•` marker and a startup
    description. Use `w` to replace the highlighted pin's saved state with its
    live state and `x` to forget it without changing the live pin.
-8. Run `rp-extioctl default SERIAL` and confirm the custom map and all GPIO
+8. With the input highlighted, press `b` until it is an active-low button. Run
+   `rp-extioctl button SERIAL GP28 --wait pressed`, press the button, and confirm
+   the CLI reports `pressed (low)`. Cycle it to active-high and confirm
+   `rp-extioctl show SERIAL` reports the changed role. Cycle once more to clear
+   the role and confirm the button command asks for a saved role or an explicit
+   `--active-low`/`--active-high` override.
+9. Run `rp-extioctl default SERIAL` and confirm the custom map and all GPIO
    startup entries disappear. Recreate any map needed for later tests.
 
 ### GPIO acceptance criteria

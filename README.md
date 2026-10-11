@@ -361,8 +361,9 @@ terminals also show a complete signal legend with enabled-state markers.
 Press `v` to switch from route mode to operate mode. The pinout then refreshes
 live state while idle and annotates every exported GPIO as input or output,
 high or low, and pull-up or pull-down. The status panel expands the highlighted
-pin's state and interprets it as a button; `b` switches between active-low and
-active-high button wiring. In this mode, arrow keys select the live function on
+pin's state and interprets it as a button; `b` cycles the selected input through
+no button role, active-low, and active-high. The role is saved per board and pin
+as soon as it changes. In this mode, arrow keys select the live function on
 the highlighted physical pin—including GPIO, ADC, PWM, or clock—while Tab and
 Shift-Tab explicitly select signals and move to their routed pins. Moving with
 an arrow afterward returns operation focus to the physical pin. `0` and `1`
@@ -391,7 +392,7 @@ The persistent file is JSON and always contains complete maps:
 
 ```json
 {
-  "version": 5,
+  "version": 6,
   "boards": {
     "125DBCCF0BCA4BEF": {
       "uart0_enabled": true, "uart0_tx": 0, "uart0_rx": 1,
@@ -420,6 +421,9 @@ The persistent file is JSON and always contains complete maps:
       "pwm_startup": [
         {"channel": 6, "enabled": true, "inverted": false,
          "period_ns": 1000000, "duty_ns": 250000}
+      ],
+      "buttons": [
+        {"pin": 28, "active_low": true}
       ]
     }
   }
@@ -431,15 +435,15 @@ the disabled instance-1 defaults. Version-2 maps gain disabled ADC, PWM, and
 clock functions. Version-2 maps without the CS1 enable fields load with both
 second chip selects enabled. Versions 1 through 3 gain an empty GPIO startup
 list, and versions 1 through 4 gain an empty PWM startup list. The next
-successful save writes version 5.
+successful save adds an empty button list and writes version 6.
 
-The daemon validates saved GPIO and PWM states against the same board object's
-map. Duplicate entries, GPIO pins owned by an enabled peripheral, invalid PWM
-timing, and PWM channels not enabled in the map are rejected. A map change
-cannot claim a saved GPIO pin or disable a PWM channel with saved state; forget
-that state first. `rp-extioctl default SERIAL` removes the custom map and all
-saved GPIO/PWM state. `rp-extioctl reload` rereads and reapplies maps and
-startup state to connected boards.
+The daemon validates saved GPIO, PWM, and button states against the same board
+object's map. Duplicate entries, GPIO pins owned by an enabled peripheral,
+invalid PWM timing, and PWM channels not enabled in the map are rejected. A map
+change cannot claim a saved GPIO or button pin or disable a PWM channel with
+saved state; forget that state first. `rp-extioctl default SERIAL` removes the
+custom map and all saved GPIO/PWM/button state. `rp-extioctl reload` rereads and
+reapplies maps and startup state to connected boards.
 
 This release uses USB protocol major 3 and kernel ABI major 3. Rebuild and
 install the module and daemon, and flash the matching firmware as one upgrade;
@@ -448,9 +452,10 @@ the daemon rejects older incompatible modules and firmware.
 The socket is mode `0666`, but access is enforced per request using the Unix
 peer credentials supplied by the kernel. Any local process can use `list`,
 `show`, ADC reads, PWM queries, GPIO snapshots, and the read-only parts of the
-TUI. Routing changes, GPIO direction/bias/output changes, PWM application, and
-TUI actions that apply a change ask Polkit for `org.rp-extio.configure`; an
-active desktop session therefore receives its normal authentication dialog.
+TUI. Routing changes, GPIO direction/bias/output changes, button-role changes,
+PWM application, and TUI actions that apply a change ask Polkit for
+`org.rp-extio.configure`; an active desktop session therefore receives its
+normal authentication dialog.
 
 Root and members of the group selected with `rp-extiod --operator-group GROUP`
 may mutate configuration without a Polkit prompt. Group membership is checked
@@ -514,8 +519,12 @@ rp-extioctl gpio input 125DBCCF0BCA4BEF GP28 --pull pull-up --persist
 rp-extioctl gpio set 125DBCCF0BCA4BEF GP22 high --persist
 rp-extioctl gpio forget 125DBCCF0BCA4BEF GP22
 rp-extioctl led 125DBCCF0BCA4BEF GP22 on --active-low
-rp-extioctl button 125DBCCF0BCA4BEF GP22 --active-low --wait pressed --timeout-ms 10000
+rp-extioctl button 125DBCCF0BCA4BEF GP28 --wait pressed --timeout-ms 10000
 ```
+
+The button command uses the polarity saved for that board and pin by the TUI.
+If no button role is saved, it reports an error instead of guessing. For an
+ad-hoc invocation, `--active-low` or `--active-high` overrides the saved role.
 
 Without `--persist`, daemon-owned output state lasts until another command
 changes it, the pin map is reconfigured, or the device disconnects. Persisted

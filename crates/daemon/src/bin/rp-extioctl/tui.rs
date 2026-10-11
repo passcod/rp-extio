@@ -16,8 +16,8 @@ use rp_extio_wire::{
     ClockSource, DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError,
 };
 use rp_extiod::control::{
-    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup, PwmInfo,
-    signal_name,
+    BoardInfo, ButtonConfig, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup,
+    PwmInfo, signal_name,
 };
 use std::{
     error::Error,
@@ -170,7 +170,6 @@ struct App {
     adc: Option<AdcReading>,
     pwm: Option<PwmInfo>,
     pwm_editor: Option<PwmEditor>,
-    button_active_low: bool,
     telemetry_error: Option<String>,
     last_refresh: Instant,
     default_pending: bool,
@@ -211,6 +210,15 @@ impl App {
             .gpio_startup
             .iter()
             .find(|startup| startup.pin() == pin)
+            .copied()
+    }
+
+    fn selected_button(&self) -> Option<ButtonConfig> {
+        let pin = self.selected_pin().gpio?;
+        self.current()?
+            .buttons
+            .iter()
+            .find(|button| button.pin == pin)
             .copied()
     }
 
@@ -618,7 +626,6 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         adc: None,
         pwm: None,
         pwm_editor: None,
-        button_active_low: true,
         telemetry_error: None,
         last_refresh: Instant::now() - Duration::from_secs(1),
         default_pending: false,
@@ -736,12 +743,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::Char('w') if app.mode == UiMode::Operate => save_startup(client, &mut app)?,
             KeyCode::Char('x') if app.mode == UiMode::Operate => clear_startup(client, &mut app)?,
             KeyCode::Char('b') if app.mode == UiMode::Operate => {
-                app.button_active_low = !app.button_active_low;
-                app.message = format!(
-                    "button interpretation is now active {}",
-                    if app.button_active_low { "low" } else { "high" }
-                );
-                app.message_error = false;
+                cycle_button_config(client, &mut app)?
             }
             KeyCode::Char('p') if app.mode == UiMode::Operate => app.open_pwm_editor(),
             KeyCode::Char('r') => {
@@ -959,6 +961,57 @@ fn cycle_gpio_input(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Er
         format!("GP{pin} configured as input with {}", bias_name(bias)),
     );
     refresh_telemetry(client, app);
+    Ok(())
+}
+
+fn cycle_button_config(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    let Some(gpio) = app.selected_gpio() else {
+        set_app_error(app, "highlight a configured GPIO to set its button role");
+        return Ok(());
+    };
+    if gpio.output {
+        set_app_error(
+            app,
+            format!("GP{} must be an input to act as a button", gpio.pin),
+        );
+        return Ok(());
+    }
+    let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+        set_app_error(app, "no board selected");
+        return Ok(());
+    };
+    let (request, success) = match app.selected_button() {
+        None => (
+            ControlRequest::ButtonSet {
+                serial,
+                button: ButtonConfig {
+                    pin: gpio.pin,
+                    active_low: true,
+                },
+            },
+            format!("GP{} saved as an active-low button", gpio.pin),
+        ),
+        Some(ButtonConfig {
+            active_low: true, ..
+        }) => (
+            ControlRequest::ButtonSet {
+                serial,
+                button: ButtonConfig {
+                    pin: gpio.pin,
+                    active_low: false,
+                },
+            },
+            format!("GP{} saved as an active-high button", gpio.pin),
+        ),
+        Some(_) => (
+            ControlRequest::ButtonClear {
+                serial,
+                pin: gpio.pin,
+            },
+            format!("GP{} button role cleared", gpio.pin),
+        ),
+    };
+    handle_startup_response(app, client.request(&request)?, success);
     Ok(())
 }
 
@@ -1253,7 +1306,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_status(frame, rows[2], app);
     let assignment_mode = if app.grouped { "grouped" } else { "single" };
     let help = if app.mode == UiMode::Operate && area.width >= 72 {
-        "arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\nw save startup  x forget startup  b polarity  v route  f flip  r refresh  q quit".into()
+        "arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\nw save startup  x forget startup  b button role  v route  f flip  r refresh  q quit".into()
     } else if app.mode == UiMode::Operate {
         "arrows/Tab select  Enter/t act  0/1 output  i input\nw save  x forget  p PWM  v route  r refresh  q quit".into()
     } else if area.width >= 72 {
@@ -1528,6 +1581,13 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
         role.push_str(" •");
     }
     if app.mode == UiMode::Operate
+        && let Some(button) = app
+            .current()
+            .and_then(|board| board.buttons.iter().find(|button| button.pin == gpio))
+    {
+        role.push_str(if button.active_low { " B↓" } else { " B↑" });
+    }
+    if app.mode == UiMode::Operate
         && app.current().is_some_and(|board| {
             board.pwm_startup.iter().any(|pwm| {
                 map.pwm_pins
@@ -1696,11 +1756,24 @@ fn selected_runtime_detail(app: &App) -> String {
         );
     }
     if let Some(gpio) = app.selected_gpio() {
-        let button = if gpio.level != app.button_active_low {
-            "pressed"
-        } else {
-            "released"
-        };
+        let button = app.selected_button().map_or_else(
+            || "button unconfigured".into(),
+            |button| {
+                format!(
+                    "button {} ({})",
+                    if gpio.level != button.active_low {
+                        "pressed"
+                    } else {
+                        "released"
+                    },
+                    if button.active_low {
+                        "active low"
+                    } else {
+                        "active high"
+                    }
+                )
+            },
+        );
         let startup = app.selected_gpio_startup().map_or_else(
             || "startup not saved".into(),
             |startup| match startup {
@@ -1713,17 +1786,11 @@ fn selected_runtime_detail(app: &App) -> String {
             },
         );
         return format!(
-            "GP{}: {} · {} · bias {} · {startup} · button {} ({})",
+            "GP{}: {} · {} · bias {} · {startup} · {button}",
             gpio.pin,
             if gpio.level { "HIGH" } else { "LOW" },
             if gpio.output { "output" } else { "input" },
             bias_name(gpio.bias),
-            button,
-            if app.button_active_low {
-                "active low"
-            } else {
-                "active high"
-            }
         );
     }
     "No live state for this selection".into()
@@ -2202,6 +2269,7 @@ mod tests {
                 pwm_chip: Some(0),
                 gpio_startup: vec![],
                 pwm_startup: vec![],
+                buttons: vec![],
             }],
             board: 0,
             signal: 0,
@@ -2216,7 +2284,6 @@ mod tests {
             adc: None,
             pwm: None,
             pwm_editor: None,
-            button_active_low: true,
             telemetry_error: None,
             last_refresh: Instant::now(),
             default_pending: false,
@@ -2262,11 +2329,16 @@ mod tests {
             pin: 2,
             bias: GpioBias::PullUp,
         }];
+        app.boards[0].buttons = vec![ButtonConfig {
+            pin: 2,
+            active_low: true,
+        }];
         (app.cursor_row, app.cursor_side) = find_gpio(2).unwrap();
         let gpio = rendered(120, 40, &app);
         assert!(gpio.contains("OPERATE"));
         assert!(gpio.contains("GPIO I↑ H"));
         assert!(gpio.contains("GPIO I↑ H •"));
+        assert!(gpio.contains("B↓"));
         assert!(gpio.contains("startup input, bias pull-up"));
         assert!(gpio.contains("button released (active low)"));
         assert!(gpio.contains("live state refreshes while idle"));
