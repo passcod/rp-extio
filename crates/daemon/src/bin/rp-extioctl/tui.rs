@@ -16,7 +16,8 @@ use rp_extio_wire::{
     ClockSource, DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError,
 };
 use rp_extiod::control::{
-    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, PwmInfo, signal_name,
+    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup, PwmInfo,
+    signal_name,
 };
 use std::{
     error::Error,
@@ -195,6 +196,15 @@ impl App {
     fn selected_gpio(&self) -> Option<GpioInfo> {
         let pin = self.selected_pin().gpio?;
         self.gpio.iter().find(|gpio| gpio.pin == pin).copied()
+    }
+
+    fn selected_gpio_startup(&self) -> Option<GpioStartup> {
+        let pin = self.selected_pin().gpio?;
+        self.current()?
+            .gpio_startup
+            .iter()
+            .find(|startup| startup.pin() == pin)
+            .copied()
     }
 
     fn screen_cursor_row(&self) -> usize {
@@ -657,6 +667,12 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::Char('i') if app.mode == UiMode::Operate => {
                 cycle_gpio_input(client, &mut app)?
             }
+            KeyCode::Char('w') if app.mode == UiMode::Operate => {
+                save_gpio_startup(client, &mut app)?
+            }
+            KeyCode::Char('x') if app.mode == UiMode::Operate => {
+                clear_gpio_startup(client, &mut app)?
+            }
             KeyCode::Char('b') if app.mode == UiMode::Operate => {
                 app.button_active_low = !app.button_active_low;
                 app.message = format!(
@@ -882,6 +898,65 @@ fn cycle_gpio_input(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Er
     Ok(())
 }
 
+fn save_gpio_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    let Some(gpio) = app.selected_gpio() else {
+        set_app_error(app, "highlight a configured GPIO to save its live state");
+        return Ok(());
+    };
+    let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+        set_app_error(app, "no board selected");
+        return Ok(());
+    };
+    let startup = if gpio.output {
+        GpioStartup::Output {
+            pin: gpio.pin,
+            value: gpio.level,
+        }
+    } else {
+        GpioStartup::Input {
+            pin: gpio.pin,
+            bias: gpio.bias,
+        }
+    };
+    handle_startup_response(
+        app,
+        client.request(&ControlRequest::GpioStartupSet { serial, startup })?,
+        format!("GP{} live state saved for daemon startup", gpio.pin),
+    );
+    Ok(())
+}
+
+fn clear_gpio_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    let Some(pin) = app.selected_pin().gpio else {
+        set_app_error(app, "select a GPIO pin");
+        return Ok(());
+    };
+    let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+        set_app_error(app, "no board selected");
+        return Ok(());
+    };
+    handle_startup_response(
+        app,
+        client.request(&ControlRequest::GpioStartupClear { serial, pin })?,
+        format!("GP{pin} startup state forgotten"),
+    );
+    Ok(())
+}
+
+fn handle_startup_response(app: &mut App, response: ControlResponse, success: String) {
+    match response {
+        ControlResponse::Board { board } => {
+            if let Some(current) = app.boards.get_mut(app.board) {
+                *current = board;
+            }
+            app.message = success;
+            app.message_error = false;
+        }
+        ControlResponse::Error { message, .. } => set_app_error(app, message),
+        _ => set_app_error(app, "unexpected GPIO startup response"),
+    }
+}
+
 fn operate_default(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
     if app.selected_signal().pwm_channel().is_some() {
         app.open_pwm_editor();
@@ -1058,9 +1133,9 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     draw_status(frame, rows[2], app);
     let assignment_mode = if app.grouped { "grouped" } else { "single" };
     let help = if app.mode == UiMode::Operate && area.width >= 72 {
-        "arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\nb button polarity  v route mode  f flip  r refresh  [/] board  q quit".into()
+        "arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\nw save startup  x forget startup  b polarity  v route  f flip  r refresh  q quit".into()
     } else if app.mode == UiMode::Operate {
-        "arrows/Tab select  Enter/t act  0/1 output  i input\np PWM  b polarity  v route  r refresh  q quit".into()
+        "arrows/Tab select  Enter/t act  0/1 output  i input\nw save  x forget  p PWM  v route  r refresh  q quit".into()
     } else if area.width >= 72 {
         format!(
             "arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nv operate mode  f flip  s clock source  +/- clock Hz  d defaults  u undo  r refresh  q quit"
@@ -1296,7 +1371,7 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
         .into_iter()
         .filter(|&signal| map.is_signal_enabled(signal) && map.pin(signal) == gpio)
         .collect::<Vec<_>>();
-    let role = if signals.is_empty() && app.mode == UiMode::Operate {
+    let mut role = if signals.is_empty() && app.mode == UiMode::Operate {
         app.gpio
             .iter()
             .find(|state| state.pin == gpio)
@@ -1310,6 +1385,16 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
             .collect::<Vec<_>>()
             .join("+")
     };
+    if app.mode == UiMode::Operate
+        && app.current().is_some_and(|board| {
+            board
+                .gpio_startup
+                .iter()
+                .any(|startup| startup.pin() == gpio)
+        })
+    {
+        role.push_str(" •");
+    }
     let changed = app.active_map().is_some_and(|active| {
         PinSignal::ALL.into_iter().any(|signal| {
             let active_enabled = active.is_signal_enabled(signal);
@@ -1446,8 +1531,19 @@ fn selected_runtime_detail(app: &App) -> String {
         } else {
             "released"
         };
+        let startup = app.selected_gpio_startup().map_or_else(
+            || "startup not saved".into(),
+            |startup| match startup {
+                GpioStartup::Output { value, .. } => {
+                    format!("startup output {}", if value { "HIGH" } else { "LOW" })
+                }
+                GpioStartup::Input { bias, .. } => {
+                    format!("startup input, bias {}", bias_name(bias))
+                }
+            },
+        );
         return format!(
-            "GP{}: {} · {} · bias {} · button {} ({})",
+            "GP{}: {} · {} · bias {} · {startup} · button {} ({})",
             gpio.pin,
             if gpio.level { "HIGH" } else { "LOW" },
             if gpio.output { "output" } else { "input" },
@@ -2004,10 +2100,16 @@ mod tests {
             output: false,
             bias: GpioBias::PullUp,
         }];
+        app.boards[0].gpio_startup = vec![GpioStartup::Input {
+            pin: 2,
+            bias: GpioBias::PullUp,
+        }];
         (app.cursor_row, app.cursor_side) = find_gpio(2).unwrap();
         let gpio = rendered(120, 40, &app);
         assert!(gpio.contains("OPERATE"));
         assert!(gpio.contains("GPIO I↑ H"));
+        assert!(gpio.contains("GPIO I↑ H •"));
+        assert!(gpio.contains("startup input, bias pull-up"));
         assert!(gpio.contains("button released (active low)"));
         assert!(gpio.contains("live state refreshes while idle"));
 
