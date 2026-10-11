@@ -177,8 +177,12 @@ async fn try_connect(
             }
         };
     }
-    if let Err(error) =
-        apply_gpio_startup(&backend, &config.pin_map, desired.gpio_startup(&serial)).await
+    if let Err(error) = apply_gpio_startup(
+        backend.as_ref(),
+        &config.pin_map,
+        desired.gpio_startup(&serial),
+    )
+    .await
     {
         eprintln!("failed to apply GPIO startup state on rp-extio USB device {serial}: {error:?}");
         backend.disconnect().await;
@@ -376,7 +380,7 @@ async fn handle_control(
             }
             for device in devices.values() {
                 if let Err(response) = apply_gpio_startup(
-                    &device.backend,
+                    device.backend.as_ref(),
                     &device.config.pin_map,
                     store.gpio_startup(&device.serial),
                 )
@@ -513,7 +517,8 @@ async fn handle_control(
                 return ControlResponse::error("configuration", error.to_string());
             }
             if let Err(response) =
-                apply_one_gpio_startup(&device.backend, &device.config.pin_map, startup).await
+                apply_one_gpio_startup(device.backend.as_ref(), &device.config.pin_map, startup)
+                    .await
             {
                 let rollback = match previous {
                     Some(previous) => store.set_gpio_startup(serial.clone(), previous),
@@ -657,7 +662,7 @@ fn gpio_line_for_map(map: &PinMap, pin: u8) -> Option<u8> {
 }
 
 async fn apply_one_gpio_startup(
-    backend: &Arc<UsbBackend>,
+    backend: &dyn Backend,
     map: &PinMap,
     startup: GpioStartup,
 ) -> Result<(), ControlResponse> {
@@ -690,7 +695,7 @@ async fn apply_one_gpio_startup(
 }
 
 async fn apply_gpio_startup(
-    backend: &Arc<UsbBackend>,
+    backend: &dyn Backend,
     map: &PinMap,
     entries: &[GpioStartup],
 ) -> Result<(), ControlResponse> {
@@ -857,7 +862,9 @@ async fn reconfigure(
             return Err(ControlResponse::error("usb", error.to_string()));
         }
     };
-    if let Err(response) = apply_gpio_startup(&backend, &new_config.pin_map, gpio_startup).await {
+    if let Err(response) =
+        apply_gpio_startup(backend.as_ref(), &new_config.pin_map, gpio_startup).await
+    {
         backend.disconnect().await;
         return Err(response);
     }
@@ -1722,6 +1729,7 @@ fn invalid(message: &'static str) -> io::Error {
 mod tests {
     use super::*;
     use crate::backend::{I2cMessage, SpiSegment};
+    use crate::sim::{Command as SimCommand, Response as SimResponse, Simulator};
 
     fn capability_record(payload: &mut Vec<u8>, kind: u16, value: &[u8]) {
         payload.extend_from_slice(&kind.to_le_bytes());
@@ -1976,6 +1984,54 @@ mod tests {
             payload: vec![1, 0, 0, 0, 1, 1, 0, 0],
         };
         assert!(decode_reply(&command, malformed).is_err());
+    }
+
+    #[tokio::test]
+    async fn applies_persisted_gpio_outputs_and_input_biases() {
+        let simulator = Arc::new(Simulator::default());
+        assert!(matches!(
+            simulator
+                .command(SimCommand::Create {
+                    device: "startup".into(),
+                })
+                .await,
+            SimResponse::Ok
+        ));
+        let backend = simulator.device("startup");
+        let map = rp_extio_wire::DEFAULT_PIN_MAP;
+        apply_gpio_startup(
+            &backend,
+            &map,
+            &[
+                GpioStartup::Output {
+                    pin: 22,
+                    value: true,
+                },
+                GpioStartup::Input {
+                    pin: 28,
+                    bias: GpioBias::PullDown,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+
+        let snapshot = backend
+            .transact(Transaction::Gpio {
+                command: rp_extio_wire::GPIO_SNAPSHOT,
+                line: 0,
+                value: 0,
+            })
+            .await;
+        let output_line = gpio_line_for_map(&map, 22).unwrap();
+        let input_line = gpio_line_for_map(&map, 28).unwrap();
+        let levels = u32::from_le_bytes(snapshot.data[0..4].try_into().unwrap());
+        let outputs = u32::from_le_bytes(snapshot.data[4..8].try_into().unwrap());
+        let pull_downs = u32::from_le_bytes(snapshot.data[12..16].try_into().unwrap());
+        assert_ne!(levels & (1 << output_line), 0);
+        assert_ne!(outputs & (1 << output_line), 0);
+        assert_eq!(outputs & (1 << input_line), 0);
+        assert_ne!(pull_downs & (1 << input_line), 0);
     }
 
     #[test]
