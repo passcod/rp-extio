@@ -358,6 +358,24 @@ select a board, `r` refreshes, `l` reloads the persistent file, and `q` exits.
 Short terminals scroll the physical pin rows around the cursor, while wide
 terminals also show a complete signal legend with enabled-state markers.
 
+Press `v` to switch from route mode to operate mode. The pinout then refreshes
+live state while idle and annotates every exported GPIO as input or output,
+high or low, and pull-up or pull-down. The status panel expands the highlighted
+pin's state and interprets it as a button; `b` switches between active-low and
+active-high button wiring. `0` and `1` drive the highlighted GPIO low or high,
+`t`, Enter, or Space toggles it as a persistent LED/output, and `i` returns it
+to input while cycling through pull-up, pull-down, and no internal bias. These
+actions use the daemon's normal Polkit authorization.
+
+Selecting an enabled ADC signal in operate mode continuously shows its raw and
+millivolt reading. Selecting an enabled PWM signal shows its runtime enable,
+effective frequency, duty cycle, and polarity. Press `p`, Enter, or Space to
+open the PWM editor: type the frequency and duty percentage, use Tab to switch
+fields, `e` to toggle output, `i` to invert polarity, Enter to apply, and Escape
+to cancel. Only the selected ADC or PWM is polled; GPIO state still arrives in
+one bulk snapshot. Clock selections show their configured source, target
+frequency, and enabled state. Press `v` again to return to route editing.
+
 The persistent file is JSON and always contains complete maps:
 
 ```json
