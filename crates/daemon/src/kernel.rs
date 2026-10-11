@@ -24,6 +24,8 @@ pub struct RegistrationConfig {
     pub spi: [Option<SpiRegistration>; 2],
     pub gpio_lines: u16,
     pub gpio_pins: [u8; 26],
+    pub adc: Option<AdcRegistration>,
+    pub pwm: Option<PwmRegistration>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +39,20 @@ pub struct SpiRegistration {
     pub spi_min_speed_hz: u32,
     pub spi_max_speed_hz: u32,
     pub spi_chip_selects: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AdcRegistration {
+    pub channels: u8,
+    pub resolution_bits: u8,
+    pub reference_mv: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PwmRegistration {
+    pub channels: u8,
+    pub enabled: u16,
+    pub clock_hz: u32,
 }
 
 impl RegistrationConfig {
@@ -55,6 +71,16 @@ impl RegistrationConfig {
         gpio_pins: [
             2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0,
         ],
+        adc: Some(AdcRegistration {
+            channels: 3,
+            resolution_bits: 12,
+            reference_mv: 3_300,
+        }),
+        pwm: Some(PwmRegistration {
+            channels: 16,
+            enabled: 0,
+            clock_hz: 150_000_000,
+        }),
     };
 }
 
@@ -538,11 +564,15 @@ impl Request {
                 Some(payload)
             }
             Transaction::Gpio { .. } => {
-                if reply.completed != 1
-                    || reply.data.len() != 1
-                    || reply.data[0] > 1
-                    || !reply.effective_speeds.is_empty()
-                {
+                if !reply.effective_speeds.is_empty() {
+                    return None;
+                }
+                if reply.data.len() == 16 {
+                    let mut payload = reply.completed.to_le_bytes().to_vec();
+                    payload.extend_from_slice(&reply.data);
+                    return Some(payload);
+                }
+                if reply.completed != 1 || reply.data.len() != 1 || reply.data[0] > 2 {
                     return None;
                 }
                 let mut payload = reply.completed.to_le_bytes().to_vec();
@@ -550,6 +580,14 @@ impl Request {
                 payload.extend_from_slice(&[0; 3]);
                 Some(payload)
             }
+            Transaction::Adc { .. } => {
+                (reply.completed == 1 && reply.data.len() == 2 && reply.effective_speeds.is_empty())
+                    .then(|| reply.data.clone())
+            }
+            Transaction::Pwm { .. } => (reply.completed == 1
+                && reply.data.len() == rp_extio_wire::PWM_STATE_LEN
+                && reply.effective_speeds.is_empty())
+            .then(|| reply.data.clone()),
         }
     }
 }

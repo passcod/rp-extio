@@ -40,6 +40,40 @@ pub enum Transaction {
         line: u8,
         value: u8,
     },
+    Adc {
+        channel: u8,
+    },
+    Pwm {
+        command: u8,
+        channel: u8,
+        enabled: bool,
+        inverted: bool,
+        period_ns: u64,
+        duty_ns: u64,
+    },
+}
+
+impl Transaction {
+    pub fn pwm_state(&self) -> Option<rp_extio_wire::PwmState> {
+        let Self::Pwm {
+            channel,
+            enabled,
+            inverted,
+            period_ns,
+            duty_ns,
+            ..
+        } = self
+        else {
+            return None;
+        };
+        Some(rp_extio_wire::PwmState {
+            channel: *channel,
+            enabled: *enabled,
+            inverted: *inverted,
+            period_ns: *period_ns,
+            duty_ns: *duty_ns,
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

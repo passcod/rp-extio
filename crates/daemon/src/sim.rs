@@ -62,6 +62,10 @@ struct Device {
     connected: bool,
     gpio_values: u32,
     gpio_outputs: u32,
+    gpio_pull_ups: u32,
+    gpio_pull_downs: u32,
+    adc_values: [u16; 3],
+    pwm: [Option<rp_extio_wire::PwmState>; 16],
 }
 #[derive(Default)]
 pub struct Simulator {
@@ -78,6 +82,7 @@ impl Simulator {
                         device,
                         Device {
                             connected: true,
+                            adc_values: [512, 2048, 3584],
                             ..Default::default()
                         },
                     )
@@ -129,6 +134,9 @@ impl Simulator {
                     state.connected = true;
                     state.gpio_values = 0;
                     state.gpio_outputs = 0;
+                    state.gpio_pull_ups = 0;
+                    state.gpio_pull_downs = 0;
+                    state.pwm = [None; 16];
                     Response::Ok
                 }
                 None => Response::Error {
@@ -191,14 +199,26 @@ impl Backend for SimBackend {
         {
             let (command, line, value) = (*command, *line, *value);
             if command == rp_extio_wire::GPIO_SNAPSHOT {
+                let mut data = Vec::with_capacity(16);
+                data.extend_from_slice(&device.gpio_values.to_le_bytes());
+                data.extend_from_slice(&device.gpio_outputs.to_le_bytes());
+                data.extend_from_slice(&device.gpio_pull_ups.to_le_bytes());
+                data.extend_from_slice(&device.gpio_pull_downs.to_le_bytes());
                 return BackendReply {
                     status: 0,
                     completed: 17,
-                    data: device.gpio_values.to_le_bytes().to_vec(),
+                    data,
                     effective_speeds: vec![],
                 };
             }
-            if line >= 17 || value > 1 {
+            if line >= 17
+                || value
+                    > if command == rp_extio_wire::GPIO_SET_BIAS {
+                        rp_extio_wire::GPIO_BIAS_PULL_DOWN
+                    } else {
+                        1
+                    }
+            {
                 return BackendReply::error(Status::BadFrame);
             }
             let mask = 1_u32 << line;
@@ -226,12 +246,71 @@ impl Backend for SimBackend {
                     0
                 }
                 rp_extio_wire::GPIO_GET_DIRECTION => u8::from(device.gpio_outputs & mask == 0),
+                rp_extio_wire::GPIO_SET_BIAS => {
+                    device.gpio_pull_ups &= !mask;
+                    device.gpio_pull_downs &= !mask;
+                    if value == rp_extio_wire::GPIO_BIAS_PULL_UP {
+                        device.gpio_pull_ups |= mask;
+                    } else if value == rp_extio_wire::GPIO_BIAS_PULL_DOWN {
+                        device.gpio_pull_downs |= mask;
+                    }
+                    value
+                }
                 _ => return BackendReply::error(Status::Unsupported),
             };
             return BackendReply {
                 status: 0,
                 completed: 1,
                 data: vec![result],
+                effective_speeds: vec![],
+            };
+        }
+        if let Transaction::Adc { channel } = &transaction {
+            let Some(value) = device.adc_values.get(*channel as usize) else {
+                return BackendReply::error(Status::Unsupported);
+            };
+            return BackendReply {
+                status: Status::Ok as i32,
+                completed: 1,
+                data: value.to_le_bytes().to_vec(),
+                effective_speeds: vec![],
+            };
+        }
+        if let Transaction::Pwm {
+            command, channel, ..
+        } = &transaction
+        {
+            let channel = *channel as usize;
+            if channel >= device.pwm.len() {
+                return BackendReply::error(Status::Unsupported);
+            }
+            let requested = transaction.pwm_state().unwrap();
+            let state = match *command {
+                rp_extio_wire::PWM_GET => device.pwm[channel].unwrap_or(rp_extio_wire::PwmState {
+                    channel: channel as u8,
+                    enabled: false,
+                    inverted: false,
+                    period_ns: 1_000_000,
+                    duty_ns: 0,
+                }),
+                rp_extio_wire::PWM_APPLY => {
+                    let sibling = channel ^ 1;
+                    if requested.enabled
+                        && device.pwm[sibling].is_some_and(|state| {
+                            state.enabled && state.period_ns != requested.period_ns
+                        })
+                    {
+                        return BackendReply::error(Status::Busy);
+                    }
+                    device.pwm[channel] = Some(requested);
+                    requested
+                }
+                _ => return BackendReply::error(Status::BadFrame),
+            };
+            return BackendReply {
+                status: Status::Ok as i32,
+                completed: 1,
+                data: state.encode(*command).to_vec(),
                 effective_speeds: vec![],
             };
         }
@@ -296,7 +375,7 @@ mod tests {
         assert_eq!(simulator.set_input("gpio", 2, 0).await.unwrap(), 1);
         let snapshot = gpio(&backend, rp_extio_wire::GPIO_SNAPSHOT, 0, 0).await;
         assert_eq!(snapshot.completed, 17);
-        assert_eq!(snapshot.data, 0_u32.to_le_bytes());
+        assert_eq!(snapshot.data, [0; 16]);
 
         gpio(&backend, rp_extio_wire::GPIO_DIRECTION_OUTPUT, 3, 1).await;
         simulator
@@ -305,7 +384,7 @@ mod tests {
             })
             .await;
         let snapshot = gpio(&backend, rp_extio_wire::GPIO_SNAPSHOT, 0, 0).await;
-        assert_eq!(snapshot.data, 0_u32.to_le_bytes());
+        assert_eq!(snapshot.data, [0; 16]);
         assert_eq!(
             gpio(&backend, rp_extio_wire::GPIO_GET_DIRECTION, 3, 0)
                 .await
@@ -336,5 +415,54 @@ mod tests {
             gpio(&backend, 0xff, 0, 0).await.status,
             Status::Unsupported as i32
         );
+    }
+
+    #[tokio::test]
+    async fn analog_pwm_and_gpio_bias_have_deterministic_state() {
+        let simulator = Arc::new(Simulator::default());
+        simulator
+            .command(Command::Create {
+                device: "aux".into(),
+            })
+            .await;
+        let backend = simulator.device("aux");
+        let adc = backend.transact(Transaction::Adc { channel: 1 }).await;
+        assert_eq!(adc.data, 2048_u16.to_le_bytes());
+
+        assert_eq!(
+            gpio(
+                &backend,
+                rp_extio_wire::GPIO_SET_BIAS,
+                3,
+                rp_extio_wire::GPIO_BIAS_PULL_UP,
+            )
+            .await
+            .status,
+            Status::Ok as i32
+        );
+        let snapshot = gpio(&backend, rp_extio_wire::GPIO_SNAPSHOT, 0, 0).await;
+        assert_eq!(
+            u32::from_le_bytes(snapshot.data[8..12].try_into().unwrap()),
+            1 << 3
+        );
+
+        let apply = Transaction::Pwm {
+            command: rp_extio_wire::PWM_APPLY,
+            channel: 0,
+            enabled: true,
+            inverted: false,
+            period_ns: 20_000_000,
+            duty_ns: 1_000_000,
+        };
+        assert_eq!(backend.transact(apply).await.status, Status::Ok as i32);
+        let conflict = Transaction::Pwm {
+            command: rp_extio_wire::PWM_APPLY,
+            channel: 1,
+            enabled: true,
+            inverted: false,
+            period_ns: 10_000_000,
+            duty_ns: 1_000_000,
+        };
+        assert_eq!(backend.transact(conflict).await.status, Status::Busy as i32);
     }
 }

@@ -11,9 +11,9 @@ use nusb::{
     transfer::{Buffer, Bulk, Direction, In, Out},
 };
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_SPI, CAP_UART, MAX_GPIO_LINES, MAX_PAYLOAD,
-    Operation, PIN_MAP_LEN, Peripheral, PinMap, PinValidationError, Status, USB_HEADER_LEN,
-    UsbHeader,
+    CAP_ADC, CAP_CLOCK, CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART,
+    MAX_GPIO_LINES, MAX_PAYLOAD, Operation, PIN_MAP_LEN, Peripheral, PinMap, PinValidationError,
+    PwmState, Status, USB_HEADER_LEN, UsbHeader,
 };
 use std::{
     collections::HashMap,
@@ -445,12 +445,12 @@ async fn poll_gpio(backend: Arc<UsbBackend>, kernel: Arc<Kernel>, instance_id: u
             .await;
         if reply.status != Status::Ok as i32
             || reply.completed != lines as u32
-            || reply.data.len() != 4
+            || reply.data.len() != 16
         {
             backend.fail();
             return;
         }
-        let values = u32::from_le_bytes(reply.data.try_into().unwrap());
+        let values = u32::from_le_bytes(reply.data[..4].try_into().unwrap());
         if let Some(old) = previous {
             let mut changed = (old ^ values) & ((1_u32 << lines) - 1);
             while changed != 0 {
@@ -581,16 +581,17 @@ impl UsbBackend {
             .exchange(Operation::ConfigurePins, request_id, payload)
             .await
             .map_err(|failure| ConfigureError::Transport(failure.error))?;
-        match reply.header.status {
+        let applied_map = match reply.header.status {
             Status::Ok => {
                 if reply.payload.len() != 8 + PIN_MAP_LEN
                     || reply.payload[..8] != generation.to_le_bytes()
-                    || reply.payload[8..] != map.encode()
                 {
                     return Err(ConfigureError::Transport(invalid(
                         "invalid configure-pins reply",
                     )));
                 }
+                PinMap::decode(&reply.payload[8..])
+                    .map_err(|_| ConfigureError::Transport(invalid("invalid configured pin map")))?
             }
             Status::InvalidRoute | Status::PinConflict => {
                 let error = PinValidationError::decode(&reply.payload)
@@ -603,7 +604,7 @@ impl UsbBackend {
                     reply.header.status
                 ))));
             }
-        }
+        };
         let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
         let hello = self
             .exchange(Operation::Hello, request_id, Vec::new())
@@ -616,7 +617,7 @@ impl UsbBackend {
             ))));
         }
         let negotiated = parse_capabilities(&hello.payload).map_err(ConfigureError::Transport)?;
-        if negotiated.pin_map != map || negotiated.generation != generation {
+        if negotiated.pin_map != applied_map || negotiated.generation != generation {
             return Err(ConfigureError::Transport(invalid(
                 "firmware did not retain configured pin map",
             )));
@@ -873,27 +874,36 @@ fn encode_transaction(transaction: &Transaction) -> io::Result<(Operation, Vec<u
             line,
             value,
         } => Ok((Operation::GpioCommand, vec![*command, *line, *value, 0])),
+        Transaction::Adc { channel } => Ok((Operation::AdcRead, vec![*channel, 0, 0, 0])),
+        Transaction::Pwm { command, .. } => Ok((
+            Operation::Pwm,
+            transaction
+                .pwm_state()
+                .expect("PWM transaction has state")
+                .encode(*command)
+                .to_vec(),
+        )),
     }
 }
 
 fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<BackendReply> {
-    if reply.payload.len() < 4 {
-        return Err(invalid("USB bus reply is missing completion count"));
-    }
-    let completed = u32::from_le_bytes(reply.payload[..4].try_into().unwrap());
     if reply.header.status != Status::Ok {
         if reply.payload.len() != 4 {
             return Err(invalid("USB error reply has trailing data"));
         }
         return Ok(BackendReply {
             status: reply.header.status as i32,
-            completed,
+            completed: u32::from_le_bytes(reply.payload[..4].try_into().unwrap()),
             data: Vec::new(),
             effective_speeds: Vec::new(),
         });
     }
     match transaction {
         Transaction::I2c { messages, .. } => {
+            if reply.payload.len() < 4 {
+                return Err(invalid("USB I2C reply is missing completion count"));
+            }
+            let completed = u32::from_le_bytes(reply.payload[..4].try_into().unwrap());
             let expected: usize = messages
                 .iter()
                 .map(|message| message.read_len as usize)
@@ -909,6 +919,10 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
             })
         }
         Transaction::Spi { segments, .. } => {
+            if reply.payload.len() < 4 {
+                return Err(invalid("USB SPI reply is missing completion count"));
+            }
+            let completed = u32::from_le_bytes(reply.payload[..4].try_into().unwrap());
             let data_len: usize = segments.iter().map(|segment| segment.tx.len()).sum();
             let metadata_len = 8 + segments.len() * 4;
             if completed != data_len as u32
@@ -932,20 +946,29 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
             })
         }
         Transaction::Gpio { command, .. } => {
+            if reply.payload.len() < 4 {
+                return Err(invalid("USB GPIO reply is missing completion count"));
+            }
+            let completed = u32::from_le_bytes(reply.payload[..4].try_into().unwrap());
             if *command == rp_extio_wire::GPIO_SNAPSHOT {
-                if reply.payload.len() != 8 {
+                if reply.payload.len() != 20 {
                     return Err(invalid("invalid GPIO snapshot reply"));
                 }
                 return Ok(BackendReply {
                     status: Status::Ok as i32,
                     completed,
-                    data: reply.payload[4..8].to_vec(),
+                    data: reply.payload[4..20].to_vec(),
                     effective_speeds: Vec::new(),
                 });
             }
             if completed != 1
                 || reply.payload.len() != 8
-                || reply.payload[4] > 1
+                || reply.payload[4]
+                    > if *command == rp_extio_wire::GPIO_SET_BIAS {
+                        rp_extio_wire::GPIO_BIAS_PULL_DOWN
+                    } else {
+                        1
+                    }
                 || reply.payload[5..8] != [0; 3]
             {
                 return Err(invalid("invalid successful GPIO reply"));
@@ -954,6 +977,32 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
                 status: Status::Ok as i32,
                 completed,
                 data: vec![reply.payload[4]],
+                effective_speeds: Vec::new(),
+            })
+        }
+        Transaction::Adc { channel } => {
+            if reply.payload.len() != 4 || reply.payload[2] != 12 || reply.payload[3] != *channel {
+                return Err(invalid("invalid ADC reply"));
+            }
+            Ok(BackendReply {
+                status: Status::Ok as i32,
+                completed: 1,
+                data: reply.payload[..2].to_vec(),
+                effective_speeds: Vec::new(),
+            })
+        }
+        Transaction::Pwm { command, .. } => {
+            let (reply_command, state) =
+                PwmState::decode(&reply.payload).map_err(|_| invalid("invalid PWM reply"))?;
+            if reply_command != *command
+                || Some(state.channel) != transaction.pwm_state().map(|state| state.channel)
+            {
+                return Err(invalid("mismatched PWM reply"));
+            }
+            Ok(BackendReply {
+                status: Status::Ok as i32,
+                completed: 1,
+                data: state.encode(reply_command).to_vec(),
                 effective_speeds: Vec::new(),
             })
         }
@@ -968,6 +1017,9 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut uart: [Option<[u8; 2]>; 2] = [None; 2];
     let mut pin_map = None;
     let mut gpio_pins: Option<Vec<u8>> = None;
+    let mut adc = None;
+    let mut pwm = None;
+    let mut clocks = None;
     while offset < payload.len() {
         if payload.len() - offset < 4 {
             return Err(invalid("truncated capability record"));
@@ -1070,12 +1122,54 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                 }
                 gpio_pins = Some(value[4..].to_vec());
             }
+            CAP_ADC => {
+                if adc.is_some()
+                    || value.len() != 7
+                    || value[0] as usize != rp_extio_wire::ADC_CHANNEL_COUNT
+                    || value[1] != 12
+                    || u16::from_le_bytes(value[2..4].try_into().unwrap()) == 0
+                {
+                    return Err(invalid("invalid ADC capability"));
+                }
+                adc = Some((
+                    value[1],
+                    u16::from_le_bytes(value[2..4].try_into().unwrap()),
+                    value[4..7].to_vec(),
+                ));
+            }
+            CAP_PWM => {
+                if pwm.is_some()
+                    || value.len() != 7 + rp_extio_wire::PWM_CHANNEL_COUNT
+                    || value[0] as usize != rp_extio_wire::PWM_CHANNEL_COUNT
+                {
+                    return Err(invalid("invalid PWM capability"));
+                }
+                pwm = Some((
+                    u32::from_le_bytes(value[1..5].try_into().unwrap()),
+                    u16::from_le_bytes(value[5..7].try_into().unwrap()),
+                    value[7..].to_vec(),
+                ));
+            }
+            CAP_CLOCK => {
+                if clocks.is_some()
+                    || value.len() != 14
+                    || value[0] as usize != rp_extio_wire::CLOCK_OUTPUT_COUNT
+                {
+                    return Err(invalid("invalid clock capability"));
+                }
+                clocks = Some(value.to_vec());
+            }
             _ => {}
         }
     }
     let gpio_pins = gpio_pins.ok_or_else(|| invalid("GPIO capability missing"))?;
     let generation = generation.ok_or_else(|| invalid("general capability missing"))?;
     let pin_map = pin_map.ok_or_else(|| invalid("pin configuration capability missing"))?;
+    let (adc_bits, adc_reference_mv, adc_pins) =
+        adc.ok_or_else(|| invalid("ADC capability missing"))?;
+    let (pwm_clock_hz, pwm_enabled, pwm_pins) =
+        pwm.ok_or_else(|| invalid("PWM capability missing"))?;
+    let clocks = clocks.ok_or_else(|| invalid("clock capability missing"))?;
     pin_map
         .validate()
         .map_err(|_| invalid("invalid peripheral pin map"))?;
@@ -1111,6 +1205,26 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     if expected_gpio.as_slice() != gpio_pins.as_slice() {
         return Err(invalid("GPIO capability does not match peripheral pins"));
     }
+    if adc_pins.as_slice() != pin_map.adc_pins
+        || pwm_enabled != pin_map.pwm_enabled
+        || pwm_pins.as_slice() != pin_map.pwm_pins
+        || pwm_clock_hz == 0
+        || clocks[1] != pin_map.clock_enabled
+    {
+        return Err(invalid(
+            "auxiliary capabilities do not match pin configuration",
+        ));
+    }
+    for output in 0..rp_extio_wire::CLOCK_OUTPUT_COUNT {
+        let offset = 2 + output * 6;
+        if clocks[offset] != pin_map.clock_pins[output]
+            || clocks[offset + 1] != pin_map.clock_sources[output] as u8
+            || u32::from_le_bytes(clocks[offset + 2..offset + 6].try_into().unwrap())
+                != pin_map.clock_hz[output]
+        {
+            return Err(invalid("clock capability does not match pin configuration"));
+        }
+    }
     let mut gpio_array = [0; MAX_GPIO_LINES];
     gpio_array[..gpio_pins.len()].copy_from_slice(&gpio_pins);
     Ok(NegotiatedConfig {
@@ -1130,6 +1244,16 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
             }),
             gpio_lines: gpio_pins.len() as u16,
             gpio_pins: gpio_array,
+            adc: Some(crate::kernel::AdcRegistration {
+                channels: rp_extio_wire::ADC_CHANNEL_COUNT as u8,
+                resolution_bits: adc_bits,
+                reference_mv: adc_reference_mv,
+            }),
+            pwm: Some(crate::kernel::PwmRegistration {
+                channels: rp_extio_wire::PWM_CHANNEL_COUNT as u8,
+                enabled: pwm_enabled,
+                clock_hz: pwm_clock_hz,
+            }),
         },
         pin_map,
         generation,
@@ -1212,6 +1336,22 @@ mod tests {
         let mut value = vec![gpio.len() as u8, 0, 0, 0];
         value.extend_from_slice(gpio.as_slice());
         capability_record(&mut payload, CAP_GPIO, &value);
+        let mut value = vec![rp_extio_wire::ADC_CHANNEL_COUNT as u8, 12];
+        value.extend_from_slice(&3_300_u16.to_le_bytes());
+        value.extend_from_slice(&map.adc_pins);
+        capability_record(&mut payload, CAP_ADC, &value);
+        let mut value = vec![rp_extio_wire::PWM_CHANNEL_COUNT as u8];
+        value.extend_from_slice(&150_000_000_u32.to_le_bytes());
+        value.extend_from_slice(&map.pwm_enabled.to_le_bytes());
+        value.extend_from_slice(&map.pwm_pins);
+        capability_record(&mut payload, CAP_PWM, &value);
+        let mut value = vec![rp_extio_wire::CLOCK_OUTPUT_COUNT as u8, map.clock_enabled];
+        for output in 0..rp_extio_wire::CLOCK_OUTPUT_COUNT {
+            value.push(map.clock_pins[output]);
+            value.push(map.clock_sources[output] as u8);
+            value.extend_from_slice(&map.clock_hz[output].to_le_bytes());
+        }
+        capability_record(&mut payload, CAP_CLOCK, &value);
         payload
     }
 
@@ -1364,15 +1504,24 @@ mod tests {
                     operation: Operation::GpioCommand,
                     reply: true,
                     request_id: 9,
-                    payload_len: 8,
+                    payload_len: 20,
                     status: Status::Ok,
                 },
-                payload: vec![17, 0, 0, 0, 0x34, 0x12, 0, 0],
+                payload: vec![
+                    17, 0, 0, 0, // line count
+                    0x34, 0x12, 0, 0, // levels
+                    4, 0, 0, 0, // outputs
+                    8, 0, 0, 0, // pull-ups
+                    16, 0, 0, 0, // pull-downs
+                ],
             },
         )
         .unwrap();
         assert_eq!(reply.completed, 17);
-        assert_eq!(reply.data, [0x34, 0x12, 0, 0]);
+        assert_eq!(
+            reply.data,
+            [0x34, 0x12, 0, 0, 4, 0, 0, 0, 8, 0, 0, 0, 16, 0, 0, 0]
+        );
 
         let malformed = UsbReply {
             header: UsbHeader {
@@ -1385,6 +1534,60 @@ mod tests {
             payload: vec![1, 0, 0, 0, 1, 1, 0, 0],
         };
         assert!(decode_reply(&command, malformed).is_err());
+    }
+
+    #[test]
+    fn adc_and_pwm_transaction_codecs_preserve_results() {
+        let adc = Transaction::Adc { channel: 2 };
+        assert_eq!(
+            encode_transaction(&adc).unwrap(),
+            (Operation::AdcRead, vec![2, 0, 0, 0])
+        );
+        let adc_reply = decode_reply(
+            &adc,
+            UsbReply {
+                header: UsbHeader {
+                    operation: Operation::AdcRead,
+                    reply: true,
+                    request_id: 11,
+                    payload_len: 4,
+                    status: Status::Ok,
+                },
+                payload: vec![0x34, 0x0a, 12, 2],
+            },
+        )
+        .unwrap();
+        assert_eq!(adc_reply.data, [0x34, 0x0a]);
+
+        let pwm = Transaction::Pwm {
+            command: rp_extio_wire::PWM_APPLY,
+            channel: 3,
+            enabled: true,
+            inverted: false,
+            period_ns: 20_000_000,
+            duty_ns: 1_500_000,
+        };
+        let (operation, payload) = encode_transaction(&pwm).unwrap();
+        assert_eq!(operation, Operation::Pwm);
+        assert_eq!(
+            rp_extio_wire::PwmState::decode(&payload).unwrap().1,
+            pwm.pwm_state().unwrap()
+        );
+        let pwm_reply = decode_reply(
+            &pwm,
+            UsbReply {
+                header: UsbHeader {
+                    operation,
+                    reply: true,
+                    request_id: 12,
+                    payload_len: rp_extio_wire::PWM_STATE_LEN as u32,
+                    status: Status::Ok,
+                },
+                payload,
+            },
+        )
+        .unwrap();
+        assert_eq!(pwm_reply.data.len(), rp_extio_wire::PWM_STATE_LEN);
     }
 
     #[test]
@@ -1429,7 +1632,7 @@ mod tests {
             .await;
         assert_eq!(snapshot.status, Status::Ok as i32);
         assert_eq!(snapshot.completed, 17);
-        assert_eq!(snapshot.data.len(), 4);
+        assert_eq!(snapshot.data.len(), 16);
         backend.disconnect().await;
     }
 }
