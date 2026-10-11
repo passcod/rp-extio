@@ -339,7 +339,8 @@ impl PwmState {
         let mut bytes = [0; PWM_STATE_LEN];
         bytes[0] = command;
         bytes[1] = self.channel;
-        let flags = u16::from(self.enabled) * PWM_ENABLED | u16::from(self.inverted) * PWM_INVERTED;
+        let flags =
+            (u16::from(self.enabled) * PWM_ENABLED) | (u16::from(self.inverted) * PWM_INVERTED);
         bytes[2..4].copy_from_slice(&flags.to_le_bytes());
         bytes[4..12].copy_from_slice(&self.period_ns.to_le_bytes());
         bytes[12..20].copy_from_slice(&self.duty_ns.to_le_bytes());
