@@ -27,6 +27,7 @@ use tokio::sync::{Mutex, mpsc};
 pub const DEVELOPMENT_VID: u16 = 0xcafe;
 pub const DEVELOPMENT_PID: u16 = 0x4010;
 const USB_DEADLINE: Duration = Duration::from_secs(6);
+const USB_DRAIN_QUIET: Duration = Duration::from_millis(50);
 
 struct ConnectedDevice {
     backend: Arc<UsbBackend>,
@@ -234,11 +235,14 @@ impl UsbBackend {
                 io::Error::new(io::ErrorKind::NotFound, "bulk OUT endpoint not found")
             })?)
             .map_err(nusb_error)?;
-        let in_endpoint = interface
+        let mut in_endpoint = interface
             .endpoint::<Bulk, In>(in_address.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "bulk IN endpoint not found")
             })?)
             .map_err(nusb_error)?;
+        // Replies completed after the previous host process released this interface
+        // remain queued by the device and must not be mistaken for this session's HELLO.
+        drain_stale_input(&mut in_endpoint).await?;
         let backend = Arc::new(Self {
             transport: Mutex::new(Transport {
                 out_endpoint,
@@ -335,6 +339,35 @@ impl Backend for UsbBackend {
     async fn disconnect(&self) {
         self.connected.store(false, Ordering::Release);
     }
+}
+
+async fn drain_stale_input(in_endpoint: &mut Endpoint<Bulk, In>) -> io::Result<()> {
+    let packet_size = in_endpoint.max_packet_size();
+    let max_packets = (USB_HEADER_LEN + MAX_PAYLOAD).div_ceil(packet_size) + 1;
+    for _ in 0..max_packets {
+        in_endpoint.submit(Buffer::new(packet_size));
+        match tokio::time::timeout(USB_DRAIN_QUIET, in_endpoint.next_complete()).await {
+            Ok(completion) => completion.status.map_err(io::Error::from)?,
+            Err(_) => {
+                in_endpoint.cancel_all();
+                let completion = tokio::time::timeout(USB_DEADLINE, in_endpoint.next_complete())
+                    .await
+                    .map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "timed out cancelling USB input drain",
+                        )
+                    })?;
+                match (completion.status, completion.actual_len) {
+                    (Err(nusb::transfer::TransferError::Cancelled), 0) => return Ok(()),
+                    (Err(nusb::transfer::TransferError::Cancelled), _) => continue,
+                    (Ok(()), _) => continue,
+                    (Err(error), _) => return Err(io::Error::from(error)),
+                }
+            }
+        }
+    }
+    Err(invalid("too much stale USB input"))
 }
 
 struct UsbReply {
