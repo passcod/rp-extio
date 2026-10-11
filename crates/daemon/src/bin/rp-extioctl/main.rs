@@ -354,7 +354,7 @@ fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {
 
 fn board_summary(board: &BoardInfo) -> String {
     format!(
-        "{}  {:12}  generation={}  i2c={} spi={}",
+        "{}  {:12}  generation={}  enabled={} i2c={} spi={}",
         board.serial,
         if board.connected {
             "connected"
@@ -364,6 +364,18 @@ fn board_summary(board: &BoardInfo) -> String {
         board
             .generation
             .map_or_else(|| "-".into(), |value| value.to_string()),
+        board.active.or(board.desired).map_or_else(
+            || "-".into(),
+            |config| {
+                let map = PinMap::from(config);
+                Peripheral::ALL
+                    .into_iter()
+                    .filter(|&peripheral| map.is_enabled(peripheral))
+                    .map(peripheral_name)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            }
+        ),
         bus_numbers(board.i2c_buses),
         bus_numbers(board.spi_buses),
     )
@@ -487,5 +499,22 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn list_summary_identifies_enabled_hardware_instances() {
+        let summary = board_summary(&BoardInfo {
+            serial: "ABC".into(),
+            connected: true,
+            active: Some(rp_extio_wire::DEFAULT_PIN_MAP.into()),
+            desired: None,
+            generation: Some(3),
+            i2c_buses: [Some(7), None],
+            spi_buses: [Some(2), None],
+            gpio_instance: Some(9),
+        });
+        assert!(summary.contains("enabled=uart0,i2c0,spi0"));
+        assert!(summary.contains("i2c=0:7,1:-"));
+        assert!(summary.contains("spi=0:2,1:-"));
     }
 }
