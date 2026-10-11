@@ -594,9 +594,16 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let active = app.active_map();
+    let visible = usize::from(area.height.saturating_sub(2)).max(1);
+    let start = app
+        .signal
+        .saturating_sub(visible / 2)
+        .min(PinSignal::ALL.len().saturating_sub(visible));
     let items = PinSignal::ALL
         .iter()
         .enumerate()
+        .skip(start)
+        .take(visible)
         .map(|(index, &signal)| {
             let draft = app.edited.map(|map| map.pin(signal));
             let active = active.map(|map| map.pin(signal));
@@ -1331,6 +1338,15 @@ mod tests {
         assert!(output.contains("USB CONNECTOR · rows 1–"));
         assert!(output.contains("▼ more header rows"));
         assert!(!output.contains("SWD DEBUG"));
+    }
+
+    #[test]
+    fn short_wide_legend_scrolls_to_selected_signal() {
+        let mut app = app();
+        app.signal = PinSignal::Spi1Cs1 as usize;
+        let output = rendered(120, 20, &app);
+        assert!(output.contains("SPI1 CS1"));
+        assert!(!output.contains("UART0 TX"));
     }
 
     #[test]
