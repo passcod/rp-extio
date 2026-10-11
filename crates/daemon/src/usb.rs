@@ -866,6 +866,28 @@ async fn apply_pwm_startup(
     map: &PinMap,
     entries: &[PwmInfo],
 ) -> Result<(), ControlResponse> {
+    validate_pwm_startup(map, entries)
+        .map_err(|message| ControlResponse::error("pwm_startup_conflict", message))?;
+    let mut affected_slices = 0_u8;
+    for entry in entries {
+        affected_slices |= 1 << (entry.channel / 2);
+    }
+    for channel in 0..rp_extio_wire::PWM_CHANNEL_COUNT as u8 {
+        if affected_slices & (1 << (channel / 2)) != 0 && map.pwm_enabled & (1 << channel) != 0 {
+            apply_one_pwm_startup(
+                backend,
+                map,
+                PwmInfo {
+                    channel,
+                    enabled: false,
+                    inverted: false,
+                    period_ns: 0,
+                    duty_ns: 0,
+                },
+            )
+            .await?;
+        }
+    }
     for &entry in entries {
         apply_one_pwm_startup(backend, map, entry).await?;
     }
@@ -2182,7 +2204,7 @@ mod tests {
         ));
         let backend = simulator.device("startup");
         let mut map = rp_extio_wire::DEFAULT_PIN_MAP;
-        map.pwm_enabled |= 1 << 6;
+        map.pwm_enabled |= (1 << 6) | (1 << 7);
         map.pwm_pins[6] = 22;
         apply_gpio_startup(
             &backend,
@@ -2200,16 +2222,38 @@ mod tests {
         )
         .await
         .unwrap();
+        for channel in [6, 7] {
+            let seeded = backend
+                .transact(Transaction::Pwm {
+                    command: rp_extio_wire::PWM_APPLY,
+                    channel,
+                    enabled: true,
+                    inverted: false,
+                    period_ns: 2_000_000,
+                    duty_ns: 1_000_000,
+                })
+                .await;
+            assert_eq!(seeded.status, Status::Ok as i32);
+        }
         apply_pwm_startup(
             &backend,
             &map,
-            &[PwmInfo {
-                channel: 6,
-                enabled: true,
-                inverted: true,
-                period_ns: 1_000_000,
-                duty_ns: 250_000,
-            }],
+            &[
+                PwmInfo {
+                    channel: 6,
+                    enabled: true,
+                    inverted: true,
+                    period_ns: 1_000_000,
+                    duty_ns: 250_000,
+                },
+                PwmInfo {
+                    channel: 7,
+                    enabled: true,
+                    inverted: false,
+                    period_ns: 1_000_000,
+                    duty_ns: 750_000,
+                },
+            ],
         )
         .await
         .unwrap();
@@ -2248,6 +2292,26 @@ mod tests {
                 inverted: true,
                 period_ns: 1_000_000,
                 duty_ns: 250_000,
+            }
+        );
+        let sibling = backend
+            .transact(Transaction::Pwm {
+                command: rp_extio_wire::PWM_GET,
+                channel: 7,
+                enabled: false,
+                inverted: false,
+                period_ns: 0,
+                duty_ns: 0,
+            })
+            .await;
+        assert_eq!(
+            rp_extio_wire::PwmState::decode(&sibling.data).unwrap().1,
+            rp_extio_wire::PwmState {
+                channel: 7,
+                enabled: true,
+                inverted: false,
+                period_ns: 1_000_000,
+                duty_ns: 750_000,
             }
         );
     }
