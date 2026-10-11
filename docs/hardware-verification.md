@@ -226,14 +226,14 @@ some devices are disturbed by address scans.
 With an SCD41 at its fixed address `0x62`, run the demo script:
 
 ```sh
-./scripts/read-scd41.sh
+./scripts/scd41.sh
 ```
 
 The script builds and starts `rp-extiod`, discovers the adapter created by that
-daemon session, starts periodic measurement, waits for the first sample,
-validates all three Sensirion CRC bytes, and prints CO2, temperature, and
-relative humidity. It then stops periodic measurement and the daemon. The
-privileged phase uses `runzero` and prompts through polkit.
+daemon session, starts periodic measurement, waits for the first sample, and
+prints CO2, temperature, and relative humidity. It then stops periodic
+measurement and the daemon. The privileged phase uses `runzero` and prompts
+through polkit.
 
 ### Register-device tests
 
