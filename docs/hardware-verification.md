@@ -69,17 +69,16 @@ These are firmware startup defaults, not fixed pins. Runtime configuration can
 replace them without rebuilding. Always wire the fixture to the active map from
 `rp-extioctl show SERIAL`.
 
-| Interface | GPIO | Pico header pin |
-| --- | ---: | ---: |
-| UART TX | GP0 | 1 |
-| UART RX | GP1 | 2 |
-| I2C SDA | GP4 | 6 |
-| I2C SCL | GP5 | 7 |
-| SPI MISO | GP16 | 21 |
-| SPI CS0 | GP17 | 22 |
-| SPI SCK | GP18 | 24 |
-| SPI MOSI | GP19 | 25 |
-| SPI CS1 | GP21 | 27 |
+| Interface | State | GPIO and Pico header pin |
+| --- | --- | --- |
+| UART0 TX / RX | enabled | GP0 pin 1 / GP1 pin 2 |
+| UART1 TX / RX | disabled | GP8 pin 11 / GP9 pin 12 |
+| I2C0 SDA / SCL | enabled | GP4 pin 6 / GP5 pin 7 |
+| I2C1 SDA / SCL | disabled | GP10 pin 14 / GP11 pin 15 |
+| SPI0 MISO / SCK / MOSI | enabled | GP16 pin 21 / GP18 pin 24 / GP19 pin 25 |
+| SPI0 CS0 / CS1 | enabled | GP17 pin 22 / GP21 pin 27 |
+| SPI1 MISO / SCK / MOSI | disabled | GP12 pin 16 / GP14 pin 19 / GP15 pin 20 |
+| SPI1 CS0 / CS1 | disabled | GP13 pin 17 / GP20 pin 26 |
 | 3V3 OUT | — | 36 |
 
 Convenient ground pins include header pins 3, 8, 13, 18, 23, 28, and 33.
@@ -98,10 +97,10 @@ Kernel module build:
 Daemon build:
 Pico USB serial:
 Pico USB path:
-I2C adapter:
-SPI controller and children:
+I2C0 / I2C1 adapters:
+SPI0 / SPI1 controllers and children:
 GPIO chip:
-CDC ACM device:
+UART0 / UART1 CDC ACM devices:
 Peripheral parts and board revisions:
 Logic-analyser capture names:
 ```
@@ -118,9 +117,11 @@ systemctl status rp-extiod.service
 rp-extioctl list
 ```
 
-The board must have a stable USB serial, one CDC ACM device, one I2C adapter,
-two `spidev` children, and one 17-line GPIO chip. Run the ignored USB hardware
-test before attaching a peripheral:
+With the startup map, the board must have a stable USB serial, two CDC ACM
+devices, one I2C0 adapter, two SPI0 `spidev` children, and one 17-line GPIO
+chip. UART1 remains enumerated over USB while disabled; I2C1 and SPI1 have no
+Linux buses until enabled. Run the ignored USB hardware test before attaching a
+peripheral:
 
 ```sh
 cargo test -p rp-extiod negotiates_connected_bridge_and_reads_gpio_snapshot \
@@ -132,29 +133,54 @@ cargo test -p rp-extiod negotiates_connected_bridge_and_reads_gpio_snapshot \
 Perform this section with one stock UF2; do not rebuild between routes.
 
 1. Record the startup map with `rp-extioctl show SERIAL`.
-2. Move I2C0 to GP12/GP13 with `rp-extioctl set SERIAL --i2c-sda GP12
-   --i2c-scl GP13`, rediscover the adapter, and read the attached I2C device.
+2. Move I2C0 to GP12/GP13 with `rp-extioctl set SERIAL --i2c0-sda GP12
+   --i2c0-scl GP13`, rediscover the adapter, and read the attached I2C device.
 3. Move I2C0 to a second valid pair, move the wires, and repeat the read.
 4. Move SPI0 MISO/SCK/MOSI and both chip selects to another conflict-free map,
    rediscover both spidev children, and repeat loopback and device-ID reads.
 5. Move UART0 TX/RX, reconnect the signal wires without reconnecting USB, and
-   verify both CDC-to-UART and UART-to-CDC traffic.
-6. Confirm that the GPIO line list changes to exactly the 17 unassigned header
-   pins after every map change.
-7. Attempt an invalid mux route and a duplicate assignment. The client or
-   firmware must reject each one while the previous buses and active map remain
-   usable.
-8. Start two `rp-extioctl set` operations from the same observed generation.
+   verify both CDC-to-UART and UART-to-CDC traffic. Restore the startup map
+   before enabling all remembered instance-1 routes below.
+6. Enable I2C1 on its remembered GP10/GP11 route. Confirm a second I2C adapter
+   appears, each adapter reaches only its wired bus, and the GPIO count falls
+   from 17 to 15.
+7. Enable SPI1 on its remembered GP12/GP14/GP15, CS GP13/GP20 route. Confirm a
+   second controller with two children appears, exercise both SPI instances,
+   and confirm the GPIO count falls to 10.
+8. Enable UART1 on GP8/GP9, exercise the second ACM path in both directions,
+   and confirm the GPIO count falls to 8. The two ACM devices must have remained
+   enumerated throughout.
+9. Disable each second instance again. Its remembered routes must stay visible,
+   its I2C or SPI Linux bus must disappear, and its pins must return to the GPIO
+   list in ascending GPIO order.
+10. Disable all six peripherals. Confirm there are no I2C or SPI buses for the
+    board, both ACM devices remain, and the GPIO controller exposes all 26
+    header GPIOs. Restore the startup state with `rp-extioctl default SERIAL`.
+11. Attempt an invalid mux route and a duplicate enabled assignment. The
+    client or firmware must reject each one while the previous buses and active
+    map remain usable.
+12. Change remembered routes while an instance is disabled, including a route
+    overlapping an enabled peripheral. The edit may be saved, but enabling the
+    conflicting instance must fail atomically without changing the active map.
+13. Start two `rp-extioctl set` operations from the same observed generation.
    One may apply; the other must report a generation conflict.
-9. Restart the daemon and then reset the Pico. The persistent map must be
+14. Restart the daemon and then reset the Pico. The persistent map must be
    reapplied in both cases before Linux buses appear.
-10. Run `rp-extioctl default SERIAL`; the startup map must return, its
+15. Run `rp-extioctl default SERIAL`; the startup map must return, its
     persistent entry must disappear, and Linux buses must be rediscovered.
-11. Run `rp-extioctl tui SERIAL`, exercise every signal selector, conflict
-    display, apply, refresh, reload, and default action, then exit with both `q`
-    and an interrupt and confirm the terminal is restored.
+16. Run `rp-extioctl tui SERIAL`, exercise every signal selector, grouped moves
+    within both hardware instances, the `e` enable toggle, conflict display,
+    apply, refresh, reload, and default action. Press `f` and confirm the board
+    rotates 180° with screen-relative arrow navigation. Exit with both `q` and
+    an interrupt and confirm the terminal is restored.
 
 ## GPIO fixture
+
+The line offsets below are for the startup map only. After any peripheral
+enable, disable, or route change, derive the current offset-to-pin mapping from
+`gpioinfo`; offsets are reassigned in ascending Pico GPIO order. Repeat the
+input/output smoke test on every pin released by a disabled peripheral, and
+repeat it with all peripherals disabled so all 26 header GPIOs are covered.
 
 ### Protected loopback pairs
 
@@ -296,6 +322,8 @@ messages and exactly one final STOP.
 ### I2C acceptance criteria
 
 - Known register values and EEPROM patterns round-trip correctly.
+- The same fixture works through I2C0 and I2C1, including simultaneous adapters
+  on independent pin pairs.
 - Combined transactions retain repeated-start semantics.
 - Unknown addresses and forced NACKs map to the documented Linux error.
 - Clock stretching within the deadline succeeds; exceeding it times out and
@@ -355,11 +383,21 @@ alternate CS0 and CS1 requests. A logic-analyser capture must show only the
 selected line asserted for each transaction. Run traffic to both children
 from separate processes to cover controller serialization.
 
+### Second controller tests
+
+Enable SPI1 on a pin group separate from SPI0 and wire either another device or
+a second loopback. Run transfers on both Linux controllers concurrently and
+confirm logic-analyser captures associate each request with the correct SCK,
+MOSI, MISO, and chip-select pins. Disable SPI0 while SPI1 traffic continues,
+verify the SPI0 children disappear and their five pins become GPIO lines, then
+re-enable SPI0 and repeat in the opposite direction.
+
 ### SPI acceptance criteria
 
 - Loopback returns every transmitted byte at representative lengths and
   speeds.
 - Both chip selects address only their intended peripheral.
+- SPI0 and SPI1 remain isolated and can operate concurrently on separate pins.
 - Flash erase, program, and readback succeed in the dedicated test region.
 - Multi-segment chip-select lifetime and delay fields match the request.
 - Unsupported modes and sizes fail before partial device operations occur.
@@ -396,12 +434,18 @@ authentication itself.
 6. Run UART traffic concurrently with I2C, SPI, and GPIO activity.
 7. Change the host CDC line coding and confirm the fixed physical UART remains
    at the documented 115200 8N1 setting.
+8. Move the fixture to UART1's configured pins, enable UART1, and repeat the
+   bidirectional raw and console tests through its distinct ACM device.
+9. Disable each UART in turn. Its ACM device must remain enumerated, host writes
+   must produce no pin activity, and its TX/RX pins must appear as GPIO lines.
+   Re-enable it and confirm traffic resumes on the remembered route.
 
 ### UART acceptance criteria
 
 - Boot and login-console output reaches the host without corruption.
 - Host input reaches the Raspberry Pi console and produces the expected output.
 - Raw bidirectional transfers preserve bytes when terminal processing is off.
+- UART0 and UART1 map to distinct, stable ACM interfaces and physical pins.
 - Concurrent bus activity does not stall or corrupt UART traffic.
 - Disconnect and reconnect restore the same stable CDC identity.
 

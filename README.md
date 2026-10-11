@@ -16,25 +16,25 @@ distributed product uses an allocated VID/PID.
 
 ## Hardware and electrical limits
 
-The default Pico 2 pin map is:
+The startup map enables instance 0 of each peripheral and remembers
+conflict-free routes for the disabled instance 1 peripherals:
 
-| Function | Pico 2 pin |
-| --- | --- |
-| I2C0 SDA | GP4 |
-| I2C0 SCL | GP5 |
-| SPI0 SCK | GP18 |
-| SPI0 MOSI | GP19 |
-| SPI0 MISO | GP16 |
-| SPI0 CS0 | GP17 |
-| SPI0 CS1 | GP21 |
-| UART0 TX | GP0 |
-| UART0 RX | GP1 |
-| GPIO lines 0–16 | GP2, GP3, GP6–GP15, GP20, GP22, GP26–GP28 |
+| Peripheral | Startup state | Pico 2 GPIOs |
+| --- | --- | --- |
+| UART0 | enabled | TX GP0, RX GP1 |
+| UART1 | disabled | TX GP8, RX GP9 |
+| I2C0 | enabled | SDA GP4, SCL GP5 |
+| I2C1 | disabled | SDA GP10, SCL GP11 |
+| SPI0 | enabled | MISO GP16, SCK GP18, MOSI GP19, CS0 GP17, CS1 GP21 |
+| SPI1 | disabled | MISO GP12, SCK GP14, MOSI GP15, CS0 GP13, CS1 GP20 |
+| GPIO | 17 lines | GP2, GP3, GP6–GP15, GP20, GP22, GP26–GP28 |
 
-Firmware builds can select other valid, conflict-free RP2350A peripheral
-routes. The 17 unassigned Pico 2 header pins automatically become the GPIO
-lines in ascending pin order, and the firmware reports that generated map to
-the daemon and kernel.
+Routes and enabled states can be changed at runtime. A disabled peripheral
+keeps its remembered routes but reserves no pins. Every unassigned Pico 2
+header GPIO becomes a Linux GPIO line in ascending pin order, so the controller
+has between 8 lines when all six peripherals are enabled and 26 lines when all
+are disabled. The firmware reports the generated mapping to the daemon and
+kernel after every change.
 
 All signals are 3.3 V only. Do not connect 5 V logic directly. I2C SDA and SCL
 need external pull-ups to 3.3 V; 2.2–4.7 kΩ is a common starting range, but the
@@ -52,12 +52,17 @@ and no-CS transfers. USB full-speed latency means this is a functional remote
 bus for development and integration tests, not a timing-equivalent substitute
 for a local controller.
 
-UART0 appears through Linux's `cdc_acm` driver as `/dev/ttyACM*`. It uses
-115200 baud, eight data bits, no parity, and one stop bit. Set the host terminal
-to the same format; CDC line-coding requests do not reconfigure the RP2350 UART.
+UART0 and UART1 are two permanent USB CDC ACM functions and appear through
+Linux's `cdc_acm` driver as separate `/dev/ttyACM*` devices. Both use 115200
+baud, eight data bits, no parity, and one stop bit. Set the host terminal to the
+same format; CDC line-coding requests do not reconfigure the RP2350 UART. When
+an instance is disabled its ACM function remains enumerated, host output is
+discarded, no physical UART traffic is accepted, and its pins become GPIOs.
 
-The GPIO controller exposes 17 lines. GPIO line offsets map to physical pins as
-follows; pins assigned to UART, I2C, and SPI are deliberately absent:
+With the startup map, the GPIO controller exposes 17 lines. GPIO line offsets
+map to physical pins as follows; pins assigned to enabled UART, I2C, and SPI
+instances are deliberately absent. Re-read `gpioinfo` after every map change
+because both the count and offsets can change:
 
 | Line | Pin | Line | Pin | Line | Pin |
 | ---: | --- | ---: | --- | ---: | --- |
@@ -82,25 +87,45 @@ variables only change the startup and recovery default. For example, this
 builds a recovery image whose default I2C0 route is GP12/GP13:
 
 ```sh
-RP_EXTIO_I2C_SDA=12 RP_EXTIO_I2C_SCL=13 ./scripts/build-uf2.sh
+RP_EXTIO_I2C0_SDA=12 RP_EXTIO_I2C0_SCL=13 ./scripts/build-uf2.sh
 ```
 
 Supported variables and defaults are:
 
 | Variable | Default | Valid Pico 2 GPIOs |
 | --- | ---: | --- |
-| `RP_EXTIO_UART_TX` | 0 | 0, 2, 12, 14, 16, 18, 28 |
-| `RP_EXTIO_UART_RX` | 1 | 1, 3, 13, 15, 17, 19 |
-| `RP_EXTIO_I2C_SDA` | 4 | 0, 4, 8, 12, 16, 20 |
-| `RP_EXTIO_I2C_SCL` | 5 | 1, 5, 9, 13, 17, 21 |
-| `RP_EXTIO_SPI_MISO` | 16 | 0, 4, 16, 20 |
-| `RP_EXTIO_SPI_SCK` | 18 | 2, 6, 18, 22 |
-| `RP_EXTIO_SPI_MOSI` | 19 | 3, 7, 19 |
-| `RP_EXTIO_SPI_CS0` | 17 | any Pico 2 header GPIO |
-| `RP_EXTIO_SPI_CS1` | 21 | any Pico 2 header GPIO |
+| `RP_EXTIO_UART0_TX` | 0 | 0, 2, 12, 14, 16, 18, 28 |
+| `RP_EXTIO_UART0_RX` | 1 | 1, 3, 13, 15, 17, 19 |
+| `RP_EXTIO_UART1_TX` | 8 | 4, 6, 8, 10, 20, 22, 26 |
+| `RP_EXTIO_UART1_RX` | 9 | 5, 7, 9, 11, 21, 27 |
+| `RP_EXTIO_I2C0_SDA` | 4 | 0, 4, 8, 12, 16, 20 |
+| `RP_EXTIO_I2C0_SCL` | 5 | 1, 5, 9, 13, 17, 21 |
+| `RP_EXTIO_I2C1_SDA` | 10 | 2, 6, 10, 14, 18, 22, 26 |
+| `RP_EXTIO_I2C1_SCL` | 11 | 3, 7, 11, 15, 19, 27 |
+| `RP_EXTIO_SPI0_MISO` | 16 | 0, 4, 16, 20 |
+| `RP_EXTIO_SPI0_SCK` | 18 | 2, 6, 18, 22 |
+| `RP_EXTIO_SPI0_MOSI` | 19 | 3, 7, 19 |
+| `RP_EXTIO_SPI0_CS0` | 17 | any Pico 2 header GPIO |
+| `RP_EXTIO_SPI0_CS1` | 21 | any Pico 2 header GPIO |
+| `RP_EXTIO_SPI1_MISO` | 12 | 8, 12, 28 |
+| `RP_EXTIO_SPI1_SCK` | 14 | 10, 14, 26 |
+| `RP_EXTIO_SPI1_MOSI` | 15 | 11, 15, 27 |
+| `RP_EXTIO_SPI1_CS0` | 13 | any Pico 2 header GPIO |
+| `RP_EXTIO_SPI1_CS1` | 20 | any Pico 2 header GPIO |
+| `RP_EXTIO_UART0_ENABLED` | true | boolean |
+| `RP_EXTIO_UART1_ENABLED` | false | boolean |
+| `RP_EXTIO_I2C0_ENABLED` | true | boolean |
+| `RP_EXTIO_I2C1_ENABLED` | false | boolean |
+| `RP_EXTIO_SPI0_ENABLED` | true | boolean |
+| `RP_EXTIO_SPI1_ENABLED` | false | boolean |
 
-I2C SDA/SCL must be a matching pair, and no pin can be assigned to two
-signals. Invalid or conflicting maps fail the firmware build with a diagnostic.
+The old unqualified instance-0 names, such as `RP_EXTIO_I2C_SDA`, remain
+aliases when the corresponding `RP_EXTIO_I2C0_SDA` variable is unset.
+
+Each I2C SDA/SCL route must be a matching pair. Remembered routes must always
+be valid for their hardware block, while duplicate pins are permitted only
+between disabled peripherals. Invalid enabled conflicts fail the firmware
+build with a diagnostic.
 The daemon normally replaces this map after USB negotiation and reapplies its
 persistent map after every reconnect or firmware reset.
 
@@ -221,16 +246,25 @@ applies the requested edits, validates it, and submits it with the observed
 generation:
 
 ```sh
-rp-extioctl set 125DBCCF0BCA4BEF --i2c-sda GP12 --i2c-scl GP13
+rp-extioctl set 125DBCCF0BCA4BEF --i2c0-sda GP12 --i2c0-scl GP13
 rp-extioctl set 125DBCCF0BCA4BEF \
-  --spi-miso GP4 --spi-sck GP6 --spi-mosi GP7 --spi-cs0 GP5 --spi-cs1 GP8
+  --spi1-miso GP8 --spi1-sck GP10 --spi1-mosi GP11 \
+  --spi1-cs0 GP14 --spi1-cs1 GP15 --enable-spi1
+rp-extioctl set 125DBCCF0BCA4BEF --disable-uart0
 ```
 
-Every accepted change removes and recreates that board's Linux I2C, SPI, and
-GPIO instances, so rediscover their numbers afterward. A stale generation is
-rejected instead of overwriting a concurrent edit. Firmware validates the map
-before touching hardware; an invalid route or conflict leaves the prior map
-active.
+Every route option is instance-qualified. The old unqualified options such as
+`--i2c-sda` and `--spi-miso` remain aliases for instance 0. Each of `uart0`,
+`uart1`, `i2c0`, `i2c1`, `spi0`, and `spi1` has matching `--enable-*` and
+`--disable-*` options. Routes can be edited while an instance is disabled;
+enabling it later atomically rejects any conflict with the active instances.
+
+Every accepted change removes and recreates that board's enabled Linux I2C and
+SPI instances and its GPIO controller, so rediscover their numbers and GPIO
+offsets afterward. Disabled I2C and SPI instances have no Linux bus. A stale
+generation is rejected instead of overwriting a concurrent edit. Firmware
+validates the map before touching hardware; an invalid route or conflict leaves
+the prior map active.
 
 Use JSON responses in scripts, restore the firmware default, or launch the
 interactive editor:
@@ -243,12 +277,13 @@ rp-extioctl tui 125DBCCF0BCA4BEF
 ```
 
 The TUI presents the physical Pico 2 headers with pin 1 opposite pin 40 at the
-USB end. Arrow keys move between physical pins, Tab and Shift-Tab select a
-peripheral signal, and Enter or Space assigns that signal to the highlighted
-GPIO in the draft. Assignments move UART TX/RX, I2C SDA/SCL, or the SPI
-MISO/SCK/MOSI mux group together by default. A grouped move that would conflict
-with another signal or cannot fit on the exposed header is rejected without
-changing the draft. SPI chip selects remain individually assignable.
+USB end. Arrow keys move between physical pins, Tab and Shift-Tab select any of
+the 18 peripheral signals, and Enter or Space assigns that signal to the
+highlighted GPIO in the draft. Assignments move the selected hardware
+instance's UART TX/RX, I2C SDA/SCL, or SPI MISO/SCK/MOSI mux group together by
+default. A grouped move that would conflict with another enabled signal or
+cannot fit on the exposed header is rejected without changing the draft. SPI
+chip selects remain individually assignable.
 
 Press `g` to switch between grouped and individual assignment. Individual mode
 allows unusual valid layouts without a complete exposed group, and can leave a
@@ -256,27 +291,47 @@ temporarily invalid draft for manual correction. Valid routes are highlighted;
 conflicts, mismatched I2C pairs, changed pins, exported GPIO lines, power pins,
 grounds, and current Linux bus assignments remain visible on the board.
 
+`e` toggles the selected signal's entire peripheral instance. Disabling it
+immediately previews its pins as GPIO; enabling validates all of its remembered
+routes before changing the draft. `f` rotates the diagram 180° for an
+upside-down board, placing SWD at the top and USB at the bottom while keeping
+arrow movement aligned with the screen. Orientation is not persisted.
+
 `a` applies the complete draft atomically, `d` loads the firmware defaults into
 the draft, and `u` discards edits and restores the active map. `[` and `]`
 select a board, `r` refreshes, `l` reloads the persistent file, and `q` exits.
 Short terminals scroll the physical pin rows around the cursor, while wide
-terminals also show a complete signal legend.
+terminals also show a complete signal legend with enabled-state markers.
 
 The persistent file is JSON and always contains complete maps:
 
 ```json
 {
-  "version": 1,
+  "version": 2,
   "boards": {
     "125DBCCF0BCA4BEF": {
-      "uart_tx": 0, "uart_rx": 1,
-      "i2c_sda": 12, "i2c_scl": 13,
-      "spi_miso": 16, "spi_sck": 18, "spi_mosi": 19,
-      "spi_cs0": 17, "spi_cs1": 21
+      "uart0_enabled": true, "uart0_tx": 0, "uart0_rx": 1,
+      "uart1_enabled": false, "uart1_tx": 8, "uart1_rx": 9,
+      "i2c0_enabled": true, "i2c0_sda": 12, "i2c0_scl": 13,
+      "i2c1_enabled": false, "i2c1_sda": 10, "i2c1_scl": 11,
+      "spi0_enabled": true,
+      "spi0_miso": 16, "spi0_sck": 18, "spi0_mosi": 19,
+      "spi0_cs0": 17, "spi0_cs1": 21,
+      "spi1_enabled": false,
+      "spi1_miso": 12, "spi1_sck": 14, "spi1_mosi": 15,
+      "spi1_cs0": 13, "spi1_cs1": 20
     }
   }
 }
 ```
+
+Version-1 files are loaded by placing their routes on instance 0 and retaining
+the disabled instance-1 defaults. The next successful save writes version 2.
+
+This release uses USB protocol major 2 and kernel ABI major 2. Rebuild and
+install the module and daemon, and flash the matching firmware, as one upgrade;
+the daemon rejects a version-1 module or firmware instead of registering an
+incompatible device.
 
 The socket is root-only by default. `rp-extiod --operator-group GROUP` changes
 it to group-writable and assigns it to `GROUP`, allowing operators to route
@@ -339,7 +394,7 @@ by the `device` name. Creating a device returns the allocated Linux bus numbers:
 
 ```json
 {"command":"create","device":"test-1"}
-{"result":"created","i2c_bus":12,"spi_bus":7}
+{"result":"created","i2c_buses":[12,null],"spi_buses":[7,null]}
 ```
 
 Queue exact expected transactions and their replies before software accesses
