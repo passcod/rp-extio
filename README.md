@@ -363,9 +363,13 @@ live state while idle and annotates every exported GPIO as input or output,
 high or low, and pull-up or pull-down. The status panel expands the highlighted
 pin's state and interprets it as a button; `b` switches between active-low and
 active-high button wiring. `0` and `1` drive the highlighted GPIO low or high,
-`t`, Enter, or Space toggles it as a persistent LED/output, and `i` returns it
+`t`, Enter, or Space toggles it as a daemon-held LED/output, and `i` returns it
 to input while cycling through pull-up, pull-down, and no internal bias. These
-actions use the daemon's normal Polkit authorization.
+live changes last until the pin map changes or the board disconnects. Press
+`w` to save the highlighted GPIO's current direction, output level, and bias
+for future daemon connections; `x` forgets that saved startup state. Saved
+GPIOs carry a `•` marker. These actions use the daemon's normal Polkit
+authorization.
 
 Selecting an enabled ADC signal in operate mode continuously shows its raw and
 millivolt reading. Selecting an enabled PWM signal shows its runtime enable,
@@ -380,7 +384,7 @@ The persistent file is JSON and always contains complete maps:
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "boards": {
     "125DBCCF0BCA4BEF": {
       "uart0_enabled": true, "uart0_tx": 0, "uart0_rx": 1,
@@ -401,7 +405,11 @@ The persistent file is JSON and always contains complete maps:
       "clock_enabled": [false, false],
       "clock_pins": [13, 15],
       "clock_sources": ["system", "system"],
-      "clock_hz": [1000000, 1000000]
+      "clock_hz": [1000000, 1000000],
+      "gpio_startup": [
+        {"direction": "output", "pin": 22, "value": true},
+        {"direction": "input", "pin": 28, "bias": "pull_up"}
+      ]
     }
   }
 }
@@ -409,8 +417,16 @@ The persistent file is JSON and always contains complete maps:
 
 Version-1 files are loaded by placing their routes on instance 0 and retaining
 the disabled instance-1 defaults. Version-2 maps gain disabled ADC, PWM, and
-clock functions. The next successful save writes version 3. Version-2 maps
-without the CS1 enable fields load with both second chip selects enabled.
+clock functions. Version-2 maps without the CS1 enable fields load with both
+second chip selects enabled. Versions 1 through 3 gain an empty GPIO startup
+list; the next successful save writes version 4.
+
+The daemon validates saved GPIO states against the same board object's map.
+Duplicate entries and pins owned by an enabled peripheral are rejected. A map
+change cannot claim a pin with saved GPIO state; forget that state first.
+`rp-extioctl default SERIAL` removes both the custom map and every saved GPIO
+state. `rp-extioctl reload` rereads and reapplies maps and GPIO startup state to
+connected boards.
 
 This release uses USB protocol major 3 and kernel ABI major 3. Rebuild and
 install the module and daemon, and flash the matching firmware as one upgrade;
@@ -481,12 +497,21 @@ waits are also available without finding dynamic GPIO line offsets:
 rp-extioctl gpio snapshot 125DBCCF0BCA4BEF
 rp-extioctl gpio input 125DBCCF0BCA4BEF GP22 --pull pull-up
 rp-extioctl gpio set 125DBCCF0BCA4BEF GP22 high
+rp-extioctl gpio input 125DBCCF0BCA4BEF GP28 --pull pull-up --persist
+rp-extioctl gpio set 125DBCCF0BCA4BEF GP22 high --persist
+rp-extioctl gpio forget 125DBCCF0BCA4BEF GP22
 rp-extioctl led 125DBCCF0BCA4BEF GP22 on --active-low
 rp-extioctl button 125DBCCF0BCA4BEF GP22 --active-low --wait pressed --timeout-ms 10000
 ```
 
-Daemon-owned output state persists until another command changes it, the pin
-map is reconfigured, or the device disconnects.
+Without `--persist`, daemon-owned output state lasts until another command
+changes it, the pin map is reconfigured, or the device disconnects. Persisted
+states are host-side and keyed by USB serial, like pin maps. Firmware initially
+leaves GPIOs as inputs; after USB enumeration the daemon applies the saved map
+and GPIO state before registering Linux devices. Outputs can therefore float
+briefly during boot, reset, or daemon downtime. Use an external pull resistor
+when a safe level is required continuously, and never persist an output until
+its circuit is known to tolerate that level.
 
 Enable an ADC route before reading it. The direct CLI reports raw counts and
 millivolts; standard IIO exposes the same 12-bit conversion and 3.3 V scale:

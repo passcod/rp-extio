@@ -247,6 +247,7 @@ libgpiod, replacing `SERIAL` and the free pin:
 
 ```sh
 rp-extioctl gpio set SERIAL GP22 high
+rp-extioctl gpio set SERIAL GP22 high --persist
 rp-extioctl led SERIAL GP22 off
 rp-extioctl led SERIAL GP22 on --active-low
 ```
@@ -272,6 +273,7 @@ Remove the external 10 kΩ pull-up and repeat with the RP2350 internal pull:
 
 ```sh
 rp-extioctl gpio input SERIAL GP28 --pull pull-up
+rp-extioctl gpio input SERIAL GP28 --pull pull-up --persist
 rp-extioctl gpio snapshot SERIAL
 rp-extioctl button SERIAL GP28 --active-low --pull pull-up --wait pressed \
   --timeout-ms 10000
@@ -281,6 +283,33 @@ Repeat with a button to 3.3 V and `--pull pull-down`. Confirm `gpioinfo` reports
 the requested bias and that a pin-map change clears daemon-owned direction and
 bias state.
 
+### Persisted GPIO startup state
+
+Only persist output levels on the resistor-protected LED fixture or another
+load known to tolerate them. Saved state is keyed by the Pico USB serial and is
+applied by the host daemon, not by firmware. Expect a brief input/floating
+interval after power-up, reset, or while the daemon is stopped; add an external
+pull when the circuit needs a defined level throughout that interval.
+
+1. Save the LED pin high with `rp-extioctl gpio set SERIAL GP22 high
+   --persist`. Confirm `rp-extioctl show SERIAL` lists it as a saved output.
+2. Restart `rp-extiod.service`, rediscover the GPIO device, and confirm the LED
+   returns high without another GPIO command.
+3. Reset or reconnect the Pico and confirm the same result after it enumerates.
+4. Save the button pin using `rp-extioctl gpio input SERIAL GP28 --pull
+   pull-up --persist`. Repeat the service restart and Pico reset, then confirm
+   its direction and pull-up in `gpioinfo` and `rp-extioctl gpio snapshot`.
+5. Change the live direction, bias, or level without `--persist`, run
+   `rp-extioctl reload`, and confirm the saved state is restored.
+6. Attempt to route an enabled peripheral onto GP22 or GP28. Confirm the map is
+   rejected until `rp-extioctl gpio forget SERIAL PIN` removes that pin's
+   startup entry.
+7. In TUI operate mode, confirm saved pins have a `•` marker and a startup
+   description. Use `w` to replace the highlighted pin's saved state with its
+   live state and `x` to forget it without changing the live pin.
+8. Run `rp-extioctl default SERIAL` and confirm the custom map and all GPIO
+   startup entries disappear. Recreate any map needed for later tests.
+
 ### GPIO acceptance criteria
 
 - Every exposed line can become an input and an output.
@@ -289,6 +318,9 @@ bias state.
   events without missing or inventing stable transitions.
 - The LED and button circuits behave according to their schematics.
 - Invalid offsets and attempts to claim an already-owned line fail promptly.
+- Duplicate saved states and maps that claim saved GPIO pins are rejected.
+- Saved input and output states return after daemon restart, Pico reset, and
+  explicit configuration reload.
 - Stopping the daemon releases open GPIO operations with an error rather than
   leaving a new unkillable task.
 
