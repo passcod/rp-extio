@@ -12,7 +12,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use rp_extio_wire::{DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError};
+use rp_extio_wire::{
+    ClockSource, DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError,
+};
 use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, signal_name};
 use std::{error::Error, io::stdout};
 
@@ -336,6 +338,61 @@ impl App {
         self.message_error = false;
     }
 
+    fn cycle_clock_source(&mut self) {
+        let Some(output) = self.selected_signal().clock_output() else {
+            self.message = "select CLOCK0 or CLOCK1 to change its source".into();
+            self.message_error = true;
+            return;
+        };
+        let Some(mut map) = self.edited else {
+            return;
+        };
+        const SOURCES: [ClockSource; 7] = [
+            ClockSource::System,
+            ClockSource::Reference,
+            ClockSource::Usb,
+            ClockSource::Adc,
+            ClockSource::Crystal,
+            ClockSource::RingOscillator,
+            ClockSource::LowPowerOscillator,
+        ];
+        let current = SOURCES
+            .iter()
+            .position(|&source| source == map.clock_sources[output])
+            .unwrap();
+        map.clock_sources[output] = SOURCES[(current + 1) % SOURCES.len()];
+        self.edited = Some(map);
+        self.default_pending = false;
+        self.message = format!(
+            "CLOCK{output} source set to {:?}; press a to apply",
+            map.clock_sources[output]
+        );
+        self.message_error = false;
+    }
+
+    fn adjust_clock_frequency(&mut self, increase: bool) {
+        let Some(output) = self.selected_signal().clock_output() else {
+            self.message = "select CLOCK0 or CLOCK1 to change its frequency".into();
+            self.message_error = true;
+            return;
+        };
+        let Some(mut map) = self.edited else {
+            return;
+        };
+        map.clock_hz[output] = if increase {
+            map.clock_hz[output].saturating_mul(2)
+        } else {
+            (map.clock_hz[output] / 2).max(1)
+        };
+        self.edited = Some(map);
+        self.default_pending = false;
+        self.message = format!(
+            "CLOCK{output} target set to {}Hz; press a to apply",
+            map.clock_hz[output]
+        );
+        self.message_error = false;
+    }
+
     fn load_default(&mut self) {
         if self.edited.is_none() {
             self.message = "board is disconnected".into();
@@ -432,6 +489,9 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::Char('g') => app.toggle_grouped(),
             KeyCode::Char('e') => app.toggle_selected_enabled(),
             KeyCode::Char('f') => app.flip(),
+            KeyCode::Char('s') => app.cycle_clock_source(),
+            KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_clock_frequency(true),
+            KeyCode::Char('-') => app.adjust_clock_frequency(false),
             KeyCode::Char('u') => app.undo(),
             KeyCode::Char('d') => app.load_default(),
             KeyCode::Char('r') => {
@@ -559,7 +619,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     let assignment_mode = if app.grouped { "grouped" } else { "single" };
     let help = if area.width >= 72 {
         format!(
-            "arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nf flip  d defaults  u undo  [/] board  r refresh  l reload  q quit"
+            "arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nf flip  s clock source  +/- clock Hz  d defaults  u undo  r refresh  q quit"
         )
     } else {
         format!(
@@ -575,14 +635,21 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let route = app
         .edited
         .map(|map| {
+            let clock = selected.clock_output().map_or_else(String::new, |output| {
+                format!(
+                    ", {:?} {}Hz",
+                    map.clock_sources[output], map.clock_hz[output]
+                )
+            });
             format!(
-                "GP{} ({})",
+                "GP{} ({}{})",
                 map.pin(selected),
                 if signal_toggle_enabled(map, selected) {
                     "enabled"
                 } else {
                     "disabled"
-                }
+                },
+                clock,
             )
         })
         .unwrap_or_else(|| "-".into());
@@ -1547,6 +1614,27 @@ mod tests {
         let output = rendered(120, 20, &app);
         assert!(output.contains("SPI1 CS1"));
         assert!(!output.contains("UART0 TX"));
+    }
+
+    #[test]
+    fn auxiliary_signals_move_individually_and_clocks_are_adjustable() {
+        let mut app = app();
+        app.edited
+            .as_mut()
+            .unwrap()
+            .set_enabled(Peripheral::Spi0, false);
+        app.signal = PinSignal::Pwm1A as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(18).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!(map.pwm_pins[2], 18);
+        assert!(map.is_signal_enabled(PinSignal::Pwm1A));
+
+        app.signal = PinSignal::Clock0 as usize;
+        app.cycle_clock_source();
+        assert_eq!(app.edited.unwrap().clock_sources[0], ClockSource::Reference);
+        app.adjust_clock_frequency(true);
+        assert_eq!(app.edited.unwrap().clock_hz[0], 2_000_000);
     }
 
     #[test]

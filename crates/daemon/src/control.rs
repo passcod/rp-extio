@@ -238,11 +238,103 @@ pub enum ControlRequest {
         generation: u64,
     },
     Reload,
+    AdcRead {
+        serial: String,
+        channel: u8,
+    },
+    PwmGet {
+        serial: String,
+        channel: u8,
+    },
+    PwmApply {
+        serial: String,
+        pwm: PwmInfo,
+    },
+    GpioSnapshot {
+        serial: String,
+    },
+    GpioOutput {
+        serial: String,
+        pin: u8,
+        value: bool,
+    },
+    GpioInput {
+        serial: String,
+        pin: u8,
+        bias: GpioBias,
+    },
 }
 
 impl ControlRequest {
     pub const fn requires_authorization(&self) -> bool {
-        !matches!(self, Self::List | Self::Show { .. })
+        !matches!(
+            self,
+            Self::List
+                | Self::Show { .. }
+                | Self::AdcRead { .. }
+                | Self::PwmGet { .. }
+                | Self::GpioSnapshot { .. }
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GpioBias {
+    None,
+    PullUp,
+    PullDown,
+}
+
+impl GpioBias {
+    pub const fn wire_value(self) -> u8 {
+        match self {
+            Self::None => rp_extio_wire::GPIO_BIAS_NONE,
+            Self::PullUp => rp_extio_wire::GPIO_BIAS_PULL_UP,
+            Self::PullDown => rp_extio_wire::GPIO_BIAS_PULL_DOWN,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct GpioInfo {
+    pub line: u8,
+    pub pin: u8,
+    pub level: bool,
+    pub output: bool,
+    pub bias: GpioBias,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PwmInfo {
+    pub channel: u8,
+    pub enabled: bool,
+    pub inverted: bool,
+    pub period_ns: u64,
+    pub duty_ns: u64,
+}
+
+impl From<rp_extio_wire::PwmState> for PwmInfo {
+    fn from(state: rp_extio_wire::PwmState) -> Self {
+        Self {
+            channel: state.channel,
+            enabled: state.enabled,
+            inverted: state.inverted,
+            period_ns: state.period_ns,
+            duty_ns: state.duty_ns,
+        }
+    }
+}
+
+impl From<PwmInfo> for rp_extio_wire::PwmState {
+    fn from(state: PwmInfo) -> Self {
+        Self {
+            channel: state.channel,
+            enabled: state.enabled,
+            inverted: state.inverted,
+            period_ns: state.period_ns,
+            duty_ns: state.duty_ns,
+        }
     }
 }
 
@@ -292,6 +384,21 @@ pub enum ControlResponse {
         board: BoardInfo,
     },
     Ok,
+    Adc {
+        channel: u8,
+        raw: u16,
+        reference_mv: u16,
+        resolution_bits: u8,
+    },
+    Pwm {
+        pwm: PwmInfo,
+    },
+    GpioSnapshot {
+        gpio: Vec<GpioInfo>,
+    },
+    Gpio {
+        gpio: GpioInfo,
+    },
     Error {
         code: String,
         message: String,
@@ -669,6 +776,34 @@ mod tests {
                 serial: "ABC".into(),
                 generation: 1,
                 map: rp_extio_wire::DEFAULT_PIN_MAP.into(),
+            }
+            .requires_authorization()
+        );
+        assert!(
+            !ControlRequest::AdcRead {
+                serial: "ABC".into(),
+                channel: 0,
+            }
+            .requires_authorization()
+        );
+        assert!(
+            !ControlRequest::PwmGet {
+                serial: "ABC".into(),
+                channel: 0,
+            }
+            .requires_authorization()
+        );
+        assert!(
+            !ControlRequest::GpioSnapshot {
+                serial: "ABC".into(),
+            }
+            .requires_authorization()
+        );
+        assert!(
+            ControlRequest::GpioOutput {
+                serial: "ABC".into(),
+                pin: 22,
+                value: true,
             }
             .requires_authorization()
         );

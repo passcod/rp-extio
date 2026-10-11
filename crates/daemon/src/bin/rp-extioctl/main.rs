@@ -1,8 +1,11 @@
 mod tui;
 
-use clap::{Args, Parser, Subcommand};
-use rp_extio_wire::{Peripheral, PinMap, PinSignal};
-use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, PinMapConfig, signal_name};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use rp_extio_wire::{ClockSource, Peripheral, PinMap, PinSignal};
+use rp_extiod::control::{
+    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, PinMapConfig, PwmInfo,
+    signal_name,
+};
 use std::{
     error::Error,
     io::{BufRead, BufReader, Write},
@@ -45,6 +48,124 @@ enum Command {
     Tui {
         serial: Option<String>,
     },
+    /// Read one ADC channel directly through the daemon
+    Adc {
+        serial: String,
+        channel: u8,
+    },
+    /// Query or drive a routed PWM channel
+    Pwm {
+        #[command(subcommand)]
+        command: PwmCommand,
+    },
+    /// Inspect or configure pins currently available as GPIO
+    Gpio {
+        #[command(subcommand)]
+        command: GpioCommand,
+    },
+    /// Drive an LED and retain the output until changed or disconnected
+    Led {
+        serial: String,
+        #[arg(value_parser = parse_pin)]
+        pin: u8,
+        state: OnOff,
+        #[arg(long)]
+        active_low: bool,
+    },
+    /// Configure a button input and wait for a level or transition
+    Button {
+        serial: String,
+        #[arg(value_parser = parse_pin)]
+        pin: u8,
+        #[arg(long, value_enum, default_value_t = ButtonWait::Pressed)]
+        wait: ButtonWait,
+        #[arg(long, value_enum, default_value_t = BiasArg::PullUp)]
+        pull: BiasArg,
+        #[arg(long)]
+        active_low: bool,
+        #[arg(long)]
+        timeout_ms: Option<u64>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PwmCommand {
+    Get {
+        serial: String,
+        channel: u8,
+    },
+    Set {
+        serial: String,
+        channel: u8,
+        #[arg(long)]
+        frequency_hz: u64,
+        #[arg(long, default_value_t = 50.0)]
+        duty_percent: f64,
+        #[arg(long)]
+        inverted: bool,
+    },
+    Disable {
+        serial: String,
+        channel: u8,
+    },
+}
+
+#[derive(Subcommand)]
+enum GpioCommand {
+    Snapshot {
+        serial: String,
+    },
+    Set {
+        serial: String,
+        #[arg(value_parser = parse_pin)]
+        pin: u8,
+        level: LevelArg,
+    },
+    Input {
+        serial: String,
+        #[arg(value_parser = parse_pin)]
+        pin: u8,
+        #[arg(long, value_enum, default_value_t = BiasArg::None)]
+        pull: BiasArg,
+    },
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum LevelArg {
+    Low,
+    High,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum OnOff {
+    Off,
+    On,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum BiasArg {
+    None,
+    PullUp,
+    PullDown,
+}
+
+impl From<BiasArg> for GpioBias {
+    fn from(bias: BiasArg) -> Self {
+        match bias {
+            BiasArg::None => Self::None,
+            BiasArg::PullUp => Self::PullUp,
+            BiasArg::PullDown => Self::PullDown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, ValueEnum)]
+enum ButtonWait {
+    Pressed,
+    Released,
+    Rising,
+    Falling,
+    Either,
 }
 
 #[derive(Args)]
@@ -118,6 +239,21 @@ struct SetArgs {
     enable_spi1_cs1: bool,
     #[arg(long, conflicts_with = "enable_spi1_cs1")]
     disable_spi1_cs1: bool,
+    /// Route any signal by name, for example pwm1a=GP18 or adc0=GP26
+    #[arg(long = "route", value_parser = parse_route)]
+    routes: Vec<(PinSignal, u8)>,
+    /// Enable any signal (serial groups enable together)
+    #[arg(long = "enable", value_parser = parse_signal)]
+    enable_signals: Vec<PinSignal>,
+    /// Disable any signal (serial groups disable together)
+    #[arg(long = "disable", value_parser = parse_signal)]
+    disable_signals: Vec<PinSignal>,
+    /// Select a clock source, for example 0=system or 1=crystal
+    #[arg(long = "clock-source", value_parser = parse_clock_source)]
+    clock_sources: Vec<(usize, ClockSource)>,
+    /// Set a clock target in hertz, for example 0=1000000
+    #[arg(long = "clock-hz", value_parser = parse_clock_hz)]
+    clock_hz: Vec<(usize, u32)>,
 }
 
 pub(crate) struct Client {
@@ -246,6 +382,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 && !arguments.disable_spi0_cs1
                 && !arguments.enable_spi1_cs1
                 && !arguments.disable_spi1_cs1
+                && arguments.routes.is_empty()
+                && arguments.enable_signals.is_empty()
+                && arguments.disable_signals.is_empty()
+                && arguments.clock_sources.is_empty()
+                && arguments.clock_hz.is_empty()
             {
                 return Err("set requires at least one route or enable/disable option".into());
             }
@@ -253,6 +394,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if let Some(pin) = pin {
                     map.set_pin(signal, pin);
                 }
+            }
+            for (signal, pin) in arguments.routes {
+                map.set_pin(signal, pin);
             }
             for (peripheral, enable, disable) in enable_edits {
                 if enable || disable {
@@ -266,6 +410,25 @@ fn main() -> Result<(), Box<dyn Error>> {
                 if enable || disable {
                     map.set_spi_cs1_enabled(bus, enable);
                 }
+            }
+            for signal in arguments.enable_signals {
+                if arguments.disable_signals.contains(&signal) {
+                    return Err(format!(
+                        "{} cannot be both enabled and disabled",
+                        signal_name(signal)
+                    )
+                    .into());
+                }
+                map.set_signal_enabled(signal, true);
+            }
+            for signal in arguments.disable_signals {
+                map.set_signal_enabled(signal, false);
+            }
+            for (output, source) in arguments.clock_sources {
+                map.clock_sources[output] = source;
+            }
+            for (output, frequency) in arguments.clock_hz {
+                map.clock_hz[output] = frequency;
             }
             map.validate()
                 .map_err(rp_extiod::control::format_validation)?;
@@ -290,6 +453,178 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Command::Reload => output(client.request(&ControlRequest::Reload)?, cli.json),
         Command::Tui { serial } => tui::run(&mut client, serial.as_deref()),
+        Command::Adc { serial, channel } => output(
+            client.request(&ControlRequest::AdcRead { serial, channel })?,
+            cli.json,
+        ),
+        Command::Pwm { command } => {
+            let request = match command {
+                PwmCommand::Get { serial, channel } => ControlRequest::PwmGet { serial, channel },
+                PwmCommand::Set {
+                    serial,
+                    channel,
+                    frequency_hz,
+                    duty_percent,
+                    inverted,
+                } => {
+                    if frequency_hz == 0 {
+                        return Err("PWM frequency must be greater than zero".into());
+                    }
+                    if !(0.0..=100.0).contains(&duty_percent) || !duty_percent.is_finite() {
+                        return Err("PWM duty percent must be between 0 and 100".into());
+                    }
+                    let period_ns = 1_000_000_000_u64
+                        .checked_add(frequency_hz / 2)
+                        .and_then(|value| value.checked_div(frequency_hz))
+                        .ok_or("PWM frequency is out of range")?;
+                    if period_ns == 0 {
+                        return Err("PWM frequency is too high".into());
+                    }
+                    ControlRequest::PwmApply {
+                        serial,
+                        pwm: PwmInfo {
+                            channel,
+                            enabled: true,
+                            inverted,
+                            period_ns,
+                            duty_ns: (period_ns as f64 * duty_percent / 100.0).round() as u64,
+                        },
+                    }
+                }
+                PwmCommand::Disable { serial, channel } => ControlRequest::PwmApply {
+                    serial,
+                    pwm: PwmInfo {
+                        channel,
+                        enabled: false,
+                        inverted: false,
+                        period_ns: 0,
+                        duty_ns: 0,
+                    },
+                },
+            };
+            output(client.request(&request)?, cli.json)
+        }
+        Command::Gpio { command } => {
+            let request = match command {
+                GpioCommand::Snapshot { serial } => ControlRequest::GpioSnapshot { serial },
+                GpioCommand::Set { serial, pin, level } => ControlRequest::GpioOutput {
+                    serial,
+                    pin,
+                    value: matches!(level, LevelArg::High),
+                },
+                GpioCommand::Input { serial, pin, pull } => ControlRequest::GpioInput {
+                    serial,
+                    pin,
+                    bias: pull.into(),
+                },
+            };
+            output(client.request(&request)?, cli.json)
+        }
+        Command::Led {
+            serial,
+            pin,
+            state,
+            active_low,
+        } => {
+            let on = matches!(state, OnOff::On);
+            output(
+                client.request(&ControlRequest::GpioOutput {
+                    serial,
+                    pin,
+                    value: on != active_low,
+                })?,
+                cli.json,
+            )
+        }
+        Command::Button {
+            serial,
+            pin,
+            wait,
+            pull,
+            active_low,
+            timeout_ms,
+        } => wait_for_button(
+            &mut client,
+            &serial,
+            pin,
+            wait,
+            pull.into(),
+            active_low,
+            timeout_ms,
+            cli.json,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn wait_for_button(
+    client: &mut Client,
+    serial: &str,
+    pin: u8,
+    wait: ButtonWait,
+    bias: GpioBias,
+    active_low: bool,
+    timeout_ms: Option<u64>,
+    json: bool,
+) -> Result<(), Box<dyn Error>> {
+    match client.request(&ControlRequest::GpioInput {
+        serial: serial.into(),
+        pin,
+        bias,
+    })? {
+        ControlResponse::Gpio { .. } => {}
+        response => return Err(response_error(response).into()),
+    }
+    let started = std::time::Instant::now();
+    let mut previous = None;
+    loop {
+        let gpio = snapshot_pin(client, serial, pin)?;
+        let logical = gpio.level != active_low;
+        let triggered = match (wait, previous) {
+            (ButtonWait::Pressed, _) => logical,
+            (ButtonWait::Released, _) => !logical,
+            (ButtonWait::Rising, Some(false)) => gpio.level,
+            (ButtonWait::Falling, Some(true)) => !gpio.level,
+            (ButtonWait::Either, Some(previous)) => previous != gpio.level,
+            _ => false,
+        };
+        if triggered {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "result": "button",
+                        "pin": pin,
+                        "level": gpio.level,
+                        "pressed": logical,
+                    })
+                );
+            } else {
+                println!(
+                    "GP{pin}: {} ({})",
+                    if logical { "pressed" } else { "released" },
+                    if gpio.level { "high" } else { "low" }
+                );
+            }
+            return Ok(());
+        }
+        previous = Some(gpio.level);
+        if timeout_ms.is_some_and(|timeout| started.elapsed().as_millis() >= timeout.into()) {
+            return Err(format!("timed out waiting for GP{pin}").into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn snapshot_pin(client: &mut Client, serial: &str, pin: u8) -> Result<GpioInfo, Box<dyn Error>> {
+    match client.request(&ControlRequest::GpioSnapshot {
+        serial: serial.into(),
+    })? {
+        ControlResponse::GpioSnapshot { gpio } => gpio
+            .into_iter()
+            .find(|gpio| gpio.pin == pin)
+            .ok_or_else(|| format!("GP{pin} is not configured as GPIO").into()),
+        response => Err(response_error(response).into()),
     }
 }
 
@@ -363,6 +698,44 @@ fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {
                 print_board(board)
             }
             ControlResponse::Ok => println!("ok"),
+            ControlResponse::Adc {
+                channel,
+                raw,
+                reference_mv,
+                resolution_bits,
+            } => {
+                let millivolts =
+                    u32::from(*raw) * u32::from(*reference_mv) / ((1_u32 << *resolution_bits) - 1);
+                println!("ADC{channel}: {raw} raw, {millivolts} mV");
+            }
+            ControlResponse::Pwm { pwm } => {
+                println!(
+                    "PWM{}: {} period={}ns duty={}ns polarity={}",
+                    pwm.channel,
+                    if pwm.enabled { "enabled" } else { "disabled" },
+                    pwm.period_ns,
+                    pwm.duty_ns,
+                    if pwm.inverted { "inverted" } else { "normal" }
+                );
+            }
+            ControlResponse::GpioSnapshot { gpio } => {
+                for gpio in gpio {
+                    println!(
+                        "GP{:<2} {:<6} {} bias={:?}",
+                        gpio.pin,
+                        if gpio.output { "output" } else { "input" },
+                        if gpio.level { "high" } else { "low" },
+                        gpio.bias
+                    );
+                }
+            }
+            ControlResponse::Gpio { gpio } => println!(
+                "GP{}: {} {} bias={:?}",
+                gpio.pin,
+                if gpio.output { "output" } else { "input" },
+                if gpio.level { "high" } else { "low" },
+                gpio.bias
+            ),
             ControlResponse::Error { message, .. } => eprintln!("{message}"),
         }
     }
@@ -392,6 +765,13 @@ fn board_summary(board: &BoardInfo) -> String {
                     .into_iter()
                     .filter(|&peripheral| map.is_enabled(peripheral))
                     .map(peripheral_name)
+                    .chain(
+                        PinSignal::ALL
+                            .into_iter()
+                            .filter(|signal| signal.serial_peripheral().is_none())
+                            .filter(|&signal| map.is_signal_enabled(signal))
+                            .map(signal_name),
+                    )
                     .collect::<Vec<_>>()
                     .join(",")
             }
@@ -458,6 +838,28 @@ fn print_map(label: &str, config: PinMapConfig) {
             );
         }
     }
+    for signal in PinSignal::ALL
+        .into_iter()
+        .filter(|signal| signal.serial_peripheral().is_none())
+    {
+        let details = signal.clock_output().map_or_else(String::new, |output| {
+            format!(
+                " source={:?} target={}Hz",
+                map.clock_sources[output], map.clock_hz[output]
+            )
+        });
+        println!(
+            "  {:10} {:8} GP{}{}",
+            signal_name(signal),
+            if map.is_signal_enabled(signal) {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            map.pin(signal),
+            details
+        );
+    }
     let gpio = map.gpio_pins().unwrap();
     print!("  gpio      ");
     for (index, pin) in gpio.as_slice().iter().enumerate() {
@@ -506,6 +908,63 @@ fn parse_pin(value: &str) -> Result<u8, String> {
         .unwrap_or(value)
         .parse()
         .map_err(|_| format!("expected a GPIO number, got {value:?}"))
+}
+
+fn parse_signal(value: &str) -> Result<PinSignal, String> {
+    let normalized = value.to_ascii_lowercase().replace('-', "_");
+    PinSignal::ALL
+        .into_iter()
+        .find(|&signal| signal_name(signal) == normalized)
+        .ok_or_else(|| format!("unknown pin signal {value:?}"))
+}
+
+fn parse_route(value: &str) -> Result<(PinSignal, u8), String> {
+    let (signal, pin) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected SIGNAL=PIN, got {value:?}"))?;
+    Ok((parse_signal(signal)?, parse_pin(pin)?))
+}
+
+fn parse_clock_output(value: &str) -> Result<usize, String> {
+    match value
+        .strip_prefix("clock")
+        .or_else(|| value.strip_prefix("CLOCK"))
+        .unwrap_or(value)
+    {
+        "0" => Ok(0),
+        "1" => Ok(1),
+        _ => Err(format!("expected clock output 0 or 1, got {value:?}")),
+    }
+}
+
+fn parse_clock_source(value: &str) -> Result<(usize, ClockSource), String> {
+    let (output, source) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected OUTPUT=SOURCE, got {value:?}"))?;
+    let source = match source.to_ascii_lowercase().replace('-', "_").as_str() {
+        "system" | "sys" => ClockSource::System,
+        "reference" | "ref" => ClockSource::Reference,
+        "usb" => ClockSource::Usb,
+        "adc" => ClockSource::Adc,
+        "crystal" | "xosc" => ClockSource::Crystal,
+        "ring_oscillator" | "rosc" => ClockSource::RingOscillator,
+        "low_power_oscillator" | "lposc" => ClockSource::LowPowerOscillator,
+        _ => return Err(format!("unknown clock source {source:?}")),
+    };
+    Ok((parse_clock_output(output)?, source))
+}
+
+fn parse_clock_hz(value: &str) -> Result<(usize, u32), String> {
+    let (output, frequency) = value
+        .split_once('=')
+        .ok_or_else(|| format!("expected OUTPUT=HZ, got {value:?}"))?;
+    let frequency = frequency
+        .parse()
+        .map_err(|_| format!("invalid clock frequency {frequency:?}"))?;
+    if frequency == 0 {
+        return Err("clock frequency must be greater than zero".into());
+    }
+    Ok((parse_clock_output(output)?, frequency))
 }
 
 #[cfg(test)]
@@ -558,6 +1017,59 @@ mod tests {
                 "--disable-spi0-cs1",
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_auxiliary_routes_clocks_and_convenience_commands() {
+        let cli = Cli::try_parse_from([
+            "rp-extioctl",
+            "set",
+            "ABC",
+            "--route",
+            "pwm1a=GP18",
+            "--enable",
+            "adc0",
+            "--clock-source",
+            "0=xosc",
+            "--clock-hz",
+            "clock0=2000000",
+        ])
+        .unwrap();
+        let Command::Set(arguments) = cli.command else {
+            panic!("expected set command");
+        };
+        assert_eq!(arguments.routes, [(PinSignal::Pwm1A, 18)]);
+        assert_eq!(arguments.enable_signals, [PinSignal::Adc0]);
+        assert_eq!(arguments.clock_sources, [(0, ClockSource::Crystal)]);
+        assert_eq!(arguments.clock_hz, [(0, 2_000_000)]);
+
+        assert!(
+            Cli::try_parse_from([
+                "rp-extioctl",
+                "pwm",
+                "set",
+                "ABC",
+                "3",
+                "--frequency-hz",
+                "50",
+                "--duty-percent",
+                "7.5",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rp-extioctl",
+                "button",
+                "ABC",
+                "GP22",
+                "--wait",
+                "falling",
+                "--timeout-ms",
+                "1000",
+            ])
+            .is_ok()
         );
     }
 

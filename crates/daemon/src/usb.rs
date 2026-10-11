@@ -1,6 +1,8 @@
 use crate::{
     backend::{Backend, BackendReply, Transaction},
-    control::{BoardInfo, ConfigStore, ControlRequest, ControlResponse},
+    control::{
+        BoardInfo, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo, PwmInfo,
+    },
     kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
 };
 use async_trait::async_trait;
@@ -335,7 +337,253 @@ async fn handle_control(
             }
             ControlResponse::Ok
         }
+        ControlRequest::AdcRead { serial, channel } => {
+            let Some(id) = find_device(devices, &serial) else {
+                return disconnected(&serial);
+            };
+            let device = &devices[&id];
+            if channel as usize >= rp_extio_wire::ADC_CHANNEL_COUNT
+                || device.config.pin_map.adc_enabled & (1 << channel) == 0
+            {
+                return ControlResponse::error(
+                    "unsupported",
+                    format!("ADC{channel} is not enabled on {serial}"),
+                );
+            }
+            let reply = device.backend.transact(Transaction::Adc { channel }).await;
+            if let Some(error) = backend_error(reply.status, "ADC conversion") {
+                return error;
+            }
+            if reply.completed != 1 || reply.data.len() != 2 {
+                return ControlResponse::error("protocol", "invalid ADC conversion reply");
+            }
+            let registration = device.config.registration.adc.unwrap();
+            ControlResponse::Adc {
+                channel,
+                raw: u16::from_le_bytes(reply.data.try_into().unwrap()),
+                reference_mv: registration.reference_mv,
+                resolution_bits: registration.resolution_bits,
+            }
+        }
+        ControlRequest::PwmGet { serial, channel } => {
+            control_pwm(
+                devices,
+                &serial,
+                rp_extio_wire::PWM_GET,
+                PwmInfo {
+                    channel,
+                    enabled: false,
+                    inverted: false,
+                    period_ns: 0,
+                    duty_ns: 0,
+                },
+            )
+            .await
+        }
+        ControlRequest::PwmApply { serial, pwm } => {
+            control_pwm(devices, &serial, rp_extio_wire::PWM_APPLY, pwm).await
+        }
+        ControlRequest::GpioSnapshot { serial } => {
+            let Some(id) = find_device(devices, &serial) else {
+                return disconnected(&serial);
+            };
+            gpio_snapshot(&devices[&id]).await
+        }
+        ControlRequest::GpioOutput { serial, pin, value } => {
+            let Some(id) = find_device(devices, &serial) else {
+                return disconnected(&serial);
+            };
+            let device = &devices[&id];
+            let Some(line) = gpio_line(device, pin) else {
+                return ControlResponse::error(
+                    "unsupported",
+                    format!("GP{pin} is not configured as GPIO on {serial}"),
+                );
+            };
+            let reply = device
+                .backend
+                .transact(Transaction::Gpio {
+                    command: rp_extio_wire::GPIO_DIRECTION_OUTPUT,
+                    line,
+                    value: u8::from(value),
+                })
+                .await;
+            if let Some(error) = backend_error(reply.status, "GPIO output configuration") {
+                return error;
+            }
+            gpio_result(device, pin).await
+        }
+        ControlRequest::GpioInput { serial, pin, bias } => {
+            let Some(id) = find_device(devices, &serial) else {
+                return disconnected(&serial);
+            };
+            let device = &devices[&id];
+            let Some(line) = gpio_line(device, pin) else {
+                return ControlResponse::error(
+                    "unsupported",
+                    format!("GP{pin} is not configured as GPIO on {serial}"),
+                );
+            };
+            for (command, value) in [
+                (rp_extio_wire::GPIO_DIRECTION_INPUT, 0),
+                (rp_extio_wire::GPIO_SET_BIAS, bias.wire_value()),
+            ] {
+                let reply = device
+                    .backend
+                    .transact(Transaction::Gpio {
+                        command,
+                        line,
+                        value,
+                    })
+                    .await;
+                if let Some(error) = backend_error(reply.status, "GPIO input configuration") {
+                    return error;
+                }
+            }
+            gpio_result(device, pin).await
+        }
     }
+}
+
+fn disconnected(serial: &str) -> ControlResponse {
+    ControlResponse::error(
+        "disconnected",
+        format!("rp-extio board {serial} is not connected"),
+    )
+}
+
+fn backend_error(status: i32, operation: &str) -> Option<ControlResponse> {
+    let status = Status::try_from(status).unwrap_or(Status::BadFrame);
+    (status != Status::Ok).then(|| {
+        ControlResponse::error(
+            match status {
+                Status::Unsupported => "unsupported",
+                Status::Busy => "busy",
+                Status::Disconnected => "disconnected",
+                Status::Timeout => "timeout",
+                _ => "device",
+            },
+            format!("{operation} failed with {status:?}"),
+        )
+    })
+}
+
+async fn control_pwm(
+    devices: &HashMap<DeviceId, ConnectedDevice>,
+    serial: &str,
+    command: u8,
+    pwm: PwmInfo,
+) -> ControlResponse {
+    let Some(id) = find_device(devices, serial) else {
+        return disconnected(serial);
+    };
+    let device = &devices[&id];
+    if pwm.channel as usize >= rp_extio_wire::PWM_CHANNEL_COUNT
+        || device.config.pin_map.pwm_enabled & (1 << pwm.channel) == 0
+    {
+        return ControlResponse::error(
+            "unsupported",
+            format!("PWM channel {} is not enabled on {serial}", pwm.channel),
+        );
+    }
+    if pwm.duty_ns > pwm.period_ns || (pwm.enabled && pwm.period_ns == 0) {
+        return ControlResponse::error(
+            "invalid_pwm",
+            "PWM duty must not exceed its nonzero enabled period",
+        );
+    }
+    let reply = device
+        .backend
+        .transact(Transaction::Pwm {
+            command,
+            channel: pwm.channel,
+            enabled: pwm.enabled,
+            inverted: pwm.inverted,
+            period_ns: pwm.period_ns,
+            duty_ns: pwm.duty_ns,
+        })
+        .await;
+    if let Some(error) = backend_error(reply.status, "PWM operation") {
+        return error;
+    }
+    let Ok((reply_command, state)) = rp_extio_wire::PwmState::decode(&reply.data) else {
+        return ControlResponse::error("protocol", "invalid PWM reply");
+    };
+    if reply.completed != 1 || reply_command != command {
+        return ControlResponse::error("protocol", "mismatched PWM reply");
+    }
+    ControlResponse::Pwm { pwm: state.into() }
+}
+
+fn gpio_line(device: &ConnectedDevice, pin: u8) -> Option<u8> {
+    device
+        .config
+        .pin_map
+        .gpio_pins()
+        .ok()?
+        .as_slice()
+        .iter()
+        .position(|&candidate| candidate == pin)
+        .map(|line| line as u8)
+}
+
+async fn gpio_result(device: &ConnectedDevice, pin: u8) -> ControlResponse {
+    match gpio_snapshot(device).await {
+        ControlResponse::GpioSnapshot { gpio } => {
+            let Some(gpio) = gpio.into_iter().find(|gpio| gpio.pin == pin) else {
+                return ControlResponse::error("protocol", "configured GPIO disappeared");
+            };
+            ControlResponse::Gpio { gpio }
+        }
+        response => response,
+    }
+}
+
+async fn gpio_snapshot(device: &ConnectedDevice) -> ControlResponse {
+    let reply = device
+        .backend
+        .transact(Transaction::Gpio {
+            command: rp_extio_wire::GPIO_SNAPSHOT,
+            line: 0,
+            value: 0,
+        })
+        .await;
+    if let Some(error) = backend_error(reply.status, "GPIO snapshot") {
+        return error;
+    }
+    let Ok(data): Result<[u8; 16], _> = reply.data.try_into() else {
+        return ControlResponse::error("protocol", "invalid GPIO snapshot reply");
+    };
+    let levels = u32::from_le_bytes(data[0..4].try_into().unwrap());
+    let outputs = u32::from_le_bytes(data[4..8].try_into().unwrap());
+    let pull_ups = u32::from_le_bytes(data[8..12].try_into().unwrap());
+    let pull_downs = u32::from_le_bytes(data[12..16].try_into().unwrap());
+    let pins = device.config.pin_map.gpio_pins().unwrap();
+    if reply.completed != pins.len() as u32 {
+        return ControlResponse::error("protocol", "GPIO snapshot line count changed");
+    }
+    let gpio = pins
+        .as_slice()
+        .iter()
+        .enumerate()
+        .map(|(line, &pin)| {
+            let mask = 1 << line;
+            GpioInfo {
+                line: line as u8,
+                pin,
+                level: levels & mask != 0,
+                output: outputs & mask != 0,
+                bias: if pull_ups & mask != 0 {
+                    GpioBias::PullUp
+                } else if pull_downs & mask != 0 {
+                    GpioBias::PullDown
+                } else {
+                    GpioBias::None
+                },
+            }
+        })
+        .collect();
+    ControlResponse::GpioSnapshot { gpio }
 }
 
 async fn change_map(
