@@ -368,8 +368,11 @@ to input while cycling through pull-up, pull-down, and no internal bias. These
 live changes last until the pin map changes or the board disconnects. Press
 `w` to save the highlighted GPIO's current direction, output level, and bias
 for future daemon connections; `x` forgets that saved startup state. Saved
-GPIOs carry a `•` marker. These actions use the daemon's normal Polkit
-authorization.
+GPIOs carry a `•` marker. When a PWM signal is selected, the same keys save or
+forget its live enable, period, duty, and polarity. Clock enable, route, source,
+and frequency are already saved as part of the pin map; `w` reports that fact,
+and `x` directs you to disable and apply the clock in route mode. These actions
+use the daemon's normal Polkit authorization.
 
 Selecting an enabled ADC signal in operate mode continuously shows its raw and
 millivolt reading. Selecting an enabled PWM signal shows its runtime enable,
@@ -384,7 +387,7 @@ The persistent file is JSON and always contains complete maps:
 
 ```json
 {
-  "version": 4,
+  "version": 5,
   "boards": {
     "125DBCCF0BCA4BEF": {
       "uart0_enabled": true, "uart0_tx": 0, "uart0_rx": 1,
@@ -409,6 +412,10 @@ The persistent file is JSON and always contains complete maps:
       "gpio_startup": [
         {"direction": "output", "pin": 22, "value": true},
         {"direction": "input", "pin": 28, "bias": "pull_up"}
+      ],
+      "pwm_startup": [
+        {"channel": 6, "enabled": true, "inverted": false,
+         "period_ns": 1000000, "duty_ns": 250000}
       ]
     }
   }
@@ -419,14 +426,16 @@ Version-1 files are loaded by placing their routes on instance 0 and retaining
 the disabled instance-1 defaults. Version-2 maps gain disabled ADC, PWM, and
 clock functions. Version-2 maps without the CS1 enable fields load with both
 second chip selects enabled. Versions 1 through 3 gain an empty GPIO startup
-list; the next successful save writes version 4.
+list, and versions 1 through 4 gain an empty PWM startup list. The next
+successful save writes version 5.
 
-The daemon validates saved GPIO states against the same board object's map.
-Duplicate entries and pins owned by an enabled peripheral are rejected. A map
-change cannot claim a pin with saved GPIO state; forget that state first.
-`rp-extioctl default SERIAL` removes both the custom map and every saved GPIO
-state. `rp-extioctl reload` rereads and reapplies maps and GPIO startup state to
-connected boards.
+The daemon validates saved GPIO and PWM states against the same board object's
+map. Duplicate entries, GPIO pins owned by an enabled peripheral, invalid PWM
+timing, and PWM channels not enabled in the map are rejected. A map change
+cannot claim a saved GPIO pin or disable a PWM channel with saved state; forget
+that state first. `rp-extioctl default SERIAL` removes the custom map and all
+saved GPIO/PWM state. `rp-extioctl reload` rereads and reapplies maps and
+startup state to connected boards.
 
 This release uses USB protocol major 3 and kernel ABI major 3. Rebuild and
 install the module and daemon, and flash the matching firmware as one upgrade;
@@ -531,6 +540,10 @@ through the CLI, or use the standard `/sys/class/pwm/pwmchipN` interface:
 rp-extioctl pwm get 125DBCCF0BCA4BEF 2
 rp-extioctl pwm set 125DBCCF0BCA4BEF 2 --frequency-hz 1000 --duty-percent 25
 rp-extioctl pwm disable 125DBCCF0BCA4BEF 2
+rp-extioctl pwm set 125DBCCF0BCA4BEF 2 --frequency-hz 1000 \
+  --duty-percent 25 --persist
+rp-extioctl pwm disable 125DBCCF0BCA4BEF 2 --persist
+rp-extioctl pwm forget 125DBCCF0BCA4BEF 2
 
 echo 2 > /sys/class/pwm/pwmchipN/export
 echo 1000000 > /sys/class/pwm/pwmchipN/pwm2/period
@@ -541,6 +554,13 @@ echo 1 > /sys/class/pwm/pwmchipN/pwm2/enable
 Writes to the PWM sysfs interface normally require the host's standard device
 permissions. The `rp-extioctl` mutation path instead requests Polkit
 authorization from the active session.
+
+Without `--persist`, PWM state lasts until another command, reconfiguration,
+disconnect, or daemon restart. Persist only on a resistor-protected LED or a
+load known to tolerate the waveform. The firmware does not produce the saved
+waveform before USB enumeration; the daemon applies it after restoring the pin
+map. Clock outputs differ: their complete state is already part of the saved
+pin map configured with `rp-extioctl set`.
 
 ## Simulator
 

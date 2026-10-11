@@ -641,6 +641,26 @@ both must run concurrently. While A is active, request a different period on B
 and require a `busy` error without disturbing A. Disable A, change B's period,
 and confirm the change now succeeds.
 
+On the resistor-protected LED fixture, save a 1 kHz 25% waveform and verify
+daemon-owned startup restoration:
+
+```sh
+rp-extioctl pwm set SERIAL CHANNEL --frequency-hz 1000 \
+  --duty-percent 25 --persist
+systemctl restart rp-extiod.service
+rp-extioctl pwm get SERIAL CHANNEL
+rp-extioctl pwm forget SERIAL CHANNEL
+```
+
+Confirm the waveform returns after service restart, Pico reset/reconnect, pin
+map reapplication, and `rp-extioctl reload`. In TUI operate mode, select the
+enabled PWM signal, press `w`, and confirm its saved settings and `•` marker;
+change the live waveform and reload to restore it, then press `x` to forget it.
+Attempting to disable or reroute a channel with saved PWM state must fail until
+the state is forgotten. `rp-extioctl default SERIAL` must clear both GPIO and
+PWM startup entries. Do not use a servo or another mechanically active load for
+automatic-start testing.
+
 ### PWM servo fixture
 
 A small servo provides a pulse-width integration test, but power it from a
@@ -664,6 +684,8 @@ signal.
 - Different slices run independently and survive concurrent ADC, serial-bus,
   and GPIO activity.
 - Disable, reconfiguration, daemon stop, and disconnect leave no waveform.
+- Saved PWM state returns after daemon restart, Pico reconnect, map
+  reapplication, and configuration reload, and can be forgotten independently.
 
 ## Clock-output fixture
 
@@ -674,6 +696,13 @@ source and measure it with a logic analyser or frequency counter:
 rp-extioctl set SERIAL --route clock0=GP13 --enable clock0 \
   --clock-source 0=system --clock-hz 0=1000000
 ```
+
+Clock output enable, route, source, and frequency are persisted directly in
+the pin map; there is no separate runtime startup record. Restart the daemon
+and reset/reconnect the Pico, confirming the clock returns after each. In TUI
+operate mode, selecting the clock and pressing `w` must report that it is
+already persisted. Disable it in route mode and apply to remove the startup
+clock output.
 
 Confirm `show` reports the effective quantized frequency. Repeat representative
 frequencies from each source: system, reference, USB, ADC, crystal, ring
