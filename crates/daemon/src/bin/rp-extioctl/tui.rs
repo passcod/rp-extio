@@ -10,17 +10,23 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
 use rp_extio_wire::{
     ClockSource, DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError,
 };
-use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, signal_name};
-use std::{error::Error, io::stdout};
+use rp_extiod::control::{
+    BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, PwmInfo, signal_name,
+};
+use std::{
+    error::Error,
+    io::stdout,
+    time::{Duration, Instant},
+};
 
 const HEADER_ROWS: usize = 20;
 const MIN_WIDTH: u16 = 54;
-const MIN_HEIGHT: u16 = 12;
+const MIN_HEIGHT: u16 = 14;
 const WIDE_WIDTH: u16 = 92;
 const CENTER_WIDTH: u16 = 8;
 
@@ -105,6 +111,36 @@ impl TerminalGuard {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UiMode {
+    Route,
+    Operate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AdcReading {
+    channel: u8,
+    raw: u16,
+    reference_mv: u16,
+    resolution_bits: u8,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PwmField {
+    Frequency,
+    Duty,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PwmEditor {
+    channel: u8,
+    frequency_hz: String,
+    duty_percent: String,
+    enabled: bool,
+    inverted: bool,
+    field: PwmField,
+}
+
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
@@ -121,6 +157,14 @@ struct App {
     edited: Option<PinMap>,
     grouped: bool,
     flipped: bool,
+    mode: UiMode,
+    gpio: Vec<GpioInfo>,
+    adc: Option<AdcReading>,
+    pwm: Option<PwmInfo>,
+    pwm_editor: Option<PwmEditor>,
+    button_active_low: bool,
+    telemetry_error: Option<String>,
+    last_refresh: Instant,
     default_pending: bool,
     message: String,
     message_error: bool,
@@ -148,6 +192,11 @@ impl App {
         }
     }
 
+    fn selected_gpio(&self) -> Option<GpioInfo> {
+        let pin = self.selected_pin().gpio?;
+        self.gpio.iter().find(|gpio| gpio.pin == pin).copied()
+    }
+
     fn screen_cursor_row(&self) -> usize {
         self.cursor_row
     }
@@ -159,6 +208,14 @@ impl App {
     fn clear_message(&mut self) {
         self.message.clear();
         self.message_error = false;
+    }
+
+    fn toggle_mode(&mut self) {
+        self.mode = match self.mode {
+            UiMode::Route => UiMode::Operate,
+            UiMode::Operate => UiMode::Route,
+        };
+        self.clear_message();
     }
 
     fn load_current(&mut self) {
@@ -175,6 +232,7 @@ impl App {
         }
         self.board = (self.board as isize + delta).rem_euclid(self.boards.len() as isize) as usize;
         self.load_current();
+        self.clear_telemetry();
     }
 
     fn cycle_signal(&mut self, delta: isize) {
@@ -182,6 +240,8 @@ impl App {
             (self.signal as isize + delta).rem_euclid(PinSignal::ALL.len() as isize) as usize;
         self.move_to_signal_pin();
         self.clear_message();
+        self.adc = None;
+        self.pwm = None;
     }
 
     fn move_to_signal_pin(&mut self) {
@@ -205,6 +265,14 @@ impl App {
             (self.cursor_row as isize + row_delta).clamp(0, HEADER_ROWS as isize - 1) as usize;
         self.cursor_side = (self.cursor_side as isize + side_delta).clamp(0, 1) as usize;
         self.clear_message();
+    }
+
+    fn clear_telemetry(&mut self) {
+        self.gpio.clear();
+        self.adc = None;
+        self.pwm = None;
+        self.telemetry_error = None;
+        self.last_refresh = Instant::now() - Duration::from_secs(1);
     }
 
     fn assign_selected(&mut self) {
@@ -393,6 +461,40 @@ impl App {
         self.message_error = false;
     }
 
+    fn open_pwm_editor(&mut self) {
+        let Some(channel) = self.selected_signal().pwm_channel() else {
+            self.message = "select a PWM signal to edit its output".into();
+            self.message_error = true;
+            return;
+        };
+        if !self
+            .active_map()
+            .is_some_and(|map| map.is_signal_enabled(self.selected_signal()))
+        {
+            self.message = format!("{} is not routed", display_signal(self.selected_signal()));
+            self.message_error = true;
+            return;
+        }
+        let pwm = self.pwm.filter(|pwm| pwm.channel == channel as u8);
+        let period_ns = pwm.map_or(1_000_000, |pwm| pwm.period_ns.max(1));
+        let frequency_hz = 1_000_000_000_u64
+            .saturating_add(period_ns / 2)
+            .checked_div(period_ns)
+            .unwrap_or(1);
+        let duty = pwm.map_or(50.0, |pwm| {
+            pwm.duty_ns as f64 * 100.0 / pwm.period_ns.max(1) as f64
+        });
+        self.pwm_editor = Some(PwmEditor {
+            channel: channel as u8,
+            frequency_hz: frequency_hz.to_string(),
+            duty_percent: format!("{duty:.1}"),
+            enabled: pwm.is_some_and(|pwm| pwm.enabled),
+            inverted: pwm.is_some_and(|pwm| pwm.inverted),
+            field: PwmField::Frequency,
+        });
+        self.clear_message();
+    }
+
     fn load_default(&mut self) {
         if self.edited.is_none() {
             self.message = "board is disconnected".into();
@@ -456,20 +558,47 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         edited: None,
         grouped: true,
         flipped: false,
+        mode: UiMode::Route,
+        gpio: Vec::new(),
+        adc: None,
+        pwm: None,
+        pwm_editor: None,
+        button_active_low: true,
+        telemetry_error: None,
+        last_refresh: Instant::now() - Duration::from_secs(1),
         default_pending: false,
         message: String::new(),
         message_error: false,
     };
     app.load_current();
+    refresh_telemetry(client, &mut app);
 
     let _guard = TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))?;
+    let mut redraw = true;
     loop {
-        terminal.draw(|frame| draw(frame, &app))?;
+        if redraw {
+            terminal.draw(|frame| draw(frame, &app))?;
+            redraw = false;
+        }
+        if !event::poll(Duration::from_millis(200))? {
+            if app.mode == UiMode::Operate
+                && app.pwm_editor.is_none()
+                && app.last_refresh.elapsed() >= Duration::from_millis(250)
+            {
+                redraw = refresh_telemetry(client, &mut app);
+            }
+            continue;
+        }
         let Event::Key(key) = event::read()? else {
             continue;
         };
         if key.kind != KeyEventKind::Press {
+            continue;
+        }
+        if app.pwm_editor.is_some() {
+            handle_pwm_editor_key(client, &mut app, key.code)?;
+            redraw = true;
             continue;
         }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -477,32 +606,78 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         }
         match key.code {
             KeyCode::Char('q') | KeyCode::Esc => break,
-            KeyCode::Char('[') => app.switch_board(-1),
-            KeyCode::Char(']') => app.switch_board(1),
+            KeyCode::Char('[') => {
+                app.switch_board(-1);
+                refresh_telemetry(client, &mut app);
+            }
+            KeyCode::Char(']') => {
+                app.switch_board(1);
+                refresh_telemetry(client, &mut app);
+            }
             KeyCode::Up => app.move_cursor(-1, 0),
             KeyCode::Down => app.move_cursor(1, 0),
             KeyCode::Left => app.move_cursor(0, -1),
             KeyCode::Right => app.move_cursor(0, 1),
-            KeyCode::Tab => app.cycle_signal(1),
-            KeyCode::BackTab => app.cycle_signal(-1),
-            KeyCode::Enter | KeyCode::Char(' ') => app.assign_selected(),
-            KeyCode::Char('g') => app.toggle_grouped(),
-            KeyCode::Char('e') => app.toggle_selected_enabled(),
+            KeyCode::Tab => {
+                app.cycle_signal(1);
+                refresh_telemetry(client, &mut app);
+            }
+            KeyCode::BackTab => {
+                app.cycle_signal(-1);
+                refresh_telemetry(client, &mut app);
+            }
+            KeyCode::Char('v') => {
+                app.toggle_mode();
+                refresh_telemetry(client, &mut app);
+            }
             KeyCode::Char('f') => app.flip(),
-            KeyCode::Char('s') => app.cycle_clock_source(),
-            KeyCode::Char('+') | KeyCode::Char('=') => app.adjust_clock_frequency(true),
-            KeyCode::Char('-') => app.adjust_clock_frequency(false),
-            KeyCode::Char('u') => app.undo(),
-            KeyCode::Char('d') => app.load_default(),
+            KeyCode::Enter | KeyCode::Char(' ') if app.mode == UiMode::Route => {
+                app.assign_selected()
+            }
+            KeyCode::Char('g') if app.mode == UiMode::Route => app.toggle_grouped(),
+            KeyCode::Char('e') if app.mode == UiMode::Route => app.toggle_selected_enabled(),
+            KeyCode::Char('s') if app.mode == UiMode::Route => app.cycle_clock_source(),
+            KeyCode::Char('+') | KeyCode::Char('=') if app.mode == UiMode::Route => {
+                app.adjust_clock_frequency(true)
+            }
+            KeyCode::Char('-') if app.mode == UiMode::Route => app.adjust_clock_frequency(false),
+            KeyCode::Char('u') if app.mode == UiMode::Route => app.undo(),
+            KeyCode::Char('d') if app.mode == UiMode::Route => app.load_default(),
+            KeyCode::Char('a') if app.mode == UiMode::Route => apply(client, &mut app)?,
+            KeyCode::Char('0') if app.mode == UiMode::Operate => {
+                set_gpio_output(client, &mut app, false)?
+            }
+            KeyCode::Char('1') if app.mode == UiMode::Operate => {
+                set_gpio_output(client, &mut app, true)?
+            }
+            KeyCode::Char('t') | KeyCode::Enter | KeyCode::Char(' ')
+                if app.mode == UiMode::Operate =>
+            {
+                operate_default(client, &mut app)?
+            }
+            KeyCode::Char('i') if app.mode == UiMode::Operate => {
+                cycle_gpio_input(client, &mut app)?
+            }
+            KeyCode::Char('b') if app.mode == UiMode::Operate => {
+                app.button_active_low = !app.button_active_low;
+                app.message = format!(
+                    "button interpretation is now active {}",
+                    if app.button_active_low { "low" } else { "high" }
+                );
+                app.message_error = false;
+            }
+            KeyCode::Char('p') if app.mode == UiMode::Operate => app.open_pwm_editor(),
             KeyCode::Char('r') => {
                 let serial = app.current().map(|board| board.serial.clone());
                 app.refresh(client, serial.as_deref())?;
+                refresh_telemetry(client, &mut app);
                 app.message = "refreshed".into();
                 app.message_error = false;
             }
             KeyCode::Char('l') => match client.request(&ControlRequest::Reload)? {
                 ControlResponse::Ok => {
                     app.refresh(client, None)?;
+                    refresh_telemetry(client, &mut app);
                     app.message = "configuration reloaded".into();
                     app.message_error = false;
                 }
@@ -515,9 +690,9 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
                     app.message_error = true;
                 }
             },
-            KeyCode::Char('a') => apply(client, &mut app)?,
             _ => {}
         }
+        redraw = true;
     }
     Ok(())
 }
@@ -580,6 +755,272 @@ fn apply(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
+    let previous = (
+        app.gpio.clone(),
+        app.adc,
+        app.pwm,
+        app.telemetry_error.clone(),
+    );
+    app.last_refresh = Instant::now();
+    app.telemetry_error = None;
+    let Some(board) = app.current().cloned().filter(|board| board.connected) else {
+        app.gpio.clear();
+        app.adc = None;
+        app.pwm = None;
+        return previous
+            != (
+                app.gpio.clone(),
+                app.adc,
+                app.pwm,
+                app.telemetry_error.clone(),
+            );
+    };
+    match client.request(&ControlRequest::GpioSnapshot {
+        serial: board.serial.clone(),
+    }) {
+        Ok(ControlResponse::GpioSnapshot { gpio }) => app.gpio = gpio,
+        Ok(ControlResponse::Error { message, .. }) => app.telemetry_error = Some(message),
+        Ok(_) => app.telemetry_error = Some("unexpected GPIO snapshot response".into()),
+        Err(error) => app.telemetry_error = Some(error.to_string()),
+    }
+    let Some(map) = board.active.map(PinMap::from) else {
+        return previous
+            != (
+                app.gpio.clone(),
+                app.adc,
+                app.pwm,
+                app.telemetry_error.clone(),
+            );
+    };
+    let signal = app.selected_signal();
+    app.adc = None;
+    app.pwm = None;
+    if let Some(channel) = signal.adc_channel()
+        && map.is_signal_enabled(signal)
+    {
+        match client.request(&ControlRequest::AdcRead {
+            serial: board.serial,
+            channel: channel as u8,
+        }) {
+            Ok(ControlResponse::Adc {
+                channel,
+                raw,
+                reference_mv,
+                resolution_bits,
+            }) => {
+                app.adc = Some(AdcReading {
+                    channel,
+                    raw,
+                    reference_mv,
+                    resolution_bits,
+                });
+            }
+            Ok(ControlResponse::Error { message, .. }) => app.telemetry_error = Some(message),
+            Ok(_) => app.telemetry_error = Some("unexpected ADC response".into()),
+            Err(error) => app.telemetry_error = Some(error.to_string()),
+        }
+    } else if let Some(channel) = signal.pwm_channel()
+        && map.is_signal_enabled(signal)
+    {
+        match client.request(&ControlRequest::PwmGet {
+            serial: board.serial,
+            channel: channel as u8,
+        }) {
+            Ok(ControlResponse::Pwm { pwm }) => app.pwm = Some(pwm),
+            Ok(ControlResponse::Error { message, .. }) => app.telemetry_error = Some(message),
+            Ok(_) => app.telemetry_error = Some("unexpected PWM response".into()),
+            Err(error) => app.telemetry_error = Some(error.to_string()),
+        }
+    }
+    previous
+        != (
+            app.gpio.clone(),
+            app.adc,
+            app.pwm,
+            app.telemetry_error.clone(),
+        )
+}
+
+fn set_gpio_output(client: &mut Client, app: &mut App, value: bool) -> Result<(), Box<dyn Error>> {
+    let Some(pin) = app.selected_pin().gpio else {
+        set_app_error(app, "select a GPIO pin");
+        return Ok(());
+    };
+    let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+        set_app_error(app, "no board selected");
+        return Ok(());
+    };
+    handle_gpio_response(
+        app,
+        client.request(&ControlRequest::GpioOutput { serial, pin, value })?,
+        format!("GP{pin} driven {}", if value { "high" } else { "low" }),
+    );
+    refresh_telemetry(client, app);
+    Ok(())
+}
+
+fn cycle_gpio_input(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    let Some(pin) = app.selected_pin().gpio else {
+        set_app_error(app, "select a GPIO pin");
+        return Ok(());
+    };
+    let bias = match app.selected_gpio().map(|gpio| gpio.bias) {
+        Some(GpioBias::None) | None => GpioBias::PullUp,
+        Some(GpioBias::PullUp) => GpioBias::PullDown,
+        Some(GpioBias::PullDown) => GpioBias::None,
+    };
+    let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+        set_app_error(app, "no board selected");
+        return Ok(());
+    };
+    handle_gpio_response(
+        app,
+        client.request(&ControlRequest::GpioInput { serial, pin, bias })?,
+        format!("GP{pin} configured as input with {}", bias_name(bias)),
+    );
+    refresh_telemetry(client, app);
+    Ok(())
+}
+
+fn operate_default(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    if app.selected_signal().pwm_channel().is_some() {
+        app.open_pwm_editor();
+    } else if app.selected_signal().adc_channel().is_some() {
+        refresh_telemetry(client, app);
+        if app.adc.is_some() {
+            app.message = "ADC sample refreshed".into();
+            app.message_error = false;
+        }
+    } else if let Some(gpio) = app.selected_gpio() {
+        set_gpio_output(client, app, !gpio.level)?;
+    } else {
+        set_app_error(
+            app,
+            "highlight a configured GPIO, or select an ADC/PWM signal",
+        );
+    }
+    Ok(())
+}
+
+fn handle_gpio_response(app: &mut App, response: ControlResponse, success: String) {
+    match response {
+        ControlResponse::Gpio { gpio } => {
+            if let Some(current) = app.gpio.iter_mut().find(|current| current.pin == gpio.pin) {
+                *current = gpio;
+            }
+            app.message = success;
+            app.message_error = false;
+        }
+        ControlResponse::Error { message, .. } => set_app_error(app, message),
+        _ => set_app_error(app, "unexpected GPIO response"),
+    }
+}
+
+fn set_app_error(app: &mut App, message: impl Into<String>) {
+    app.message = message.into();
+    app.message_error = true;
+}
+
+fn handle_pwm_editor_key(
+    client: &mut Client,
+    app: &mut App,
+    key: KeyCode,
+) -> Result<(), Box<dyn Error>> {
+    match key {
+        KeyCode::Esc => {
+            app.pwm_editor = None;
+            app.message = "PWM edit cancelled".into();
+            app.message_error = false;
+        }
+        KeyCode::Tab | KeyCode::BackTab => {
+            let editor = app.pwm_editor.as_mut().unwrap();
+            editor.field = match editor.field {
+                PwmField::Frequency => PwmField::Duty,
+                PwmField::Duty => PwmField::Frequency,
+            };
+        }
+        KeyCode::Char('e') => {
+            let editor = app.pwm_editor.as_mut().unwrap();
+            editor.enabled = !editor.enabled;
+        }
+        KeyCode::Char('i') => {
+            let editor = app.pwm_editor.as_mut().unwrap();
+            editor.inverted = !editor.inverted;
+        }
+        KeyCode::Backspace => {
+            let editor = app.pwm_editor.as_mut().unwrap();
+            match editor.field {
+                PwmField::Frequency => {
+                    editor.frequency_hz.pop();
+                }
+                PwmField::Duty => {
+                    editor.duty_percent.pop();
+                }
+            }
+        }
+        KeyCode::Char(character) if character.is_ascii_digit() || character == '.' => {
+            let editor = app.pwm_editor.as_mut().unwrap();
+            let field = match editor.field {
+                PwmField::Frequency => &mut editor.frequency_hz,
+                PwmField::Duty => &mut editor.duty_percent,
+            };
+            if character != '.' || (editor.field == PwmField::Duty && !field.contains('.')) {
+                field.push(character);
+            }
+        }
+        KeyCode::Enter => apply_pwm_editor(client, app)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn apply_pwm_editor(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    let editor = app.pwm_editor.as_ref().unwrap();
+    let frequency_hz = match editor.frequency_hz.parse::<u64>() {
+        Ok(frequency) if frequency > 0 => frequency,
+        _ => {
+            set_app_error(app, "PWM frequency must be a positive integer");
+            return Ok(());
+        }
+    };
+    let duty_percent = match editor.duty_percent.parse::<f64>() {
+        Ok(duty) if duty.is_finite() && (0.0..=100.0).contains(&duty) => duty,
+        _ => {
+            set_app_error(app, "PWM duty must be between 0 and 100 percent");
+            return Ok(());
+        }
+    };
+    let period_ns = (1_000_000_000_f64 / frequency_hz as f64).round() as u64;
+    if period_ns == 0 {
+        set_app_error(app, "PWM frequency is too high");
+        return Ok(());
+    }
+    let pwm = PwmInfo {
+        channel: editor.channel,
+        enabled: editor.enabled,
+        inverted: editor.inverted,
+        period_ns,
+        duty_ns: (period_ns as f64 * duty_percent / 100.0).round() as u64,
+    };
+    let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+        set_app_error(app, "no board selected");
+        return Ok(());
+    };
+    match client.request(&ControlRequest::PwmApply { serial, pwm })? {
+        ControlResponse::Pwm { pwm } => {
+            app.pwm = Some(pwm);
+            app.pwm_editor = None;
+            app.message = format!("PWM{} output applied", pwm.channel);
+            app.message_error = false;
+            refresh_telemetry(client, app);
+        }
+        ControlResponse::Error { message, .. } => set_app_error(app, message),
+        _ => set_app_error(app, "unexpected PWM response"),
+    }
+    Ok(())
+}
+
 fn draw(frame: &mut Frame<'_>, app: &App) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -599,8 +1040,8 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
         .constraints([
             Constraint::Length(3),
             Constraint::Min(5),
+            Constraint::Length(4),
             Constraint::Length(3),
-            Constraint::Length(2),
         ])
         .split(area);
     draw_header(frame, rows[0], app);
@@ -617,16 +1058,23 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     }
     draw_status(frame, rows[2], app);
     let assignment_mode = if app.grouped { "grouped" } else { "single" };
-    let help = if area.width >= 72 {
+    let help = if app.mode == UiMode::Operate && area.width >= 72 {
+        "arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\nb button polarity  v route mode  f flip  r refresh  [/] board  q quit".into()
+    } else if app.mode == UiMode::Operate {
+        "arrows/Tab select  Enter/t act  0/1 output  i input\np PWM  b polarity  v route  r refresh  q quit".into()
+    } else if area.width >= 72 {
         format!(
-            "arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nf flip  s clock source  +/- clock Hz  d defaults  u undo  r refresh  q quit"
+            "arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nv operate mode  f flip  s clock source  +/- clock Hz  d defaults  u undo  r refresh  q quit"
         )
     } else {
         format!(
-            "arrows/Tab select  Enter assign  e enable  g {assignment_mode}\na apply  f flip  d defaults  u undo  r refresh  q quit"
+            "arrows/Tab select  Enter assign  e enable  g {assignment_mode}\na apply  v operate  f flip  d defaults  u undo  r refresh  q quit"
         )
     };
     frame.render_widget(Paragraph::new(help), rows[3]);
+    if app.pwm_editor.is_some() {
+        draw_pwm_editor(frame, app);
+    }
 }
 
 fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -667,14 +1115,18 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
         },
     );
     let dirty = if app.dirty() { " • DRAFT" } else { "" };
+    let mode = match app.mode {
+        UiMode::Route => "ROUTE",
+        UiMode::Operate => "OPERATE",
+    };
     frame.render_widget(
         Paragraph::new(format!(
-            "{summary}  │  {} → {route}{dirty}",
+            "{mode}  {summary}  │  {} → {route}{dirty}",
             display_signal(selected)
         ))
         .block(
             Block::default()
-                .title("rp-extio · Pico 2 pin routing")
+                .title("rp-extio · Pico 2")
                 .borders(Borders::ALL),
         ),
         area,
@@ -845,7 +1297,12 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
         .into_iter()
         .filter(|&signal| map.is_signal_enabled(signal) && map.pin(signal) == gpio)
         .collect::<Vec<_>>();
-    let role = if signals.is_empty() {
+    let role = if signals.is_empty() && app.mode == UiMode::Operate {
+        app.gpio
+            .iter()
+            .find(|state| state.pin == gpio)
+            .map_or_else(|| "GPIO".into(), gpio_pin_role)
+    } else if signals.is_empty() {
         "GPIO".into()
     } else {
         signals
@@ -897,8 +1354,10 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let validation = app.edited.and_then(|map| map.validate().err());
-    let text = if !app.message.is_empty() {
+    let message = if !app.message.is_empty() {
         app.message.clone()
+    } else if let Some(error) = &app.telemetry_error {
+        error.clone()
     } else if let Some(error) = validation {
         rp_extiod::control::format_validation(error)
     } else if app.dirty() {
@@ -906,7 +1365,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "active map; move to a valid highlighted GPIO and press Enter to assign".into()
     };
-    let style = if validation.is_some() || app.message_error {
+    let detail = selected_runtime_detail(app);
+    let style = if validation.is_some() || app.message_error || app.telemetry_error.is_some() {
         Style::default().fg(Color::Red)
     } else if app.dirty() {
         Style::default().fg(Color::Yellow)
@@ -914,11 +1374,173 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Style::default().fg(Color::Green)
     };
     frame.render_widget(
-        Paragraph::new(text)
+        Paragraph::new(format!("{detail}\n{message}"))
             .style(style)
             .block(Block::default().title("Status").borders(Borders::ALL)),
         area,
     );
+}
+
+fn gpio_pin_role(gpio: &GpioInfo) -> String {
+    let direction = if gpio.output { "O" } else { "I" };
+    let bias = match gpio.bias {
+        GpioBias::None => "",
+        GpioBias::PullUp => "↑",
+        GpioBias::PullDown => "↓",
+    };
+    format!(
+        "GPIO {direction}{bias} {}",
+        if gpio.level { "H" } else { "L" }
+    )
+}
+
+fn selected_runtime_detail(app: &App) -> String {
+    if app.mode == UiMode::Route {
+        let signal = app.selected_signal();
+        return app.edited.map_or_else(
+            || "No active route map".into(),
+            |map| {
+                format!(
+                    "Route: {} → GP{} · {} · {} assignment",
+                    display_signal(signal),
+                    map.pin(signal),
+                    if map.is_signal_enabled(signal) {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    },
+                    if app.grouped { "grouped" } else { "individual" }
+                )
+            },
+        );
+    }
+    if let Some(adc) = app.adc {
+        let millivolts =
+            u32::from(adc.raw) * u32::from(adc.reference_mv) / (1_u32 << adc.resolution_bits);
+        return format!("ADC{}: {} raw · {} mV", adc.channel, adc.raw, millivolts);
+    }
+    if let Some(pwm) = app.pwm {
+        let frequency = if pwm.period_ns == 0 {
+            0
+        } else {
+            1_000_000_000_u64 / pwm.period_ns
+        };
+        let duty = if pwm.period_ns == 0 {
+            0.0
+        } else {
+            pwm.duty_ns as f64 * 100.0 / pwm.period_ns as f64
+        };
+        return format!(
+            "PWM{}: {} · {frequency} Hz · {duty:.1}% · {}",
+            pwm.channel,
+            if pwm.enabled {
+                "output enabled"
+            } else {
+                "output disabled"
+            },
+            if pwm.inverted { "inverted" } else { "normal" }
+        );
+    }
+    if let Some(gpio) = app.selected_gpio() {
+        let button = if gpio.level != app.button_active_low {
+            "pressed"
+        } else {
+            "released"
+        };
+        return format!(
+            "GP{}: {} · {} · bias {} · button {} ({})",
+            gpio.pin,
+            if gpio.level { "HIGH" } else { "LOW" },
+            if gpio.output { "output" } else { "input" },
+            bias_name(gpio.bias),
+            button,
+            if app.button_active_low {
+                "active low"
+            } else {
+                "active high"
+            }
+        );
+    }
+    if let Some(output) = app.selected_signal().clock_output()
+        && let Some(map) = app.active_map()
+    {
+        return format!(
+            "CLOCK{output}: {:?} · target {} Hz · {}",
+            map.clock_sources[output],
+            map.clock_hz[output],
+            if map.is_signal_enabled(app.selected_signal()) {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    }
+    "No live state for this selection".into()
+}
+
+fn bias_name(bias: GpioBias) -> &'static str {
+    match bias {
+        GpioBias::None => "none",
+        GpioBias::PullUp => "pull-up",
+        GpioBias::PullDown => "pull-down",
+    }
+}
+
+fn draw_pwm_editor(frame: &mut Frame<'_>, app: &App) {
+    let editor = app.pwm_editor.as_ref().unwrap();
+    let area = centered_rect(54, 9, frame.area());
+    frame.render_widget(Clear, area);
+    let frequency_style = if editor.field == PwmField::Frequency {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::default()
+    };
+    let duty_style = if editor.field == PwmField::Duty {
+        Style::default().fg(Color::Black).bg(Color::White)
+    } else {
+        Style::default()
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::raw("Frequency (Hz): "),
+            Span::styled(editor.frequency_hz.clone(), frequency_style),
+        ]),
+        Line::from(vec![
+            Span::raw("Duty (%):      "),
+            Span::styled(editor.duty_percent.clone(), duty_style),
+        ]),
+        Line::raw(format!(
+            "Output: {}    Polarity: {}",
+            if editor.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
+            if editor.inverted {
+                "inverted"
+            } else {
+                "normal"
+            }
+        )),
+        Line::raw("Tab field · e enable · i invert · Enter apply · Esc cancel"),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .title(format!("PWM{} output", editor.channel))
+                .borders(Borders::ALL),
+        ),
+        area,
+    );
+}
+
+fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width: width.min(area.width),
+        height: height.min(area.height),
+    }
 }
 
 fn centered_line(width: u16, text: String, style: Style) -> Line<'static> {
@@ -1335,6 +1957,14 @@ mod tests {
             edited: Some(DEFAULT_PIN_MAP),
             grouped: true,
             flipped: false,
+            mode: UiMode::Route,
+            gpio: Vec::new(),
+            adc: None,
+            pwm: None,
+            pwm_editor: None,
+            button_active_low: true,
+            telemetry_error: None,
+            last_refresh: Instant::now(),
             default_pending: false,
             message: String::new(),
             message_error: false,
@@ -1361,6 +1991,68 @@ mod tests {
         assert_eq!(RIGHT_HEADER[0].physical, 40);
         assert_eq!(LEFT_HEADER[19].physical, 20);
         assert_eq!(RIGHT_HEADER[19].physical, 21);
+    }
+
+    #[test]
+    fn operate_mode_renders_gpio_adc_and_pwm_state() {
+        let mut app = app();
+        app.mode = UiMode::Operate;
+        app.gpio = vec![GpioInfo {
+            line: 0,
+            pin: 2,
+            level: true,
+            output: false,
+            bias: GpioBias::PullUp,
+        }];
+        (app.cursor_row, app.cursor_side) = find_gpio(2).unwrap();
+        let gpio = rendered(120, 40, &app);
+        assert!(gpio.contains("OPERATE"));
+        assert!(gpio.contains("GPIO I↑ H"));
+        assert!(gpio.contains("button released (active low)"));
+
+        app.adc = Some(AdcReading {
+            channel: 0,
+            raw: 2_048,
+            reference_mv: 3_300,
+            resolution_bits: 12,
+        });
+        let adc = rendered(120, 40, &app);
+        assert!(adc.contains("ADC0: 2048 raw · 1650 mV"));
+
+        app.adc = None;
+        app.pwm = Some(PwmInfo {
+            channel: 2,
+            enabled: true,
+            inverted: false,
+            period_ns: 1_000_000,
+            duty_ns: 250_000,
+        });
+        let pwm = rendered(120, 40, &app);
+        assert!(pwm.contains("PWM2: output enabled · 1000 Hz · 25.0% · normal"));
+    }
+
+    #[test]
+    fn pwm_editor_starts_from_live_state() {
+        let mut app = app();
+        let mut map = DEFAULT_PIN_MAP;
+        app.signal = PinSignal::Pwm1A as usize;
+        map.set_signal_enabled(PinSignal::Pwm1A, true);
+        app.boards[0].active = Some(map.into());
+        app.edited = Some(map);
+        app.pwm = Some(PwmInfo {
+            channel: 2,
+            enabled: true,
+            inverted: true,
+            period_ns: 1_000_000,
+            duty_ns: 250_000,
+        });
+        app.open_pwm_editor();
+        let editor = app.pwm_editor.unwrap();
+        assert_eq!(editor.channel, 2);
+        assert_eq!(editor.frequency_hz, "1000");
+        assert_eq!(editor.duty_percent, "25.0");
+        assert!(editor.enabled);
+        assert!(editor.inverted);
     }
 
     #[test]
