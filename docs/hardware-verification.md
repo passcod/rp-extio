@@ -221,6 +221,20 @@ Measure the idle bus before starting: SDA and SCL should both be near 3.3 V.
 Use `i2cdetect` only when the attached parts permit arbitrary probe commands;
 some devices are disturbed by address scans.
 
+### SCD41 demo
+
+With an SCD41 at its fixed address `0x62`, pass the live rp-extio adapter
+number to the demo script:
+
+```sh
+./scripts/read-scd41.sh 28
+```
+
+The script starts periodic measurement, waits for the first sample, validates
+all three Sensirion CRC bytes, prints CO2, temperature, and relative humidity,
+then stops periodic measurement. Find the current adapter number with
+`i2cdetect -l`; do not assume it remains the same after reconnecting the board.
+
 ### Register-device tests
 
 1. Read the documented identity register.
