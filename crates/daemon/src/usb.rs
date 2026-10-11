@@ -789,7 +789,9 @@ async fn change_map(
             ),
         );
     }
-    if active.pin_map != map {
+    let needs_reconfigure =
+        active.pin_map != map || (remove_persistent && !store.gpio_startup(&serial).is_empty());
+    if needs_reconfigure {
         let startup = if remove_persistent {
             &[][..]
         } else {
@@ -806,9 +808,7 @@ async fn change_map(
         store.set(serial.clone(), map)
     };
     if let Err(error) = persisted {
-        if active.pin_map != map
-            && let Some(id) = find_device(devices, &serial)
-        {
+        if needs_reconfigure && let Some(id) = find_device(devices, &serial) {
             let _ = reconfigure(
                 kernel,
                 devices,
