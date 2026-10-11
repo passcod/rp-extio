@@ -704,8 +704,7 @@ fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {
                 reference_mv,
                 resolution_bits,
             } => {
-                let millivolts =
-                    u32::from(*raw) * u32::from(*reference_mv) / ((1_u32 << *resolution_bits) - 1);
+                let millivolts = adc_millivolts(*raw, *reference_mv, *resolution_bits);
                 println!("ADC{channel}: {raw} raw, {millivolts} mV");
             }
             ControlResponse::Pwm { pwm } => {
@@ -743,6 +742,10 @@ fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+fn adc_millivolts(raw: u16, reference_mv: u16, resolution_bits: u8) -> u32 {
+    u32::from(raw) * u32::from(reference_mv) / (1_u32 << resolution_bits)
 }
 
 fn board_summary(board: &BoardInfo) -> String {
@@ -970,6 +973,13 @@ fn parse_clock_hz(value: &str) -> Result<(usize, u32), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adc_conversion_uses_the_full_code_range() {
+        assert_eq!(adc_millivolts(0, 3_300, 12), 0);
+        assert_eq!(adc_millivolts(2_048, 3_300, 12), 1_650);
+        assert_eq!(adc_millivolts(4_095, 3_300, 12), 3_299);
+    }
 
     #[test]
     fn set_accepts_instance_routes_legacy_aliases_and_enable_flags() {
