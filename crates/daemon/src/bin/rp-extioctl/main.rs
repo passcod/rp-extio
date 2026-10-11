@@ -1195,6 +1195,7 @@ mod tests {
             iio_device: Some(4),
             pwm_chip: Some(5),
             gpio_startup: vec![],
+            pwm_startup: vec![],
         });
         assert!(summary.contains("enabled=uart0,i2c0,spi0"));
         assert!(summary.contains("i2c=0:7,1:-"));

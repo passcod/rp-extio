@@ -2045,6 +2045,7 @@ mod tests {
                 iio_device: Some(0),
                 pwm_chip: Some(0),
                 gpio_startup: vec![],
+                pwm_startup: vec![],
             }],
             board: 0,
             signal: 0,

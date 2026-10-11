@@ -250,6 +250,14 @@ pub enum ControlRequest {
         serial: String,
         pwm: PwmInfo,
     },
+    PwmStartupSet {
+        serial: String,
+        pwm: PwmInfo,
+    },
+    PwmStartupClear {
+        serial: String,
+        channel: u8,
+    },
     GpioSnapshot {
         serial: String,
     },
@@ -374,6 +382,7 @@ pub struct BoardInfo {
     pub iio_device: Option<i32>,
     pub pwm_chip: Option<i32>,
     pub gpio_startup: Vec<GpioStartup>,
+    pub pwm_startup: Vec<PwmInfo>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -471,6 +480,24 @@ struct BoardConfigV4 {
     gpio_startup: Vec<GpioStartup>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFileV5 {
+    version: u32,
+    boards: BTreeMap<String, BoardConfigV5>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoardConfigV5 {
+    #[serde(flatten)]
+    pin_map: PinMapConfig,
+    #[serde(default)]
+    gpio_startup: Vec<GpioStartup>,
+    #[serde(default)]
+    pwm_startup: Vec<PwmInfo>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyConfigFile {
@@ -511,11 +538,12 @@ pub struct ConfigStore {
     path: PathBuf,
     boards: BTreeMap<String, PinMap>,
     gpio_startup: BTreeMap<String, Vec<GpioStartup>>,
+    pwm_startup: BTreeMap<String, Vec<PwmInfo>>,
 }
 
 impl ConfigStore {
     pub fn load(path: PathBuf) -> io::Result<Self> {
-        let (boards, gpio_startup) = match fs::read(&path) {
+        let (boards, gpio_startup, pwm_startup) = match fs::read(&path) {
             Ok(bytes) => {
                 let value: serde_json::Value =
                     serde_json::from_slice(&bytes).map_err(invalid_data)?;
@@ -528,7 +556,7 @@ impl ConfigStore {
                             "configuration version is missing or invalid",
                         )
                     })?;
-                let (maps, startup): (BTreeMap<String, PinMap>, _) = match version {
+                let (maps, startup, pwm_startup): (BTreeMap<String, PinMap>, _, _) = match version {
                     1 => {
                         let config: LegacyConfigFile =
                             serde_json::from_value(value).map_err(invalid_data)?;
@@ -539,6 +567,7 @@ impl ConfigStore {
                                 .into_iter()
                                 .map(|(serial, map)| (serial, map.into()))
                                 .collect(),
+                            BTreeMap::new(),
                             BTreeMap::new(),
                         )
                     }
@@ -552,6 +581,7 @@ impl ConfigStore {
                                 .into_iter()
                                 .map(|(serial, map)| (serial, map.into()))
                                 .collect(),
+                            BTreeMap::new(),
                             BTreeMap::new(),
                         )
                     }
@@ -567,7 +597,25 @@ impl ConfigStore {
                                 startup.insert(serial, board.gpio_startup);
                             }
                         }
-                        (maps, startup)
+                        (maps, startup, BTreeMap::new())
+                    }
+                    5 => {
+                        let config: ConfigFileV5 =
+                            serde_json::from_value(value).map_err(invalid_data)?;
+                        debug_assert_eq!(config.version, 5);
+                        let mut maps = BTreeMap::new();
+                        let mut gpio = BTreeMap::new();
+                        let mut pwm = BTreeMap::new();
+                        for (serial, board) in config.boards {
+                            maps.insert(serial.clone(), board.pin_map.into());
+                            if !board.gpio_startup.is_empty() {
+                                gpio.insert(serial.clone(), board.gpio_startup);
+                            }
+                            if !board.pwm_startup.is_empty() {
+                                pwm.insert(serial, board.pwm_startup);
+                            }
+                        }
+                        (maps, gpio, pwm)
                     }
                     _ => {
                         return Err(io::Error::new(
@@ -600,10 +648,19 @@ impl ConfigStore {
                         )
                     })?;
                 }
-                (boards, startup)
+                for (serial, entries) in &pwm_startup {
+                    let map = boards.get(serial).expect("version 5 board has a pin map");
+                    validate_pwm_startup(map, entries).map_err(|message| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid PWM startup state for {serial}: {message}"),
+                        )
+                    })?;
+                }
+                (boards, startup, pwm_startup)
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                (BTreeMap::new(), BTreeMap::new())
+                (BTreeMap::new(), BTreeMap::new(), BTreeMap::new())
             }
             Err(error) => return Err(error),
         };
@@ -611,6 +668,7 @@ impl ConfigStore {
             path,
             boards,
             gpio_startup,
+            pwm_startup,
         })
     }
 
@@ -630,20 +688,28 @@ impl ConfigStore {
         self.gpio_startup.get(serial).map_or(&[], Vec::as_slice)
     }
 
+    pub fn pwm_startup(&self, serial: &str) -> &[PwmInfo] {
+        self.pwm_startup.get(serial).map_or(&[], Vec::as_slice)
+    }
+
     pub fn replace(&mut self, boards: BTreeMap<String, PinMap>) {
         self.boards = boards;
         self.gpio_startup.clear();
+        self.pwm_startup.clear();
     }
 
     pub fn reload(&mut self) -> io::Result<()> {
         let replacement = Self::load(self.path.clone())?;
         self.boards = replacement.boards;
         self.gpio_startup = replacement.gpio_startup;
+        self.pwm_startup = replacement.pwm_startup;
         Ok(())
     }
 
     pub fn set(&mut self, serial: String, map: PinMap) -> io::Result<()> {
         validate_gpio_startup(&map, self.gpio_startup(&serial))
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+        validate_pwm_startup(&map, self.pwm_startup(&serial))
             .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         let previous = self.boards.insert(serial.clone(), map);
         if let Err(error) = self.save() {
@@ -659,12 +725,16 @@ impl ConfigStore {
     pub fn remove(&mut self, serial: &str) -> io::Result<()> {
         let previous = self.boards.remove(serial);
         let previous_startup = self.gpio_startup.remove(serial);
+        let previous_pwm = self.pwm_startup.remove(serial);
         if let Err(error) = self.save() {
             if let Some(previous) = previous {
                 self.boards.insert(serial.into(), previous);
             }
             if let Some(previous) = previous_startup {
                 self.gpio_startup.insert(serial.into(), previous);
+            }
+            if let Some(previous) = previous_pwm {
+                self.pwm_startup.insert(serial.into(), previous);
             }
             return Err(error);
         }
@@ -712,6 +782,47 @@ impl ConfigStore {
         Ok(())
     }
 
+    pub fn set_pwm_startup(&mut self, serial: String, pwm: PwmInfo) -> io::Result<()> {
+        let map = self
+            .boards
+            .get(&serial)
+            .copied()
+            .unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
+        let previous_map = self.boards.insert(serial.clone(), map);
+        let previous = self.pwm_startup.get(&serial).cloned();
+        let entries = self.pwm_startup.entry(serial.clone()).or_default();
+        entries.retain(|entry| entry.channel != pwm.channel);
+        entries.push(pwm);
+        entries.sort_by_key(|entry| entry.channel);
+        if let Err(message) = validate_pwm_startup(&map, entries) {
+            restore_entry(&mut self.boards, &serial, previous_map);
+            restore_entry(&mut self.pwm_startup, &serial, previous);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+        if let Err(error) = self.save() {
+            restore_entry(&mut self.boards, &serial, previous_map);
+            restore_entry(&mut self.pwm_startup, &serial, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn clear_pwm_startup(&mut self, serial: &str, channel: u8) -> io::Result<()> {
+        let previous = self.pwm_startup.get(serial).cloned();
+        let Some(entries) = self.pwm_startup.get_mut(serial) else {
+            return Ok(());
+        };
+        entries.retain(|entry| entry.channel != channel);
+        if entries.is_empty() {
+            self.pwm_startup.remove(serial);
+        }
+        if let Err(error) = self.save() {
+            restore_entry(&mut self.pwm_startup, serial, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
     fn save(&self) -> io::Result<()> {
         let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
         fs::create_dir_all(parent)?;
@@ -726,17 +837,18 @@ impl ConfigStore {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            let config = ConfigFileV4 {
-                version: 4,
+            let config = ConfigFileV5 {
+                version: 5,
                 boards: self
                     .boards
                     .iter()
                     .map(|(serial, map)| {
                         (
                             serial.clone(),
-                            BoardConfigV4 {
+                            BoardConfigV5 {
                                 pin_map: (*map).into(),
                                 gpio_startup: self.gpio_startup(serial).to_vec(),
+                                pwm_startup: self.pwm_startup(serial).to_vec(),
                             },
                         )
                     })
@@ -778,6 +890,33 @@ pub fn validate_gpio_startup(map: &PinMap, entries: &[GpioStartup]) -> Result<()
             return Err(format!("GP{pin} has more than one startup state"));
         }
         seen.push(pin);
+    }
+    Ok(())
+}
+
+pub fn validate_pwm_startup(map: &PinMap, entries: &[PwmInfo]) -> Result<(), String> {
+    let mut seen = Vec::new();
+    for pwm in entries {
+        let channel = pwm.channel as usize;
+        if channel >= rp_extio_wire::PWM_CHANNEL_COUNT {
+            return Err(format!("PWM{} does not exist", pwm.channel));
+        }
+        if map.pwm_enabled & (1 << channel) == 0 {
+            return Err(format!("PWM{} is not enabled in the pin map", pwm.channel));
+        }
+        if pwm.duty_ns > pwm.period_ns || (pwm.enabled && pwm.period_ns == 0) {
+            return Err(format!(
+                "PWM{} duty must not exceed its nonzero enabled period",
+                pwm.channel
+            ));
+        }
+        if seen.contains(&pwm.channel) {
+            return Err(format!(
+                "PWM{} has more than one startup state",
+                pwm.channel
+            ));
+        }
+        seen.push(pwm.channel);
     }
     Ok(())
 }
@@ -931,6 +1070,7 @@ mod tests {
                     pin: 22,
                     value: true,
                 }],
+                pwm_startup: vec![],
             },
         };
         let encoded = serde_json::to_vec(&response).unwrap();
@@ -1032,7 +1172,7 @@ mod tests {
 
         store.set("ABC".into(), map).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(saved["version"], 4);
+        assert_eq!(saved["version"], 5);
         assert_eq!(saved["boards"]["ABC"]["uart1_enabled"], false);
         assert_eq!(
             saved["boards"]["ABC"]["adc_enabled"],
@@ -1090,11 +1230,12 @@ mod tests {
                 .unwrap();
             let saved: serde_json::Value =
                 serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-            assert_eq!(saved["version"], 4);
+            assert_eq!(saved["version"], 5);
             assert_eq!(
                 saved["boards"]["ABC"]["gpio_startup"],
                 serde_json::json!([])
             );
+            assert_eq!(saved["boards"]["ABC"]["pwm_startup"], serde_json::json!([]));
         }
     }
 
@@ -1135,6 +1276,76 @@ mod tests {
                     bias: GpioBias::PullUp,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn version_four_configuration_gains_empty_pwm_startup_state() {
+        let directory = TemporaryDirectory::new("config-v4-migration");
+        let path = directory.0.join("config.json");
+        let mut board =
+            serde_json::to_value(PinMapConfig::from(rp_extio_wire::DEFAULT_PIN_MAP)).unwrap();
+        board
+            .as_object_mut()
+            .unwrap()
+            .insert("gpio_startup".into(), serde_json::json!([]));
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 4,
+                "boards": {"ABC": board}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let mut store = ConfigStore::load(path.clone()).unwrap();
+        assert!(store.pwm_startup("ABC").is_empty());
+        store
+            .set("ABC".into(), rp_extio_wire::DEFAULT_PIN_MAP)
+            .unwrap();
+        let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert_eq!(saved["version"], 5);
+    }
+
+    #[test]
+    fn version_five_pwm_startup_round_trips_and_validates() {
+        let directory = TemporaryDirectory::new("pwm-startup-roundtrip");
+        let path = directory.0.join("config.json");
+        let mut store = ConfigStore::load(path.clone()).unwrap();
+        let mut map = rp_extio_wire::DEFAULT_PIN_MAP;
+        map.pwm_enabled |= 1 << 6;
+        map.pwm_pins[6] = 22;
+        store.set("ABC".into(), map).unwrap();
+        let pwm = PwmInfo {
+            channel: 6,
+            enabled: true,
+            inverted: false,
+            period_ns: 1_000_000,
+            duty_ns: 250_000,
+        };
+        store.set_pwm_startup("ABC".into(), pwm).unwrap();
+        assert_eq!(ConfigStore::load(path).unwrap().pwm_startup("ABC"), &[pwm]);
+
+        let duplicate = [
+            pwm,
+            PwmInfo {
+                duty_ns: 500_000,
+                ..pwm
+            },
+        ];
+        assert!(validate_pwm_startup(&map, &duplicate).is_err());
+        let mut disabled = map;
+        disabled.pwm_enabled &= !(1 << 6);
+        assert!(validate_pwm_startup(&disabled, &[pwm]).is_err());
+        assert!(
+            validate_pwm_startup(
+                &map,
+                &[PwmInfo {
+                    duty_ns: 2_000_000,
+                    ..pwm
+                }]
+            )
+            .is_err()
         );
     }
 

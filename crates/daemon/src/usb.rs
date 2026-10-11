@@ -2,7 +2,7 @@ use crate::{
     backend::{Backend, BackendReply, Transaction},
     control::{
         BoardInfo, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup,
-        PwmInfo, validate_gpio_startup,
+        PwmInfo, validate_gpio_startup, validate_pwm_startup,
     },
     kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
 };
@@ -188,6 +188,17 @@ async fn try_connect(
         backend.disconnect().await;
         return;
     }
+    if let Err(error) = apply_pwm_startup(
+        backend.as_ref(),
+        &config.pin_map,
+        desired.pwm_startup(&serial),
+    )
+    .await
+    {
+        eprintln!("failed to apply PWM startup state on rp-extio USB device {serial}: {error:?}");
+        backend.disconnect().await;
+        return;
+    }
     match register_device(kernel, backend.clone(), serial.clone(), config) {
         Ok(device) => {
             eprintln!(
@@ -241,6 +252,7 @@ fn board_info(
     device: &ConnectedDevice,
     desired: Option<PinMap>,
     gpio_startup: &[GpioStartup],
+    pwm_startup: &[PwmInfo],
 ) -> BoardInfo {
     BoardInfo {
         serial: device.serial.clone(),
@@ -254,10 +266,16 @@ fn board_info(
         iio_device: device.registration.iio_device,
         pwm_chip: device.registration.pwm_chip,
         gpio_startup: gpio_startup.to_vec(),
+        pwm_startup: pwm_startup.to_vec(),
     }
 }
 
-fn disconnected_info(serial: String, desired: PinMap, gpio_startup: &[GpioStartup]) -> BoardInfo {
+fn disconnected_info(
+    serial: String,
+    desired: PinMap,
+    gpio_startup: &[GpioStartup],
+    pwm_startup: &[PwmInfo],
+) -> BoardInfo {
     BoardInfo {
         serial,
         connected: false,
@@ -270,6 +288,7 @@ fn disconnected_info(serial: String, desired: PinMap, gpio_startup: &[GpioStartu
         iio_device: None,
         pwm_chip: None,
         gpio_startup: gpio_startup.to_vec(),
+        pwm_startup: pwm_startup.to_vec(),
     }
 }
 
@@ -294,6 +313,7 @@ async fn handle_control(
                         device,
                         store.get(&device.serial),
                         store.gpio_startup(&device.serial),
+                        store.pwm_startup(&device.serial),
                     )
                 })
                 .collect();
@@ -303,6 +323,7 @@ async fn handle_control(
                         serial.clone(),
                         *map,
                         store.gpio_startup(serial),
+                        store.pwm_startup(serial),
                     ));
                 }
             }
@@ -316,11 +337,17 @@ async fn handle_control(
                         &devices[&id],
                         store.get(&serial),
                         store.gpio_startup(&serial),
+                        store.pwm_startup(&serial),
                     ),
                 }
             } else if let Some(map) = store.get(&serial) {
                 ControlResponse::Board {
-                    board: disconnected_info(serial.clone(), map, store.gpio_startup(&serial)),
+                    board: disconnected_info(
+                        serial.clone(),
+                        map,
+                        store.gpio_startup(&serial),
+                        store.pwm_startup(&serial),
+                    ),
                 }
             } else {
                 ControlResponse::error("unknown_board", format!("unknown rp-extio board {serial}"))
@@ -337,6 +364,9 @@ async fn handle_control(
             }
             if let Err(message) = validate_gpio_startup(&map, store.gpio_startup(&serial)) {
                 return ControlResponse::error("gpio_startup_conflict", message);
+            }
+            if let Err(message) = validate_pwm_startup(&map, store.pwm_startup(&serial)) {
+                return ControlResponse::error("pwm_startup_conflict", message);
             }
             change_map(kernel, store, devices, serial, generation, map, false).await
         }
@@ -372,6 +402,7 @@ async fn handle_control(
                     id,
                     map,
                     store.gpio_startup(&devices[&id].serial),
+                    store.pwm_startup(&devices[&id].serial),
                 )
                 .await
                 {
@@ -383,6 +414,15 @@ async fn handle_control(
                     device.backend.as_ref(),
                     &device.config.pin_map,
                     store.gpio_startup(&device.serial),
+                )
+                .await
+                {
+                    return response;
+                }
+                if let Err(response) = apply_pwm_startup(
+                    device.backend.as_ref(),
+                    &device.config.pin_map,
+                    store.pwm_startup(&device.serial),
                 )
                 .await
                 {
@@ -436,6 +476,80 @@ async fn handle_control(
         }
         ControlRequest::PwmApply { serial, pwm } => {
             control_pwm(devices, &serial, rp_extio_wire::PWM_APPLY, pwm).await
+        }
+        ControlRequest::PwmStartupSet { serial, pwm } => {
+            let Some(id) = find_device(devices, &serial) else {
+                return disconnected(&serial);
+            };
+            let device = &devices[&id];
+            if let Err(message) = validate_pwm_startup(&device.config.pin_map, &[pwm]) {
+                return ControlResponse::error("invalid_pwm", message);
+            }
+            let previous = store
+                .pwm_startup(&serial)
+                .iter()
+                .copied()
+                .find(|entry| entry.channel == pwm.channel);
+            let had_board = store.contains_board(&serial);
+            if let Err(error) = store.set_pwm_startup(serial.clone(), pwm) {
+                return ControlResponse::error("configuration", error.to_string());
+            }
+            if let Err(response) =
+                apply_one_pwm_startup(device.backend.as_ref(), &device.config.pin_map, pwm).await
+            {
+                let rollback = match previous {
+                    Some(previous) => store.set_pwm_startup(serial.clone(), previous),
+                    None if had_board => store.clear_pwm_startup(&serial, pwm.channel),
+                    None => store.remove(&serial),
+                };
+                if let Err(error) = rollback {
+                    return ControlResponse::error(
+                        "configuration",
+                        format!(
+                            "device application failed and configuration rollback failed: {error}"
+                        ),
+                    );
+                }
+                return response;
+            }
+            ControlResponse::Board {
+                board: board_info(
+                    device,
+                    store.get(&serial),
+                    store.gpio_startup(&serial),
+                    store.pwm_startup(&serial),
+                ),
+            }
+        }
+        ControlRequest::PwmStartupClear { serial, channel } => {
+            if find_device(devices, &serial).is_none() && !store.contains_board(&serial) {
+                return ControlResponse::error(
+                    "unknown_board",
+                    format!("unknown rp-extio board {serial}"),
+                );
+            }
+            if let Err(error) = store.clear_pwm_startup(&serial, channel) {
+                return ControlResponse::error("configuration", error.to_string());
+            }
+            if let Some(id) = find_device(devices, &serial) {
+                ControlResponse::Board {
+                    board: board_info(
+                        &devices[&id],
+                        store.get(&serial),
+                        store.gpio_startup(&serial),
+                        store.pwm_startup(&serial),
+                    ),
+                }
+            } else {
+                ControlResponse::Board {
+                    board: disconnected_info(
+                        serial.clone(),
+                        store.get(&serial).unwrap(),
+                        store.gpio_startup(&serial),
+                        store.pwm_startup(&serial),
+                    ),
+                }
+            }
         }
         ControlRequest::GpioSnapshot { serial } => {
             let Some(id) = find_device(devices, &serial) else {
@@ -536,7 +650,12 @@ async fn handle_control(
                 return response;
             }
             ControlResponse::Board {
-                board: board_info(device, store.get(&serial), store.gpio_startup(&serial)),
+                board: board_info(
+                    device,
+                    store.get(&serial),
+                    store.gpio_startup(&serial),
+                    store.pwm_startup(&serial),
+                ),
             }
         }
         ControlRequest::GpioStartupClear { serial, pin } => {
@@ -555,6 +674,7 @@ async fn handle_control(
                         &devices[&id],
                         store.get(&serial),
                         store.gpio_startup(&serial),
+                        store.pwm_startup(&serial),
                     ),
                 }
             } else {
@@ -563,6 +683,7 @@ async fn handle_control(
                         serial.clone(),
                         store.get(&serial).unwrap(),
                         store.gpio_startup(&serial),
+                        store.pwm_startup(&serial),
                     ),
                 }
             }
@@ -705,6 +826,52 @@ async fn apply_gpio_startup(
     Ok(())
 }
 
+async fn apply_one_pwm_startup(
+    backend: &dyn Backend,
+    map: &PinMap,
+    pwm: PwmInfo,
+) -> Result<(), ControlResponse> {
+    validate_pwm_startup(map, &[pwm])
+        .map_err(|message| ControlResponse::error("pwm_startup_conflict", message))?;
+    let reply = backend
+        .transact(Transaction::Pwm {
+            command: rp_extio_wire::PWM_APPLY,
+            channel: pwm.channel,
+            enabled: pwm.enabled,
+            inverted: pwm.inverted,
+            period_ns: pwm.period_ns,
+            duty_ns: pwm.duty_ns,
+        })
+        .await;
+    if let Some(error) = backend_error(reply.status, "PWM startup configuration") {
+        return Err(error);
+    }
+    let Ok((command, applied)) = rp_extio_wire::PwmState::decode(&reply.data) else {
+        return Err(ControlResponse::error(
+            "protocol",
+            "invalid PWM startup reply",
+        ));
+    };
+    if reply.completed != 1 || command != rp_extio_wire::PWM_APPLY || applied != pwm.into() {
+        return Err(ControlResponse::error(
+            "protocol",
+            "mismatched PWM startup reply",
+        ));
+    }
+    Ok(())
+}
+
+async fn apply_pwm_startup(
+    backend: &dyn Backend,
+    map: &PinMap,
+    entries: &[PwmInfo],
+) -> Result<(), ControlResponse> {
+    for &entry in entries {
+        apply_one_pwm_startup(backend, map, entry).await?;
+    }
+    Ok(())
+}
+
 async fn gpio_result(device: &ConnectedDevice, pin: u8) -> ControlResponse {
     match gpio_snapshot(device).await {
         ControlResponse::GpioSnapshot { gpio } => {
@@ -789,15 +956,18 @@ async fn change_map(
             ),
         );
     }
-    let needs_reconfigure =
-        active.pin_map != map || (remove_persistent && !store.gpio_startup(&serial).is_empty());
+    let needs_reconfigure = active.pin_map != map
+        || (remove_persistent
+            && (!store.gpio_startup(&serial).is_empty() || !store.pwm_startup(&serial).is_empty()));
     if needs_reconfigure {
-        let startup = if remove_persistent {
-            &[][..]
+        let (gpio_startup, pwm_startup) = if remove_persistent {
+            (&[][..], &[][..])
         } else {
-            store.gpio_startup(&serial)
+            (store.gpio_startup(&serial), store.pwm_startup(&serial))
         };
-        if let Err(response) = reconfigure(kernel, devices, id, map, startup).await {
+        if let Err(response) =
+            reconfigure(kernel, devices, id, map, gpio_startup, pwm_startup).await
+        {
             return response;
         }
     }
@@ -815,6 +985,7 @@ async fn change_map(
                 id,
                 active.pin_map,
                 store.gpio_startup(&serial),
+                store.pwm_startup(&serial),
             )
             .await;
         }
@@ -826,6 +997,7 @@ async fn change_map(
             &devices[&id],
             store.get(&serial),
             store.gpio_startup(&serial),
+            store.pwm_startup(&serial),
         ),
     }
 }
@@ -836,6 +1008,7 @@ async fn reconfigure(
     id: DeviceId,
     map: PinMap,
     gpio_startup: &[GpioStartup],
+    pwm_startup: &[PwmInfo],
 ) -> Result<(), ControlResponse> {
     let device = devices.remove(&id).unwrap();
     let ConnectedDevice {
@@ -868,6 +1041,12 @@ async fn reconfigure(
     };
     if let Err(response) =
         apply_gpio_startup(backend.as_ref(), &new_config.pin_map, gpio_startup).await
+    {
+        backend.disconnect().await;
+        return Err(response);
+    }
+    if let Err(response) =
+        apply_pwm_startup(backend.as_ref(), &new_config.pin_map, pwm_startup).await
     {
         backend.disconnect().await;
         return Err(response);
@@ -1991,7 +2170,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn applies_persisted_gpio_outputs_and_input_biases() {
+    async fn applies_persisted_gpio_and_pwm_startup_state() {
         let simulator = Arc::new(Simulator::default());
         assert!(matches!(
             simulator
@@ -2002,13 +2181,15 @@ mod tests {
             SimResponse::Ok
         ));
         let backend = simulator.device("startup");
-        let map = rp_extio_wire::DEFAULT_PIN_MAP;
+        let mut map = rp_extio_wire::DEFAULT_PIN_MAP;
+        map.pwm_enabled |= 1 << 6;
+        map.pwm_pins[6] = 22;
         apply_gpio_startup(
             &backend,
             &map,
             &[
                 GpioStartup::Output {
-                    pin: 22,
+                    pin: 20,
                     value: true,
                 },
                 GpioStartup::Input {
@@ -2016,6 +2197,19 @@ mod tests {
                     bias: GpioBias::PullDown,
                 },
             ],
+        )
+        .await
+        .unwrap();
+        apply_pwm_startup(
+            &backend,
+            &map,
+            &[PwmInfo {
+                channel: 6,
+                enabled: true,
+                inverted: true,
+                period_ns: 1_000_000,
+                duty_ns: 250_000,
+            }],
         )
         .await
         .unwrap();
@@ -2027,7 +2221,7 @@ mod tests {
                 value: 0,
             })
             .await;
-        let output_line = gpio_line_for_map(&map, 22).unwrap();
+        let output_line = gpio_line_for_map(&map, 20).unwrap();
         let input_line = gpio_line_for_map(&map, 28).unwrap();
         let levels = u32::from_le_bytes(snapshot.data[0..4].try_into().unwrap());
         let outputs = u32::from_le_bytes(snapshot.data[4..8].try_into().unwrap());
@@ -2036,6 +2230,26 @@ mod tests {
         assert_ne!(outputs & (1 << output_line), 0);
         assert_eq!(outputs & (1 << input_line), 0);
         assert_ne!(pull_downs & (1 << input_line), 0);
+        let pwm = backend
+            .transact(Transaction::Pwm {
+                command: rp_extio_wire::PWM_GET,
+                channel: 6,
+                enabled: false,
+                inverted: false,
+                period_ns: 0,
+                duty_ns: 0,
+            })
+            .await;
+        assert_eq!(
+            rp_extio_wire::PwmState::decode(&pwm.data).unwrap().1,
+            rp_extio_wire::PwmState {
+                channel: 6,
+                enabled: true,
+                inverted: true,
+                period_ns: 1_000_000,
+                duty_ns: 250_000,
+            }
+        );
     }
 
     #[test]
