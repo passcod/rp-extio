@@ -294,8 +294,9 @@ the 18 peripheral signals, and Enter or Space assigns that signal to the
 highlighted GPIO in the draft. Assignments move the selected hardware
 instance's UART TX/RX, I2C SDA/SCL, or SPI MISO/SCK/MOSI mux group together by
 default. A grouped move that would conflict with another enabled signal or
-cannot fit on the exposed header is rejected without changing the draft. SPI
-chip selects remain individually assignable.
+cannot fit on the exposed header falls back to moving only the selected signal
+when that still produces a valid map; otherwise it is rejected without changing
+the draft. SPI chip selects remain individually assignable.
 
 Press `g` to switch between grouped and individual assignment. Individual mode
 allows unusual valid layouts without a complete exposed group, and can leave a

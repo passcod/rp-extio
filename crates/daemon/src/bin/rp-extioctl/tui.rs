@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use rp_extio_wire::{DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal};
+use rp_extio_wire::{DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError};
 use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, signal_name};
 use std::{error::Error, io::stdout};
 
@@ -226,32 +226,32 @@ impl App {
             self.message_error = true;
             return;
         };
-        let candidate = match routed_map(map, signal, gpio, self.grouped) {
+        let (candidate, moved_group) = match preferred_routed_map(map, signal, gpio, self.grouped) {
             Ok(candidate) => candidate,
-            Err(message) => {
+            Err(RouteError::Incomplete(message)) => {
                 self.message = message.into();
                 self.message_error = true;
                 return;
             }
+            Err(RouteError::Invalid(error)) => {
+                self.message = format!(
+                    "grouped move rejected: {}",
+                    rp_extiod::control::format_validation(error)
+                );
+                self.message_error = true;
+                return;
+            }
         };
-        if self.grouped
-            && let Err(error) = candidate.validate()
-        {
-            self.message = format!(
-                "grouped move rejected: {}",
-                rp_extiod::control::format_validation(error)
-            );
-            self.message_error = true;
-            return;
-        }
         self.edited = Some(candidate);
         self.default_pending = false;
         if let Err(error) = candidate.validate() {
             self.message = rp_extiod::control::format_validation(error);
             self.message_error = true;
         } else {
-            self.message = if self.grouped && coupled_signal(signal) {
+            self.message = if moved_group {
                 "draft route group updated; press a to apply"
+            } else if self.grouped && coupled_signal(signal) {
+                "group could not move together; selected route updated individually; press a to apply"
             } else {
                 "draft route updated; press a to apply"
             }
@@ -786,10 +786,9 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
         return signal_style(signal).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     }
     if signal.valid_pins().contains(&gpio)
-        && app.edited.is_some_and(|map| {
-            routed_map(map, signal, gpio, app.grouped)
-                .is_ok_and(|candidate| !app.grouped || candidate.validate().is_ok())
-        })
+        && app
+            .edited
+            .is_some_and(|map| preferred_routed_map(map, signal, gpio, app.grouped).is_ok())
     {
         return Style::default().fg(Color::Green);
     }
@@ -975,6 +974,43 @@ fn routed_map(
         map.set_pin(signal, pin);
     }
     Ok(map)
+}
+
+enum RouteError {
+    Incomplete(&'static str),
+    Invalid(PinValidationError),
+}
+
+fn preferred_routed_map(
+    map: PinMap,
+    signal: PinSignal,
+    pin: u8,
+    grouped: bool,
+) -> Result<(PinMap, bool), RouteError> {
+    let grouped_candidate = routed_map(map, signal, pin, grouped);
+    if !grouped {
+        return grouped_candidate
+            .map(|candidate| (candidate, false))
+            .map_err(RouteError::Incomplete);
+    }
+
+    match grouped_candidate {
+        Ok(candidate) if candidate.validate().is_ok() => {
+            return Ok((candidate, coupled_signal(signal)));
+        }
+        _ => {}
+    }
+
+    let mut single = map;
+    single.set_pin(signal, pin);
+    if single.validate().is_ok() {
+        return Ok((single, false));
+    }
+
+    match grouped_candidate {
+        Ok(candidate) => Err(RouteError::Invalid(candidate.validate().unwrap_err())),
+        Err(message) => Err(RouteError::Incomplete(message)),
+    }
 }
 
 fn display_signal(signal: PinSignal) -> &'static str {
@@ -1204,13 +1240,18 @@ mod tests {
     }
 
     #[test]
-    fn grouped_assignment_rejects_incomplete_header_groups() {
+    fn grouped_assignment_falls_back_to_valid_single_route() {
         let mut app = app();
-        (app.cursor_row, app.cursor_side) = find_gpio(28).unwrap();
+        app.signal = PinSignal::Spi0Sck as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(2).unwrap();
         app.assign_selected();
-        assert_eq!(app.edited.unwrap(), DEFAULT_PIN_MAP);
-        assert!(app.message.contains("no complete UART pair"));
-        assert!(app.message_error);
+        let map = app.edited.unwrap();
+        assert_eq!(map.spi_sck[0], 2);
+        assert_eq!(map.spi_miso[0], DEFAULT_PIN_MAP.spi_miso[0]);
+        assert_eq!(map.spi_mosi[0], DEFAULT_PIN_MAP.spi_mosi[0]);
+        assert!(map.validate().is_ok());
+        assert!(app.message.contains("updated individually"));
+        assert!(!app.message_error);
     }
 
     #[test]

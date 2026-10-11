@@ -174,6 +174,9 @@ Perform this section with one stock UF2; do not rebuild between routes.
     mirrors left-to-right as viewed belly up, without exchanging the USB and
     SWD ends, and that arrow navigation remains screen-relative. Exit with both
     `q` and an interrupt and confirm the terminal is restored.
+17. With UART0 on GP0/GP1, assign SPI0 SCK to GP2 in grouped mode. Confirm the
+    TUI falls back to changing SCK alone, retains the existing MISO/MOSI routes,
+    and leaves the draft valid.
 
 ## GPIO fixture
 
