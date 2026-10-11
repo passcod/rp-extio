@@ -28,7 +28,7 @@ bind_interrupts!(struct Irqs {
 });
 
 struct UsbBuffers {
-    config_descriptor: [u8; 256],
+    config_descriptor: [u8; 512],
     bos_descriptor: [u8; 64],
     msos_descriptor: [u8; 0],
     control: [u8; 64],
@@ -37,7 +37,7 @@ struct UsbBuffers {
 impl UsbBuffers {
     const fn new() -> Self {
         Self {
-            config_descriptor: [0; 256],
+            config_descriptor: [0; 512],
             bos_descriptor: [0; 64],
             msos_descriptor: [],
             control: [0; 64],
@@ -64,7 +64,7 @@ impl BridgeBuffers {
 static USB_BUFFERS: StaticCell<UsbBuffers> = StaticCell::new();
 static BRIDGE_BUFFERS: StaticCell<BridgeBuffers> = StaticCell::new();
 static SERIAL_BYTES: StaticCell<[u8; 16]> = StaticCell::new();
-static CDC_STATE: StaticCell<CdcState<'static>> = StaticCell::new();
+static CDC_STATES: [StaticCell<CdcState<'static>>; 2] = [StaticCell::new(), StaticCell::new()];
 
 struct RpTimerDriver;
 
@@ -129,14 +129,20 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         let in_endpoint = alternate.endpoint_bulk_in(None, USB_MAX_PACKET as u16);
         (out_endpoint, in_endpoint)
     };
-    let cdc = CdcAcmClass::new(
+    let cdc0 = CdcAcmClass::new(
         &mut builder,
-        CDC_STATE.init(CdcState::new()),
+        CDC_STATES[0].init(CdcState::new()),
+        USB_MAX_PACKET as u16,
+    );
+    let cdc1 = CdcAcmClass::new(
+        &mut builder,
+        CDC_STATES[1].init(CdcState::new()),
         USB_MAX_PACKET as u16,
     );
     let mut usb = builder.build();
 
-    let (cdc_tx, cdc_rx) = cdc.split();
+    let (cdc0_tx, cdc0_rx) = cdc0.split();
+    let (cdc1_tx, cdc1_rx) = cdc1.split();
 
     let mut board = Pico2Board::new(
         [
@@ -168,7 +174,9 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
             Flex::new(peripherals.PIN_28),
         ],
         peripherals.SPI0,
+        peripherals.SPI1,
         peripherals.UART0,
+        peripherals.UART1,
         PIN_MAP,
     );
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());
@@ -176,37 +184,42 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         usb.run(),
         join(
             bridge(out_endpoint, in_endpoint, &mut board, bridge_buffers),
-            join(cdc_to_uart(cdc_rx), uart_to_cdc(cdc_tx)),
+            join(
+                join(cdc_to_uart(0, cdc0_rx), uart_to_cdc(0, cdc0_tx)),
+                join(cdc_to_uart(1, cdc1_rx), uart_to_cdc(1, cdc1_tx)),
+            ),
         ),
     )
     .await;
     unreachable!()
 }
 
-async fn cdc_to_uart<'d, D: UsbDriver<'d>>(mut cdc: Receiver<'d, D>) -> ! {
+async fn cdc_to_uart<'d, D: UsbDriver<'d>>(bus: usize, mut cdc: Receiver<'d, D>) -> ! {
     let mut packet = [0; USB_MAX_PACKET];
     loop {
         cdc.wait_connection().await;
         while let Ok(length) = cdc.read_packet(&mut packet).await {
             for &byte in &packet[..length] {
-                while Pico2Board::uart_tx_full() {
+                while Pico2Board::uart_enabled(bus) && Pico2Board::uart_tx_full(bus) {
                     yield_now().await;
                 }
-                Pico2Board::uart_write(byte);
+                if Pico2Board::uart_enabled(bus) {
+                    Pico2Board::uart_write(bus, byte);
+                }
             }
         }
     }
 }
 
-async fn uart_to_cdc<'d, D: UsbDriver<'d>>(mut cdc: Sender<'d, D>) -> ! {
+async fn uart_to_cdc<'d, D: UsbDriver<'d>>(bus: usize, mut cdc: Sender<'d, D>) -> ! {
     let mut packet = [0; USB_MAX_PACKET];
     loop {
         cdc.wait_connection().await;
         loop {
-            let mut length = Pico2Board::uart_read(&mut packet);
+            let mut length = Pico2Board::uart_read(bus, &mut packet);
             while length == 0 {
                 yield_now().await;
-                length = Pico2Board::uart_read(&mut packet);
+                length = Pico2Board::uart_read(bus, &mut packet);
             }
             if cdc.write_packet(&packet[..length]).await.is_err() {
                 break;

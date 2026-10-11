@@ -1,15 +1,13 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD, Operation, PinMap,
-    PinValidationError, PinValidationKind, SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError,
-    Writer,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_SPI, CAP_UART, I2cRequest, MAX_PAYLOAD,
+    Operation, Peripheral, PinMap, PinValidationError, PinValidationKind, SPI_CS_CHANGE,
+    SpiRequest, Status, UsbHeader, WireError, Writer,
 };
 
-pub use rp_extio_wire::{DEFAULT_PIN_MAP, GPIO_LINE_COUNT};
+pub use rp_extio_wire::DEFAULT_PIN_MAP;
 
-pub const I2C_BUS_ID: u8 = 0;
-pub const SPI_BUS_ID: u8 = 0;
 pub const I2C_SPEED_HZ: u32 = 100_000;
 pub const SPI_MIN_SPEED_HZ: u32 = 50_000;
 pub const SPI_MAX_SPEED_HZ: u32 = 20_000_000;
@@ -153,40 +151,54 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
         out.u32(MAX_PAYLOAD as u32)?;
         out.extend(&board.generation().to_le_bytes())
     })?;
-    record(&mut out, CAP_I2C, 16, |out| {
-        out.push(I2C_BUS_ID)?;
-        out.push(0)?;
-        out.u16(rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)?;
-        out.u32(I2C_SPEED_HZ)?;
-        out.u32(I2C_SPEED_HZ)?;
-        out.push(pins.i2c_sda)?;
-        out.push(pins.i2c_scl)?;
-        out.u16(0)
-    })?;
-    record(&mut out, CAP_SPI, 17, |out| {
-        out.push(SPI_BUS_ID)?;
-        out.push(SPI_CHIP_SELECTS)?;
-        out.u16(SPI_SUPPORTED_MODES)?;
-        out.u32(SPI_MIN_SPEED_HZ)?;
-        out.u32(SPI_MAX_SPEED_HZ)?;
-        out.push(pins.spi_sck)?;
-        out.push(pins.spi_mosi)?;
-        out.push(pins.spi_miso)?;
-        out.extend(&pins.spi_chip_selects)
-    })?;
-    record(&mut out, CAP_UART, 12, |out| {
-        out.push(0)?;
-        out.push(pins.uart_tx)?;
-        out.push(pins.uart_rx)?;
-        out.push(0)?;
-        out.u32(UART_BAUD)?;
-        out.u32(0)
-    })?;
-    record(&mut out, CAP_GPIO, 21, |out| {
+    for bus in 0..2 {
+        if pins.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {
+            record(&mut out, CAP_I2C, 16, |out| {
+                out.push(bus as u8)?;
+                out.push(0)?;
+                out.u16(rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)?;
+                out.u32(I2C_SPEED_HZ)?;
+                out.u32(I2C_SPEED_HZ)?;
+                out.push(pins.i2c_sda[bus])?;
+                out.push(pins.i2c_scl[bus])?;
+                out.u16(0)
+            })?;
+        }
+        if pins.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]) {
+            record(&mut out, CAP_SPI, 17, |out| {
+                out.push(bus as u8)?;
+                out.push(SPI_CHIP_SELECTS)?;
+                out.u16(SPI_SUPPORTED_MODES)?;
+                out.u32(SPI_MIN_SPEED_HZ)?;
+                out.u32(SPI_MAX_SPEED_HZ)?;
+                out.push(pins.spi_sck[bus])?;
+                out.push(pins.spi_mosi[bus])?;
+                out.push(pins.spi_miso[bus])?;
+                out.extend(&pins.spi_chip_selects[bus])
+            })?;
+        }
+        if pins.is_enabled([Peripheral::Uart0, Peripheral::Uart1][bus]) {
+            record(&mut out, CAP_UART, 12, |out| {
+                out.push(bus as u8)?;
+                out.push(pins.uart_tx[bus])?;
+                out.push(pins.uart_rx[bus])?;
+                out.push(0)?;
+                out.u32(UART_BAUD)?;
+                out.u32(0)
+            })?;
+        }
+    }
+    record(
+        &mut out,
+        CAP_PIN_CONFIG,
+        rp_extio_wire::PIN_MAP_LEN as u16,
+        |out| out.extend(&pins.encode()),
+    )?;
+    record(&mut out, CAP_GPIO, 4 + gpio_pins.len() as u16, |out| {
         out.push(gpio_pins.len() as u8)?;
         out.push(0)?;
         out.u16(0)?;
-        out.extend(&gpio_pins)
+        out.extend(gpio_pins.as_slice())
     })?;
     Ok(out.len())
 }
@@ -199,7 +211,12 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
         if payload[1] != 0 || payload[2] != 0 {
             return Err(BusFailure::new(Status::BadFrame, 0));
         }
-        response[..4].copy_from_slice(&(GPIO_LINE_COUNT as u32).to_le_bytes());
+        let lines = board
+            .pin_map()
+            .gpio_pins()
+            .map_err(|_| BusFailure::new(Status::IoError, 0))?
+            .len();
+        response[..4].copy_from_slice(&(lines as u32).to_le_bytes());
         response[4..8].copy_from_slice(&board.gpio_snapshot()?.to_le_bytes());
         return Ok(8);
     }
@@ -250,7 +267,12 @@ fn record(
 
 fn i2c<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
     let request = I2cRequest::parse(payload).map_err(bad_frame)?;
-    if request.bus_id != I2C_BUS_ID {
+    let peripheral = match request.bus_id {
+        0 => Peripheral::I2c0,
+        1 => Peripheral::I2c1,
+        _ => return Err(BusFailure::new(Status::Unsupported, 0)),
+    };
+    if !board.pin_map().is_enabled(peripheral) {
         return Err(BusFailure::new(Status::Unsupported, 0));
     }
     let read_len = board.i2c_transfer(&request, &mut response[4..])?;
@@ -263,7 +285,12 @@ fn i2c<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<u
 
 fn spi<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
     let request = SpiRequest::parse(payload).map_err(bad_frame)?;
-    if request.bus_id != SPI_BUS_ID
+    let peripheral = match request.bus_id {
+        0 => Peripheral::Spi0,
+        1 => Peripheral::Spi1,
+        _ => return Err(BusFailure::new(Status::Unsupported, 0)),
+    };
+    if !board.pin_map().is_enabled(peripheral)
         || request.mode & !SPI_SUPPORTED_MODES != 0
         || (request.mode & SPI_NO_CS == 0 && request.chip_select >= SPI_CHIP_SELECTS)
     {
@@ -386,7 +413,7 @@ mod tests {
         }
 
         fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {
-            if line as usize >= GPIO_LINE_COUNT {
+            if line as usize >= self.pin_map.gpio_pins().unwrap().len() {
                 return Err(BusFailure::new(Status::Unsupported, 0));
             }
             let mask = 1_u32 << line;
@@ -451,6 +478,11 @@ mod tests {
                 .windows(2)
                 .any(|window| window == CAP_GPIO.to_le_bytes())
         );
+        assert!(
+            response[..reply.payload_len]
+                .windows(2)
+                .any(|window| window == CAP_PIN_CONFIG.to_le_bytes())
+        );
     }
 
     #[test]
@@ -458,9 +490,9 @@ mod tests {
         let mut board = Stub::default();
         let mut response = [0; MAX_PAYLOAD];
         let mut map = DEFAULT_PIN_MAP;
-        map.i2c_sda = 12;
-        map.i2c_scl = 13;
-        map.spi_chip_selects = [4, 5];
+        map.i2c_sda[0] = 12;
+        map.i2c_scl[0] = 13;
+        map.spi_chip_selects[0] = [4, 5];
         let mut payload = [0; 8 + rp_extio_wire::PIN_MAP_LEN];
         payload[..8].copy_from_slice(&42_u64.to_le_bytes());
         payload[8..].copy_from_slice(&map.encode());
@@ -486,7 +518,7 @@ mod tests {
         let mut board = Stub::default();
         let mut response = [0; MAX_PAYLOAD];
         let mut map = DEFAULT_PIN_MAP;
-        map.spi_chip_selects[0] = map.uart_tx;
+        map.spi_chip_selects[0][0] = map.uart_tx[0];
         let mut payload = [0; 8 + rp_extio_wire::PIN_MAP_LEN];
         payload[..8].copy_from_slice(&7_u64.to_le_bytes());
         payload[8..].copy_from_slice(&map.encode());
@@ -556,7 +588,10 @@ mod tests {
             &mut response,
         );
         assert_eq!(reply.header.status, Status::Ok);
-        assert_eq!(&response[..4], &(GPIO_LINE_COUNT as u32).to_le_bytes());
+        assert_eq!(
+            &response[..4],
+            &(DEFAULT_PIN_MAP.gpio_pins().unwrap().len() as u32).to_le_bytes()
+        );
         assert_eq!(&response[4..8], &(1_u32 << 3).to_le_bytes());
     }
 

@@ -5,8 +5,8 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define RPE_ABI_MAJOR 1
-#define RPE_ABI_MINOR 2
+#define RPE_ABI_MAJOR 2
+#define RPE_ABI_MINOR 0
 #define RPE_MAX_PAYLOAD 4096
 #define RPE_MAX_DATA 3584
 #define RPE_MAX_I2C_MSGS 16
@@ -22,6 +22,8 @@ struct rpe_ioc_version {
 struct rpe_ioc_create_i2c {
 	__u32 functionality;
 	__u32 speed_hz;
+	__u8 bus_id;
+	__u8 reserved[3];
 	__u32 instance_id;
 	__s32 bus_num;
 };
@@ -31,7 +33,8 @@ struct rpe_ioc_create_spi {
 	__u32 min_speed_hz;
 	__u32 max_speed_hz;
 	__u16 chip_selects;
-	__u16 reserved;
+	__u8 bus_id;
+	__u8 reserved;
 	__u32 instance_id;
 	__s32 bus_num;
 };
@@ -47,8 +50,8 @@ struct rpe_ioc_create_gpio {
 	__u32 instance_id;
 	__u32 features;
 	__u32 reserved2;
-	__u8 pins[17];
-	__u8 reserved3[7];
+	__u8 pins[26];
+	__u8 reserved3[6];
 };
 
 #define RPE_IOC_MAGIC 'R'

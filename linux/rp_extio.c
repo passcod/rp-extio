@@ -38,7 +38,7 @@
 #define RPE_GPIO_DIRECTION_INPUT 3
 #define RPE_GPIO_DIRECTION_OUTPUT 4
 #define RPE_GPIO_GET_DIRECTION 5
-#define RPE_GPIO_LINES 17
+#define RPE_MAX_GPIO_LINES 26
 
 #define RPE_STATUS_OK 0
 #define RPE_STATUS_NACK 1
@@ -74,20 +74,22 @@ struct rpe_instance {
 			struct i2c_adapter adapter;
 			u32 functionality;
 			u32 speed_hz;
+			u8 bus_id;
 		} i2c;
 		struct {
 			struct spi_controller *controller;
 			struct spi_device **children;
 			u16 chip_selects;
+			u8 bus_id;
 		} spi;
 		struct {
 			struct gpio_chip chip;
 			spinlock_t irq_lock;
 			unsigned long irq_enabled;
-			u32 irq_type[RPE_GPIO_LINES];
+			u32 irq_type[RPE_MAX_GPIO_LINES];
 			bool registering;
-			char names[RPE_GPIO_LINES][6];
-			const char *name_ptrs[RPE_GPIO_LINES];
+			char names[RPE_MAX_GPIO_LINES][6];
+			const char *name_ptrs[RPE_MAX_GPIO_LINES];
 		} gpio;
 	};
 };
@@ -122,10 +124,10 @@ static bool rpe_opened;
 static struct miscdevice rpe_misc;
 
 static_assert(sizeof(struct rpe_ioc_version) == 16);
-static_assert(sizeof(struct rpe_ioc_create_i2c) == 16);
+static_assert(sizeof(struct rpe_ioc_create_i2c) == 20);
 static_assert(sizeof(struct rpe_ioc_create_spi) == 24);
 static_assert(sizeof(struct rpe_ioc_destroy) == 8);
-static_assert(sizeof(struct rpe_ioc_create_gpio) == 40);
+static_assert(sizeof(struct rpe_ioc_create_gpio) == 48);
 
 static void rpe_put16(u8 *p, u16 value)
 {
@@ -250,7 +252,7 @@ static int rpe_i2c_xfer(struct i2c_adapter *adapter, struct i2c_msg *messages,
 	if (!request)
 		return -ENOMEM;
 	INIT_LIST_HEAD(&request->node);
-	request->request[RPE_HEADER_SIZE] = 0;
+	request->request[RPE_HEADER_SIZE] = instance->i2c.bus_id;
 	request->request[RPE_HEADER_SIZE + 1] = count;
 
 	for (i = 0; i < count; i++) {
@@ -356,7 +358,7 @@ static int rpe_spi_message(struct spi_controller *controller,
 		goto finish;
 	}
 	INIT_LIST_HEAD(&request->node);
-	request->request[RPE_HEADER_SIZE] = 0;
+	request->request[RPE_HEADER_SIZE] = instance->spi.bus_id;
 	request->request[RPE_HEADER_SIZE + 1] = spi_get_chipselect(message->spi, 0);
 	rpe_put16(request->request + RPE_HEADER_SIZE + 2, message->spi->mode);
 
@@ -756,7 +758,7 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 
 	if (copy_from_user(&create, argument, sizeof(create)))
 		return -EFAULT;
-	if (create.lines != RPE_GPIO_LINES || create.reserved || create.features ||
+	if (!create.lines || create.lines > RPE_MAX_GPIO_LINES || create.reserved || create.features ||
 	    create.reserved2 || memchr_inv(create.reserved3, 0, sizeof(create.reserved3)))
 		return -EINVAL;
 	for (i = 0; i < create.lines; i++) {
@@ -788,7 +790,7 @@ static int rpe_create_gpio(struct rpe_session *session, void __user *argument)
 	instance->gpio.chip.get = rpe_gpio_get;
 	instance->gpio.chip.set = rpe_gpio_set;
 	instance->gpio.chip.base = -1;
-	instance->gpio.chip.ngpio = RPE_GPIO_LINES;
+	instance->gpio.chip.ngpio = create.lines;
 	for (i = 0; i < create.lines; i++) {
 		snprintf(instance->gpio.names[i], sizeof(instance->gpio.names[i]), "GP%u",
 			 create.pins[i]);
@@ -830,7 +832,8 @@ static int rpe_create_i2c(struct rpe_session *session, void __user *argument)
 	if (copy_from_user(&create, argument, sizeof(create)))
 		return -EFAULT;
 	if (!create.speed_hz || !(create.functionality & I2C_FUNC_I2C) ||
-	    (create.functionality & ~RPE_I2C_FUNCTIONS))
+	    (create.functionality & ~RPE_I2C_FUNCTIONS) || create.bus_id > 1 ||
+	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
 		return -EINVAL;
 	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
 	if (!instance)
@@ -840,6 +843,7 @@ static int rpe_create_i2c(struct rpe_session *session, void __user *argument)
 	mutex_init(&instance->transaction_lock);
 	instance->i2c.functionality = create.functionality;
 	instance->i2c.speed_hz = create.speed_hz;
+	instance->i2c.bus_id = create.bus_id;
 	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
 	if ((int)instance->id < 0) {
 		ret = (int)instance->id;
@@ -878,7 +882,8 @@ static int rpe_create_spi(struct rpe_session *session, void __user *argument)
 
 	if (copy_from_user(&create, argument, sizeof(create)))
 		return -EFAULT;
-	if (!create.chip_selects || create.chip_selects > 32 || create.reserved ||
+	if (!create.chip_selects || create.chip_selects > 32 || create.bus_id > 1 ||
+	    create.reserved ||
 	    !create.min_speed_hz || create.min_speed_hz > create.max_speed_hz ||
 	    (create.mode_bits & ~RPE_SPI_MODES))
 		return -EINVAL;
@@ -891,6 +896,7 @@ static int rpe_create_spi(struct rpe_session *session, void __user *argument)
 	instance->type = RPE_INSTANCE_SPI;
 	mutex_init(&instance->transaction_lock);
 	instance->spi.chip_selects = create.chip_selects;
+	instance->spi.bus_id = create.bus_id;
 	instance->spi.children = kcalloc(create.chip_selects,
 					 sizeof(*instance->spi.children), GFP_KERNEL);
 	if (!instance->spi.children) {

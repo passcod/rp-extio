@@ -1,5 +1,6 @@
+use core::sync::atomic::{AtomicU8, Ordering};
 use embassy_rp::gpio::{Flex, Level, Pull};
-use embassy_rp::peripherals::{SPI0, UART0};
+use embassy_rp::peripherals::{SPI0, SPI1, UART0, UART1};
 use embassy_rp::{Peri, pac};
 use rp_extio_firmware::{
     Board, BusFailure, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ,
@@ -7,18 +8,22 @@ use rp_extio_firmware::{
 };
 use rp_extio_wire::{
     GPIO_DIRECTION_INPUT, GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET,
-    HEADER_PINS, I2C_READ, I2C_TEN_BIT, I2cRequest, PinMap, PinValidationError, SpiRequest, Status,
+    HEADER_PINS, I2C_READ, I2C_TEN_BIT, I2cRequest, Peripheral, PinMap, PinValidationError,
+    SpiRequest, Status,
 };
 
 const TRANSACTION_DEADLINE_US: u64 = 5_000_000;
 const I2C_HALF_PERIOD_US: u64 = 5;
 const CLOCK_STRETCH_US: u64 = 5_000_000;
+static UART_ENABLED: AtomicU8 = AtomicU8::new(0);
 
 pub struct Pico2Board<'d> {
     pins: [Flex<'d>; HEADER_PINS.len()],
     _spi0: Peri<'d, SPI0>,
+    _spi1: Peri<'d, SPI1>,
     _uart0: Peri<'d, UART0>,
-    cs_active_high: [bool; 2],
+    _uart1: Peri<'d, UART1>,
+    cs_active_high: [[bool; 2]; 2],
     gpio_outputs: u32,
     pin_map: PinMap,
     generation: u64,
@@ -28,7 +33,9 @@ impl<'d> Pico2Board<'d> {
     pub fn new(
         mut pins: [Flex<'d>; HEADER_PINS.len()],
         spi0: Peri<'d, SPI0>,
+        spi1: Peri<'d, SPI1>,
         uart0: Peri<'d, UART0>,
+        uart1: Peri<'d, UART1>,
         pin_map: PinMap,
     ) -> Self {
         for pin in &mut pins {
@@ -38,8 +45,10 @@ impl<'d> Pico2Board<'d> {
         let mut board = Self {
             pins,
             _spi0: spi0,
+            _spi1: spi1,
             _uart0: uart0,
-            cs_active_high: [false; 2],
+            _uart1: uart1,
+            cs_active_high: [[false; 2]; 2],
             gpio_outputs: 0,
             pin_map,
             generation: 0,
@@ -108,22 +117,34 @@ impl<'d> Pico2Board<'d> {
     }
 
     fn release_buses(&mut self) {
-        self.release(self.pin_map.i2c_sda);
-        self.release(self.pin_map.i2c_scl);
-        for index in 0..self.pin_map.spi_chip_selects.len() {
-            let level = if self.cs_active_high[index] {
-                Level::Low
-            } else {
-                Level::High
-            };
-            self.pin_mut(self.pin_map.spi_chip_selects[index])
-                .set_level(level);
+        for bus in 0..2 {
+            if self
+                .pin_map
+                .is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus])
+            {
+                self.release(self.pin_map.i2c_sda[bus]);
+                self.release(self.pin_map.i2c_scl[bus]);
+            }
+            if self
+                .pin_map
+                .is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus])
+            {
+                for index in 0..2 {
+                    let level = if self.cs_active_high[bus][index] {
+                        Level::Low
+                    } else {
+                        Level::High
+                    };
+                    self.pin_mut(self.pin_map.spi_chip_selects[bus][index])
+                        .set_level(level);
+                }
+            }
         }
     }
 
-    fn wait_scl_high(&self, transaction_deadline: u64) -> Result<(), BusFailure> {
+    fn wait_scl_high(&self, bus: usize, transaction_deadline: u64) -> Result<(), BusFailure> {
         let stretch_deadline = Self::now_us().saturating_add(CLOCK_STRETCH_US);
-        while self.pin(self.pin_map.i2c_scl).is_low() {
+        while self.pin(self.pin_map.i2c_scl[bus]).is_low() {
             if !Self::connected() {
                 return Err(BusFailure::new(Status::Disconnected, 0));
             }
@@ -135,132 +156,138 @@ impl<'d> Pico2Board<'d> {
         Ok(())
     }
 
-    fn clock_high(&mut self, deadline: u64) -> Result<(), BusFailure> {
-        self.release(self.pin_map.i2c_scl);
-        self.wait_scl_high(deadline)?;
+    fn clock_high(&mut self, bus: usize, deadline: u64) -> Result<(), BusFailure> {
+        self.release(self.pin_map.i2c_scl[bus]);
+        self.wait_scl_high(bus, deadline)?;
         Self::delay_us(I2C_HALF_PERIOD_US)
     }
 
-    fn clock_low(&mut self) -> Result<(), BusFailure> {
-        self.drive_low(self.pin_map.i2c_scl);
+    fn clock_low(&mut self, bus: usize) -> Result<(), BusFailure> {
+        self.drive_low(self.pin_map.i2c_scl[bus]);
         Self::delay_us(I2C_HALF_PERIOD_US)
     }
 
-    fn recover_i2c(&mut self, deadline: u64) -> Result<(), BusFailure> {
-        self.release(self.pin_map.i2c_sda);
-        self.release(self.pin_map.i2c_scl);
-        self.wait_scl_high(deadline)?;
-        if self.pin(self.pin_map.i2c_sda).is_high() {
+    fn recover_i2c(&mut self, bus: usize, deadline: u64) -> Result<(), BusFailure> {
+        self.release(self.pin_map.i2c_sda[bus]);
+        self.release(self.pin_map.i2c_scl[bus]);
+        self.wait_scl_high(bus, deadline)?;
+        if self.pin(self.pin_map.i2c_sda[bus]).is_high() {
             return Ok(());
         }
         for _ in 0..9 {
-            self.clock_low()?;
-            self.clock_high(deadline)?;
-            if self.pin(self.pin_map.i2c_sda).is_high() {
+            self.clock_low(bus)?;
+            self.clock_high(bus, deadline)?;
+            if self.pin(self.pin_map.i2c_sda[bus]).is_high() {
                 break;
             }
         }
-        self.drive_low(self.pin_map.i2c_sda);
+        self.drive_low(self.pin_map.i2c_sda[bus]);
         Self::delay_us(I2C_HALF_PERIOD_US)?;
-        self.clock_high(deadline)?;
-        self.release(self.pin_map.i2c_sda);
+        self.clock_high(bus, deadline)?;
+        self.release(self.pin_map.i2c_sda[bus]);
         Self::delay_us(I2C_HALF_PERIOD_US)?;
-        if self.pin(self.pin_map.i2c_sda).is_low() {
+        if self.pin(self.pin_map.i2c_sda[bus]).is_low() {
             Err(BusFailure::new(Status::Timeout, 0))
         } else {
             Ok(())
         }
     }
 
-    fn i2c_start(&mut self, deadline: u64) -> Result<(), BusFailure> {
-        self.release(self.pin_map.i2c_sda);
-        self.clock_high(deadline)?;
-        if self.pin(self.pin_map.i2c_sda).is_low() {
+    fn i2c_start(&mut self, bus: usize, deadline: u64) -> Result<(), BusFailure> {
+        self.release(self.pin_map.i2c_sda[bus]);
+        self.clock_high(bus, deadline)?;
+        if self.pin(self.pin_map.i2c_sda[bus]).is_low() {
             return Err(BusFailure::new(Status::ArbitrationLost, 0));
         }
-        self.drive_low(self.pin_map.i2c_sda);
+        self.drive_low(self.pin_map.i2c_sda[bus]);
         Self::delay_us(I2C_HALF_PERIOD_US)?;
-        self.clock_low()
+        self.clock_low(bus)
     }
 
-    fn i2c_stop(&mut self, deadline: u64) -> Result<(), BusFailure> {
-        self.drive_low(self.pin_map.i2c_sda);
+    fn i2c_stop(&mut self, bus: usize, deadline: u64) -> Result<(), BusFailure> {
+        self.drive_low(self.pin_map.i2c_sda[bus]);
         Self::delay_us(I2C_HALF_PERIOD_US)?;
-        self.clock_high(deadline)?;
-        self.release(self.pin_map.i2c_sda);
+        self.clock_high(bus, deadline)?;
+        self.release(self.pin_map.i2c_sda[bus]);
         Self::delay_us(I2C_HALF_PERIOD_US)
     }
 
-    fn i2c_write_byte(&mut self, byte: u8, deadline: u64) -> Result<bool, BusFailure> {
+    fn i2c_write_byte(&mut self, bus: usize, byte: u8, deadline: u64) -> Result<bool, BusFailure> {
         for bit in (0..8).rev() {
             let released = byte & (1 << bit) != 0;
             if released {
-                self.release(self.pin_map.i2c_sda);
+                self.release(self.pin_map.i2c_sda[bus]);
             } else {
-                self.drive_low(self.pin_map.i2c_sda);
+                self.drive_low(self.pin_map.i2c_sda[bus]);
             }
-            self.clock_high(deadline)?;
-            if released && self.pin(self.pin_map.i2c_sda).is_low() {
-                self.drive_low(self.pin_map.i2c_scl);
-                self.release(self.pin_map.i2c_sda);
+            self.clock_high(bus, deadline)?;
+            if released && self.pin(self.pin_map.i2c_sda[bus]).is_low() {
+                self.drive_low(self.pin_map.i2c_scl[bus]);
+                self.release(self.pin_map.i2c_sda[bus]);
                 return Err(BusFailure::new(Status::ArbitrationLost, 0));
             }
-            self.clock_low()?;
+            self.clock_low(bus)?;
         }
-        self.release(self.pin_map.i2c_sda);
-        self.clock_high(deadline)?;
-        let acknowledged = self.pin(self.pin_map.i2c_sda).is_low();
-        self.clock_low()?;
+        self.release(self.pin_map.i2c_sda[bus]);
+        self.clock_high(bus, deadline)?;
+        let acknowledged = self.pin(self.pin_map.i2c_sda[bus]).is_low();
+        self.clock_low(bus)?;
         Ok(acknowledged)
     }
 
-    fn i2c_read_byte(&mut self, acknowledge: bool, deadline: u64) -> Result<u8, BusFailure> {
-        self.release(self.pin_map.i2c_sda);
+    fn i2c_read_byte(
+        &mut self,
+        bus: usize,
+        acknowledge: bool,
+        deadline: u64,
+    ) -> Result<u8, BusFailure> {
+        self.release(self.pin_map.i2c_sda[bus]);
         let mut byte = 0;
         for _ in 0..8 {
-            self.clock_high(deadline)?;
-            byte = (byte << 1) | u8::from(self.pin(self.pin_map.i2c_sda).is_high());
-            self.clock_low()?;
+            self.clock_high(bus, deadline)?;
+            byte = (byte << 1) | u8::from(self.pin(self.pin_map.i2c_sda[bus]).is_high());
+            self.clock_low(bus)?;
         }
         if acknowledge {
-            self.drive_low(self.pin_map.i2c_sda);
+            self.drive_low(self.pin_map.i2c_sda[bus]);
         } else {
-            self.release(self.pin_map.i2c_sda);
+            self.release(self.pin_map.i2c_sda[bus]);
         }
-        self.clock_high(deadline)?;
-        self.clock_low()?;
-        self.release(self.pin_map.i2c_sda);
+        self.clock_high(bus, deadline)?;
+        self.clock_low(bus)?;
+        self.release(self.pin_map.i2c_sda[bus]);
         Ok(byte)
     }
 
     fn address(
         &mut self,
+        bus: usize,
         address: u16,
         ten_bit: bool,
         read: bool,
         deadline: u64,
     ) -> Result<bool, BusFailure> {
         if !ten_bit {
-            return self.i2c_write_byte(((address as u8) << 1) | u8::from(read), deadline);
+            return self.i2c_write_byte(bus, ((address as u8) << 1) | u8::from(read), deadline);
         }
 
         let prefix = 0b1111_0000 | (((address >> 7) as u8) & 0b110);
-        if !self.i2c_write_byte(prefix, deadline)?
-            || !self.i2c_write_byte(address as u8, deadline)?
+        if !self.i2c_write_byte(bus, prefix, deadline)?
+            || !self.i2c_write_byte(bus, address as u8, deadline)?
         {
             return Ok(false);
         }
         if read {
-            self.i2c_start(deadline)?;
-            self.i2c_write_byte(prefix | 1, deadline)
+            self.i2c_start(bus, deadline)?;
+            self.i2c_write_byte(bus, prefix | 1, deadline)
         } else {
             Ok(true)
         }
     }
 
-    fn set_cs(&mut self, index: u8, active_high: bool, asserted: bool) {
+    fn set_cs(&mut self, bus: usize, index: u8, active_high: bool, asserted: bool) {
         let high = asserted == active_high;
-        let pin = self.pin_map.spi_chip_selects[index as usize];
+        let pin = self.pin_map.spi_chip_selects[bus][index as usize];
         self.pin_mut(pin)
             .set_level(if high { Level::High } else { Level::Low });
     }
@@ -275,7 +302,10 @@ impl<'d> Pico2Board<'d> {
     fn neutralize(&mut self) {
         self.release_buses();
         pac::SPI0.cr1().write(|register| register.set_sse(false));
+        pac::SPI1.cr1().write(|register| register.set_sse(false));
         pac::UART0.uartcr().write(|_| {});
+        pac::UART1.uartcr().write(|_| {});
+        UART_ENABLED.store(0, Ordering::Release);
         for (number, pin) in HEADER_PINS.into_iter().zip(&mut self.pins) {
             pin.set_as_input();
             pin.set_pull(Pull::None);
@@ -283,7 +313,15 @@ impl<'d> Pico2Board<'d> {
         }
     }
 
-    fn configure_uart() {
+    fn uart(bus: usize) -> pac::uart::Uart {
+        if bus == 0 { pac::UART0 } else { pac::UART1 }
+    }
+
+    fn spi(bus: usize) -> pac::spi::Spi {
+        if bus == 0 { pac::SPI0 } else { pac::SPI1 }
+    }
+
+    fn configure_uart(bus: usize) {
         let clock = embassy_rp::clocks::clk_peri_freq();
         let divisor = (8 * clock) / UART_BAUD;
         let integer = (divisor >> 7).clamp(1, 65_535);
@@ -292,7 +330,7 @@ impl<'d> Pico2Board<'d> {
         } else {
             ((divisor & 0x7f) + 1) / 2
         };
-        let uart = pac::UART0;
+        let uart = Self::uart(bus);
         uart.uartibrd()
             .write(|register| register.set_baud_divint(integer as u16));
         uart.uartfbrd()
@@ -312,7 +350,7 @@ impl<'d> Pico2Board<'d> {
         });
     }
 
-    fn configure_spi(speed_hz: u32, phase: bool, polarity: bool) -> u32 {
+    fn configure_spi(bus: usize, speed_hz: u32, phase: bool, polarity: bool) -> u32 {
         let peripheral = embassy_rp::clocks::clk_peri_freq();
         let ratio = peripheral.div_ceil(speed_hz.saturating_mul(2));
         let prescaler = ratio.div_ceil(256).max(1);
@@ -322,7 +360,7 @@ impl<'d> Pico2Board<'d> {
             ratio.div_ceil(prescaler)
         }
         .clamp(1, 256);
-        let spi = pac::SPI0;
+        let spi = Self::spi(bus);
         spi.cr1().write(|register| register.set_sse(false));
         spi.cpsr()
             .write(|register| register.set_cpsdvsr((prescaler * 2) as u8));
@@ -341,45 +379,66 @@ impl<'d> Pico2Board<'d> {
         self.neutralize();
         self.pin_map = map;
         self.gpio_outputs = 0;
-        self.cs_active_high = [false; 2];
+        self.cs_active_high = [[false; 2]; 2];
 
-        self.release(map.i2c_sda);
-        self.release(map.i2c_scl);
-        for chip_select in map.spi_chip_selects {
-            self.set_output(chip_select, Level::High);
+        let mut uart_enabled = 0;
+        for bus in 0..2 {
+            if map.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {
+                self.release(map.i2c_sda[bus]);
+                self.release(map.i2c_scl[bus]);
+            }
+            if map.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]) {
+                for chip_select in map.spi_chip_selects[bus] {
+                    self.set_output(chip_select, Level::High);
+                }
+                for pin in [map.spi_miso[bus], map.spi_sck[bus], map.spi_mosi[bus]] {
+                    Self::set_function(pin, 1);
+                }
+                Self::configure_spi(bus, SPI_MIN_SPEED_HZ, false, false);
+            }
+            if map.is_enabled([Peripheral::Uart0, Peripheral::Uart1][bus]) {
+                let tx_function = if map.uart_tx[bus] % 4 == 0 { 2 } else { 11 };
+                let rx_function = if (map.uart_rx[bus] - 1) % 4 == 0 {
+                    2
+                } else {
+                    11
+                };
+                Self::set_function(map.uart_tx[bus], tx_function);
+                Self::set_function(map.uart_rx[bus], rx_function);
+                Self::configure_uart(bus);
+                uart_enabled |= 1 << bus;
+            }
         }
-        for pin in [map.spi_miso, map.spi_sck, map.spi_mosi] {
-            Self::set_function(pin, 1);
-        }
-        Self::configure_spi(SPI_MIN_SPEED_HZ, false, false);
-
-        let tx_function = if map.uart_tx % 4 == 0 { 2 } else { 11 };
-        let rx_function = if (map.uart_rx - 1) % 4 == 0 { 2 } else { 11 };
-        Self::set_function(map.uart_tx, tx_function);
-        Self::set_function(map.uart_rx, rx_function);
-        Self::configure_uart();
+        UART_ENABLED.store(uart_enabled, Ordering::Release);
     }
 
-    fn spi_transfer(byte: u8) -> u8 {
-        let spi = pac::SPI0;
+    fn spi_transfer(bus: usize, byte: u8) -> u8 {
+        let spi = Self::spi(bus);
         while !spi.sr().read().tnf() {}
         spi.dr().write(|register| register.set_data(byte as u16));
         while !spi.sr().read().rne() {}
         spi.dr().read().data() as u8
     }
 
-    pub fn uart_tx_full() -> bool {
-        pac::UART0.uartfr().read().txff()
+    pub fn uart_enabled(bus: usize) -> bool {
+        UART_ENABLED.load(Ordering::Acquire) & (1 << bus) != 0
     }
 
-    pub fn uart_write(byte: u8) {
-        pac::UART0
+    pub fn uart_tx_full(bus: usize) -> bool {
+        Self::uart(bus).uartfr().read().txff()
+    }
+
+    pub fn uart_write(bus: usize, byte: u8) {
+        Self::uart(bus)
             .uartdr()
             .write(|register| register.set_data(byte));
     }
 
-    pub fn uart_read(buffer: &mut [u8]) -> usize {
-        let uart = pac::UART0;
+    pub fn uart_read(bus: usize, buffer: &mut [u8]) -> usize {
+        if !Self::uart_enabled(bus) {
+            return 0;
+        }
+        let uart = Self::uart(bus);
         let mut count = 0;
         while count < buffer.len() && !uart.uartfr().read().rxfe() {
             let value = uart.uartdr().read();
@@ -413,18 +472,20 @@ impl Board for Pico2Board<'_> {
         request: &I2cRequest<'_>,
         reads: &mut [u8],
     ) -> Result<usize, BusFailure> {
+        let bus = request.bus_id as usize;
         let result = (|| {
             let deadline = Self::now_us().saturating_add(TRANSACTION_DEADLINE_US);
-            self.recover_i2c(deadline)?;
+            self.recover_i2c(bus, deadline)?;
             let mut read_offset = 0;
 
             for (completed, message) in request.messages().enumerate() {
                 let completed = completed as u32;
                 let message = message.map_err(|_| BusFailure::new(Status::BadFrame, completed))?;
                 let result = (|| {
-                    self.i2c_start(deadline)?;
+                    self.i2c_start(bus, deadline)?;
                     let read = message.flags & I2C_READ != 0;
                     if !self.address(
+                        bus,
                         message.address,
                         message.flags & I2C_TEN_BIT != 0,
                         read,
@@ -434,13 +495,16 @@ impl Board for Pico2Board<'_> {
                     }
                     if read {
                         for index in 0..message.len as usize {
-                            reads[read_offset] =
-                                self.i2c_read_byte(index + 1 < message.len as usize, deadline)?;
+                            reads[read_offset] = self.i2c_read_byte(
+                                bus,
+                                index + 1 < message.len as usize,
+                                deadline,
+                            )?;
                             read_offset += 1;
                         }
                     } else {
                         for &byte in message.write_data {
-                            if !self.i2c_write_byte(byte, deadline)? {
+                            if !self.i2c_write_byte(bus, byte, deadline)? {
                                 return Err(BusFailure::new(Status::Nack, completed));
                             }
                         }
@@ -450,19 +514,19 @@ impl Board for Pico2Board<'_> {
                 if let Err(mut failure) = result {
                     failure.completed = completed;
                     if failure.status != Status::ArbitrationLost {
-                        let _ = self.i2c_stop(deadline);
+                        let _ = self.i2c_stop(bus, deadline);
                     }
                     return Err(failure);
                 }
             }
-            self.i2c_stop(deadline)?;
+            self.i2c_stop(bus, deadline)?;
             Ok(read_offset)
         })();
 
         // A failed STOP can return while SDA is still asserted, particularly when SCL is held
         // low. Never allow one failed transaction to leave either open-drain output enabled.
-        self.release(self.pin_map.i2c_sda);
-        self.release(self.pin_map.i2c_scl);
+        self.release(self.pin_map.i2c_sda[bus]);
+        self.release(self.pin_map.i2c_scl[bus]);
         result
     }
 
@@ -471,6 +535,7 @@ impl Board for Pico2Board<'_> {
         request: &SpiRequest<'_>,
         receive: &mut [u8],
     ) -> Result<SpiOutcome, BusFailure> {
+        let bus = request.bus_id as usize;
         cumulative_spi_delay_ns(request)?;
         for segment in request.segments() {
             let segment = segment.map_err(|_| BusFailure::new(Status::BadFrame, 0))?;
@@ -484,9 +549,9 @@ impl Board for Pico2Board<'_> {
         let active_high = request.mode & SPI_CS_HIGH != 0;
         let lsb_first = request.mode & SPI_LSB_FIRST != 0;
         if !no_cs {
-            self.cs_active_high[request.chip_select as usize] = active_high;
-            self.set_cs(request.chip_select, active_high, false);
-            self.set_cs(request.chip_select, active_high, true);
+            self.cs_active_high[bus][request.chip_select as usize] = active_high;
+            self.set_cs(bus, request.chip_select, active_high, false);
+            self.set_cs(bus, request.chip_select, active_high, true);
         }
 
         let result = (|| {
@@ -506,6 +571,7 @@ impl Board for Pico2Board<'_> {
                     ));
                 }
                 outcome.effective_speeds[index] = Self::configure_spi(
+                    bus,
                     segment.speed_hz,
                     request.mode & SPI_CPHA != 0,
                     request.mode & SPI_CPOL != 0,
@@ -518,7 +584,7 @@ impl Board for Pico2Board<'_> {
                     } else {
                         source
                     };
-                    *target = Self::spi_transfer(*target);
+                    *target = Self::spi_transfer(bus, *target);
                     if lsb_first {
                         *target = target.reverse_bits();
                     }
@@ -544,15 +610,15 @@ impl Board for Pico2Board<'_> {
                     && index + 1 < request.count as usize
                     && !no_cs
                 {
-                    self.set_cs(request.chip_select, active_high, false);
+                    self.set_cs(bus, request.chip_select, active_high, false);
                     Self::delay_ns(segment.cs_change_delay_ns)?;
-                    self.set_cs(request.chip_select, active_high, true);
+                    self.set_cs(bus, request.chip_select, active_high, true);
                 }
             }
             Ok(outcome)
         })();
         if !no_cs {
-            self.set_cs(request.chip_select, active_high, false);
+            self.set_cs(bus, request.chip_select, active_high, false);
         }
         result
     }
@@ -566,7 +632,7 @@ impl Board for Pico2Board<'_> {
         let Ok(gpio_pins) = self.pin_map.gpio_pins() else {
             return Err(BusFailure::new(Status::IoError, 0));
         };
-        let Some(&number) = gpio_pins.get(index) else {
+        let Some(&number) = gpio_pins.as_slice().get(index) else {
             return Err(BusFailure::new(Status::Unsupported, 0));
         };
         let mask = 1_u32 << index;
@@ -603,7 +669,7 @@ impl Board for Pico2Board<'_> {
             .gpio_pins()
             .map_err(|_| BusFailure::new(Status::IoError, 0))?;
         let mut values = 0;
-        for (index, number) in gpio_pins.into_iter().enumerate() {
+        for (index, &number) in gpio_pins.as_slice().iter().enumerate() {
             if self.pin(number).is_high() {
                 values |= 1 << index;
             }

@@ -1,7 +1,7 @@
 use crate::{
     backend::{Backend, BackendReply, Transaction},
     control::{BoardInfo, ConfigStore, ControlRequest, ControlResponse},
-    kernel::{DeviceRegistration, Kernel, RegistrationConfig},
+    kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
 };
 use async_trait::async_trait;
 use futures_lite::StreamExt;
@@ -11,8 +11,9 @@ use nusb::{
     transfer::{Buffer, Bulk, Direction, In, Out},
 };
 use rp_extio_wire::{
-    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_SPI, CAP_UART, MAX_PAYLOAD, Operation, PIN_MAP_LEN, PinMap,
-    PinValidationError, Status, USB_HEADER_LEN, UsbHeader,
+    CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_SPI, CAP_UART, MAX_GPIO_LINES, MAX_PAYLOAD,
+    Operation, PIN_MAP_LEN, Peripheral, PinMap, PinValidationError, Status, USB_HEADER_LEN,
+    UsbHeader,
 };
 use std::{
     collections::HashMap,
@@ -229,8 +230,8 @@ fn board_info(device: &ConnectedDevice, desired: Option<PinMap>) -> BoardInfo {
         active: Some(device.config.pin_map.into()),
         desired: desired.map(Into::into),
         generation: Some(device.config.generation),
-        i2c_bus: Some(device.registration.buses.i2c),
-        spi_bus: Some(device.registration.buses.spi),
+        i2c_buses: device.registration.buses.i2c,
+        spi_buses: device.registration.buses.spi,
         gpio_instance: Some(device.registration.gpio_instance_id()),
     }
 }
@@ -242,8 +243,8 @@ fn disconnected_info(serial: String, desired: PinMap) -> BoardInfo {
         active: None,
         desired: Some(desired.into()),
         generation: None,
-        i2c_bus: None,
-        spi_bus: None,
+        i2c_buses: [None; 2],
+        spi_buses: [None; 2],
         gpio_instance: None,
     }
 }
@@ -962,10 +963,11 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
 fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut offset = 0;
     let mut generation = None;
-    let mut i2c = None;
-    let mut spi = None;
-    let mut uart = None;
-    let mut gpio_pins: Option<[u8; rp_extio_wire::GPIO_LINE_COUNT]> = None;
+    let mut i2c: [Option<(u32, [u8; 2])>; 2] = [None; 2];
+    let mut spi: [Option<(u32, u32, u32, u16, [u8; 5])>; 2] = [None; 2];
+    let mut uart: [Option<[u8; 2]>; 2] = [None; 2];
+    let mut pin_map = None;
+    let mut gpio_pins: Option<Vec<u8>> = None;
     while offset < payload.len() {
         if payload.len() - offset < 4 {
             return Err(invalid("truncated capability record"));
@@ -992,9 +994,10 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                 generation = Some(u64::from_le_bytes(value[8..16].try_into().unwrap()));
             }
             CAP_I2C => {
-                if i2c.is_some()
-                    || value.len() != 16
-                    || value[0] != 0
+                let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
+                if value.len() != 16
+                    || bus >= i2c.len()
+                    || i2c[bus].is_some()
                     || value[1] != 0
                     || u16::from_le_bytes(value[2..4].try_into().unwrap())
                         & (rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)
@@ -1008,12 +1011,13 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                 if minimum == 0 || minimum > maximum {
                     return Err(invalid("invalid I2C speed range"));
                 }
-                i2c = Some((maximum, [value[12], value[13]]));
+                i2c[bus] = Some((maximum, [value[12], value[13]]));
             }
             CAP_SPI => {
-                if spi.is_some()
-                    || value.len() < 16
-                    || value[0] != 0
+                let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
+                if value.len() < 16
+                    || bus >= spi.len()
+                    || spi[bus].is_some()
                     || value[1] != 2
                     || value.len() != 15 + value[1] as usize
                 {
@@ -1022,76 +1026,107 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                 let mode_bits = u16::from_le_bytes(value[2..4].try_into().unwrap()) as u32;
                 let minimum = u32::from_le_bytes(value[4..8].try_into().unwrap());
                 let maximum = u32::from_le_bytes(value[8..12].try_into().unwrap());
-                if mode_bits & !RegistrationConfig::PICO2.spi_mode_bits != 0
-                    || minimum == 0
-                    || minimum > maximum
-                {
+                if mode_bits & !0x4f != 0 || minimum == 0 || minimum > maximum {
                     return Err(invalid("invalid SPI capability values"));
                 }
-                spi = Some((
+                spi[bus] = Some((
                     mode_bits,
                     minimum,
                     maximum,
                     value[1] as u16,
-                    value[12..].to_vec(),
+                    value[12..17].try_into().unwrap(),
                 ));
             }
             CAP_UART => {
-                if uart.is_some()
-                    || value.len() != 12
-                    || value[0] != 0
+                let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
+                if value.len() != 12
+                    || bus >= uart.len()
+                    || uart[bus].is_some()
                     || value[3] != 0
                     || value[8..12] != [0; 4]
                 {
                     return Err(invalid("invalid UART capability"));
                 }
-                uart = Some([value[1], value[2]]);
+                uart[bus] = Some([value[1], value[2]]);
+            }
+            CAP_PIN_CONFIG => {
+                if pin_map.is_some() {
+                    return Err(invalid("duplicate pin configuration capability"));
+                }
+                pin_map = Some(
+                    PinMap::decode(value)
+                        .map_err(|_| invalid("invalid pin configuration capability"))?,
+                );
             }
             CAP_GPIO => {
                 if gpio_pins.is_some()
                     || value.len() < 4
-                    || value[0] != 17
+                    || value[0] == 0
+                    || value[0] as usize > MAX_GPIO_LINES
                     || value[1..4] != [0; 3]
                     || value.len() != 4 + value[0] as usize
                 {
                     return Err(invalid("invalid GPIO capability"));
                 }
-                gpio_pins = Some(value[4..].try_into().unwrap());
+                gpio_pins = Some(value[4..].to_vec());
             }
             _ => {}
         }
     }
-    let (spi_mode_bits, spi_min_speed_hz, spi_max_speed_hz, spi_chip_selects, spi_pins) =
-        spi.ok_or_else(|| invalid("SPI capability missing"))?;
-    let (i2c_speed_hz, i2c_pins) = i2c.ok_or_else(|| invalid("I2C capability missing"))?;
-    let uart_pins = uart.ok_or_else(|| invalid("UART capability missing"))?;
     let gpio_pins = gpio_pins.ok_or_else(|| invalid("GPIO capability missing"))?;
     let generation = generation.ok_or_else(|| invalid("general capability missing"))?;
-    let pin_map = PinMap {
-        uart_tx: uart_pins[0],
-        uart_rx: uart_pins[1],
-        i2c_sda: i2c_pins[0],
-        i2c_scl: i2c_pins[1],
-        spi_sck: spi_pins[0],
-        spi_mosi: spi_pins[1],
-        spi_miso: spi_pins[2],
-        spi_chip_selects: spi_pins[3..5].try_into().unwrap(),
-    };
+    let pin_map = pin_map.ok_or_else(|| invalid("pin configuration capability missing"))?;
     pin_map
         .validate()
         .map_err(|_| invalid("invalid peripheral pin map"))?;
-    if pin_map.gpio_pins().unwrap() != gpio_pins {
+    for bus in 0..2 {
+        let expected_i2c = pin_map.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]);
+        let expected_spi = pin_map.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]);
+        let expected_uart = pin_map.is_enabled([Peripheral::Uart0, Peripheral::Uart1][bus]);
+        if expected_i2c != i2c[bus].is_some()
+            || expected_spi != spi[bus].is_some()
+            || expected_uart != uart[bus].is_some()
+        {
+            return Err(invalid("capabilities do not match enabled peripherals"));
+        }
+        if i2c[bus].is_some_and(|(_, pins)| pins != [pin_map.i2c_sda[bus], pin_map.i2c_scl[bus]])
+            || spi[bus].is_some_and(|(_, _, _, _, pins)| {
+                pins != [
+                    pin_map.spi_sck[bus],
+                    pin_map.spi_mosi[bus],
+                    pin_map.spi_miso[bus],
+                    pin_map.spi_chip_selects[bus][0],
+                    pin_map.spi_chip_selects[bus][1],
+                ]
+            })
+            || uart[bus].is_some_and(|pins| pins != [pin_map.uart_tx[bus], pin_map.uart_rx[bus]])
+        {
+            return Err(invalid("capability pins do not match pin configuration"));
+        }
+    }
+    let expected_gpio = pin_map.gpio_pins().unwrap();
+    if expected_gpio.as_slice() != gpio_pins.as_slice() {
         return Err(invalid("GPIO capability does not match peripheral pins"));
     }
+    let mut gpio_array = [0; MAX_GPIO_LINES];
+    gpio_array[..gpio_pins.len()].copy_from_slice(&gpio_pins);
     Ok(NegotiatedConfig {
         registration: RegistrationConfig {
-            i2c_speed_hz,
-            spi_mode_bits,
-            spi_min_speed_hz,
-            spi_max_speed_hz,
-            spi_chip_selects,
+            i2c: i2c.map(|capability| capability.map(|(speed_hz, _)| I2cRegistration { speed_hz })),
+            spi: spi.map(|capability| {
+                capability.map(
+                    |(spi_mode_bits, spi_min_speed_hz, spi_max_speed_hz, spi_chip_selects, _)| {
+                        SpiRegistration {
+                            spi_mode_bits,
+                            spi_min_speed_hz,
+                            spi_max_speed_hz,
+                            spi_chip_selects,
+                        }
+                    },
+                )
+            }),
             gpio_lines: gpio_pins.len() as u16,
-            gpio_pins,
+            gpio_pins: gpio_array,
         },
         pin_map,
         generation,
@@ -1119,45 +1154,99 @@ mod tests {
     use super::*;
     use crate::backend::{I2cMessage, SpiSegment};
 
+    fn capability_record(payload: &mut Vec<u8>, kind: u16, value: &[u8]) {
+        payload.extend_from_slice(&kind.to_le_bytes());
+        payload.extend_from_slice(&(value.len() as u16).to_le_bytes());
+        payload.extend_from_slice(value);
+    }
+
+    fn capabilities(map: PinMap) -> Vec<u8> {
+        let mut payload = Vec::new();
+        let mut general = vec![
+            rp_extio_wire::VERSION_MAJOR,
+            rp_extio_wire::VERSION_MAJOR,
+            rp_extio_wire::VERSION_MINOR,
+            0,
+        ];
+        general.extend_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
+        general.extend_from_slice(&0_u64.to_le_bytes());
+        capability_record(&mut payload, CAP_GENERAL, &general);
+        for bus in 0..2 {
+            if map.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {
+                let mut value = vec![bus as u8, 0];
+                value.extend_from_slice(&3_u16.to_le_bytes());
+                value.extend_from_slice(&100_000_u32.to_le_bytes());
+                value.extend_from_slice(&100_000_u32.to_le_bytes());
+                value.extend_from_slice(&[map.i2c_sda[bus], map.i2c_scl[bus], 0, 0]);
+                capability_record(&mut payload, CAP_I2C, &value);
+            }
+            if map.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]) {
+                let mut value = vec![bus as u8, 2];
+                value.extend_from_slice(&0x4f_u16.to_le_bytes());
+                value.extend_from_slice(&50_000_u32.to_le_bytes());
+                value.extend_from_slice(&20_000_000_u32.to_le_bytes());
+                value.extend_from_slice(&[
+                    map.spi_sck[bus],
+                    map.spi_mosi[bus],
+                    map.spi_miso[bus],
+                    map.spi_chip_selects[bus][0],
+                    map.spi_chip_selects[bus][1],
+                ]);
+                capability_record(&mut payload, CAP_SPI, &value);
+            }
+            if map.is_enabled([Peripheral::Uart0, Peripheral::Uart1][bus]) {
+                let mut value = vec![bus as u8, map.uart_tx[bus], map.uart_rx[bus], 0];
+                value.extend_from_slice(&115_200_u32.to_le_bytes());
+                value.extend_from_slice(&0_u32.to_le_bytes());
+                capability_record(&mut payload, CAP_UART, &value);
+            }
+        }
+        capability_record(&mut payload, CAP_PIN_CONFIG, &map.encode());
+        let gpio = map.gpio_pins().unwrap();
+        let mut value = vec![gpio.len() as u8, 0, 0, 0];
+        value.extend_from_slice(gpio.as_slice());
+        capability_record(&mut payload, CAP_GPIO, &value);
+        payload
+    }
+
     #[test]
     fn parses_firmware_capabilities() {
-        let mut payload = Vec::new();
-        payload.extend_from_slice(&CAP_GENERAL.to_le_bytes());
-        payload.extend_from_slice(&16_u16.to_le_bytes());
-        payload.extend_from_slice(&[1, 1, 0, 0]);
-        payload.extend_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
-        payload.extend_from_slice(&0_u64.to_le_bytes());
-        payload.extend_from_slice(&CAP_I2C.to_le_bytes());
-        payload.extend_from_slice(&16_u16.to_le_bytes());
-        payload.extend_from_slice(&[0, 0]);
-        payload.extend_from_slice(&3_u16.to_le_bytes());
-        payload.extend_from_slice(&100_000_u32.to_le_bytes());
-        payload.extend_from_slice(&100_000_u32.to_le_bytes());
-        payload.extend_from_slice(&[4, 5, 0, 0]);
-        payload.extend_from_slice(&CAP_SPI.to_le_bytes());
-        payload.extend_from_slice(&17_u16.to_le_bytes());
-        payload.extend_from_slice(&[0, 2]);
-        payload.extend_from_slice(&0x4f_u16.to_le_bytes());
-        payload.extend_from_slice(&50_000_u32.to_le_bytes());
-        payload.extend_from_slice(&20_000_000_u32.to_le_bytes());
-        payload.extend_from_slice(&[18, 19, 16, 17, 21]);
-        payload.extend_from_slice(&CAP_UART.to_le_bytes());
-        payload.extend_from_slice(&12_u16.to_le_bytes());
-        payload.extend_from_slice(&[0, 0, 1, 0]);
-        payload.extend_from_slice(&115_200_u32.to_le_bytes());
-        payload.extend_from_slice(&0_u32.to_le_bytes());
-        payload.extend_from_slice(&CAP_GPIO.to_le_bytes());
-        payload.extend_from_slice(&21_u16.to_le_bytes());
-        payload.extend_from_slice(&[17, 0, 0, 0]);
-        payload.extend_from_slice(&rp_extio_firmware_gpio_pins());
         assert_eq!(
-            parse_capabilities(&payload).unwrap(),
+            parse_capabilities(&capabilities(rp_extio_wire::DEFAULT_PIN_MAP)).unwrap(),
             NegotiatedConfig {
                 registration: RegistrationConfig::PICO2,
                 pin_map: rp_extio_wire::DEFAULT_PIN_MAP,
                 generation: 0,
             }
         );
+    }
+
+    #[test]
+    fn parses_all_enabled_and_all_disabled_capabilities() {
+        let mut map = rp_extio_wire::DEFAULT_PIN_MAP;
+        map.enabled = 0x3f;
+        let all_enabled = parse_capabilities(&capabilities(map)).unwrap();
+        assert!(
+            all_enabled
+                .registration
+                .i2c
+                .into_iter()
+                .all(|bus| bus.is_some())
+        );
+        assert!(
+            all_enabled
+                .registration
+                .spi
+                .into_iter()
+                .all(|bus| bus.is_some())
+        );
+        assert_eq!(all_enabled.registration.gpio_lines, 8);
+
+        map.enabled = 0;
+        let all_disabled = parse_capabilities(&capabilities(map)).unwrap();
+        assert_eq!(all_disabled.registration.i2c, [None; 2]);
+        assert_eq!(all_disabled.registration.spi, [None; 2]);
+        assert_eq!(all_disabled.registration.gpio_lines, 26);
     }
 
     #[test]
@@ -1309,11 +1398,8 @@ mod tests {
             .expect("rp-extio Pico 2 not found");
         let (failed, _failures) = mpsc::unbounded_channel();
         let (backend, config) = UsbBackend::connect(&info, failed).await.unwrap();
-        assert_eq!(
-            config.registration.i2c_speed_hz,
-            RegistrationConfig::PICO2.i2c_speed_hz
-        );
-        assert_eq!(config.registration.spi_chip_selects, 2);
+        assert_eq!(config.registration.i2c, RegistrationConfig::PICO2.i2c);
+        assert_eq!(config.registration.spi[0].unwrap().spi_chip_selects, 2);
         assert_eq!(config.registration.gpio_lines, 17);
 
         let snapshot = backend

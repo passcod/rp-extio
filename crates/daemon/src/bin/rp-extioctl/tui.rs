@@ -12,7 +12,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph},
 };
-use rp_extio_wire::{DEFAULT_PIN_MAP, PinMap, PinSignal};
+use rp_extio_wire::{DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal};
 use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, signal_name};
 use std::{error::Error, io::stdout};
 
@@ -118,6 +118,7 @@ struct App {
     cursor_side: usize,
     edited: Option<PinMap>,
     grouped: bool,
+    flipped: bool,
     default_pending: bool,
     message: String,
     message_error: bool,
@@ -142,6 +143,14 @@ impl App {
             LEFT_HEADER[self.cursor_row]
         } else {
             RIGHT_HEADER[self.cursor_row]
+        }
+    }
+
+    fn screen_cursor_row(&self) -> usize {
+        if self.flipped {
+            HEADER_ROWS - 1 - self.cursor_row
+        } else {
+            self.cursor_row
         }
     }
 
@@ -189,6 +198,11 @@ impl App {
     }
 
     fn move_cursor(&mut self, row_delta: isize, side_delta: isize) {
+        let (row_delta, side_delta) = if self.flipped {
+            (-row_delta, -side_delta)
+        } else {
+            (row_delta, side_delta)
+        };
         self.cursor_row =
             (self.cursor_row as isize + row_delta).clamp(0, HEADER_ROWS as isize - 1) as usize;
         self.cursor_side = (self.cursor_side as isize + side_delta).clamp(0, 1) as usize;
@@ -261,6 +275,45 @@ impl App {
         self.message_error = false;
     }
 
+    fn toggle_peripheral(&mut self) {
+        let peripheral = self.selected_signal().peripheral();
+        let Some(mut candidate) = self.edited else {
+            self.message = "board is disconnected".into();
+            self.message_error = true;
+            return;
+        };
+        let enabled = candidate.is_enabled(peripheral);
+        candidate.set_enabled(peripheral, !enabled);
+        if !enabled && let Err(error) = candidate.validate() {
+            self.message = format!(
+                "cannot enable {}: {}",
+                peripheral_name(peripheral),
+                rp_extiod::control::format_validation(error)
+            );
+            self.message_error = true;
+            return;
+        }
+        self.edited = Some(candidate);
+        self.default_pending = false;
+        self.message = format!(
+            "{} {}; press a to apply",
+            peripheral_name(peripheral),
+            if enabled { "disabled" } else { "enabled" }
+        );
+        self.message_error = false;
+    }
+
+    fn flip(&mut self) {
+        self.flipped = !self.flipped;
+        self.message = if self.flipped {
+            "board view rotated 180°"
+        } else {
+            "board view restored to USB-up orientation"
+        }
+        .into();
+        self.message_error = false;
+    }
+
     fn load_default(&mut self) {
         if self.edited.is_none() {
             self.message = "board is disconnected".into();
@@ -323,6 +376,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
         cursor_side: 0,
         edited: None,
         grouped: true,
+        flipped: false,
         default_pending: false,
         message: String::new(),
         message_error: false,
@@ -354,6 +408,8 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::BackTab => app.cycle_signal(-1),
             KeyCode::Enter | KeyCode::Char(' ') => app.assign_selected(),
             KeyCode::Char('g') => app.toggle_grouped(),
+            KeyCode::Char('e') => app.toggle_peripheral(),
+            KeyCode::Char('f') => app.flip(),
             KeyCode::Char('u') => app.undo(),
             KeyCode::Char('d') => app.load_default(),
             KeyCode::Char('r') => {
@@ -470,7 +526,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     if area.width >= WIDE_WIDTH {
         let columns = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(27), Constraint::Min(MIN_WIDTH)])
+            .constraints([Constraint::Length(31), Constraint::Min(MIN_WIDTH)])
             .split(rows[1]);
         draw_legend(frame, columns[0], app);
         draw_pinout(frame, columns[1], app);
@@ -481,11 +537,11 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
     let assignment_mode = if app.grouped { "grouped" } else { "single" };
     let help = if area.width >= 72 {
         format!(
-            "arrows pin  Tab signal  Enter assign  g {assignment_mode}  a apply  d defaults  u undo\n[/] board  r refresh  l reload  q quit"
+            "arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nf flip  d defaults  u undo  [/] board  r refresh  l reload  q quit"
         )
     } else {
         format!(
-            "arrows pin  Tab signal  Enter assign  g {assignment_mode}\na apply  d defaults  u undo  r refresh  q quit"
+            "arrows/Tab select  Enter assign  e enable  g {assignment_mode}\na apply  f flip  d defaults  u undo  r refresh  q quit"
         )
     };
     frame.render_widget(Paragraph::new(help), rows[3]);
@@ -496,7 +552,17 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let selected = app.selected_signal();
     let route = app
         .edited
-        .map(|map| format!("GP{}", map.pin(selected)))
+        .map(|map| {
+            format!(
+                "GP{} ({})",
+                map.pin(selected),
+                if map.is_enabled(selected.peripheral()) {
+                    "enabled"
+                } else {
+                    "disabled"
+                }
+            )
+        })
         .unwrap_or_else(|| "-".into());
     let summary = board.map_or_else(
         || "no boards".into(),
@@ -506,8 +572,8 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 if board.connected { "●" } else { "○" },
                 board.serial,
                 option(board.generation),
-                option(board.i2c_bus),
-                option(board.spi_bus),
+                bus_numbers(board.i2c_buses),
+                bus_numbers(board.spi_buses),
             )
         },
     );
@@ -534,6 +600,9 @@ fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .map(|(index, &signal)| {
             let draft = app.edited.map(|map| map.pin(signal));
             let active = active.map(|map| map.pin(signal));
+            let enabled = app
+                .edited
+                .is_some_and(|map| map.is_enabled(signal.peripheral()));
             let route = match (active, draft) {
                 (Some(old), Some(new)) if old != new => format!("GP{old} → GP{new}"),
                 (_, Some(pin)) => format!("GP{pin}"),
@@ -544,7 +613,12 @@ fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
             } else {
                 signal_style(signal)
             };
-            ListItem::new(format!("{:<9} {route}", display_signal(signal))).style(style)
+            ListItem::new(format!(
+                "{} {:<10} {route}",
+                if enabled { "●" } else { "○" },
+                display_signal(signal)
+            ))
+            .style(style)
         })
         .collect::<Vec<_>>();
     frame.render_widget(
@@ -559,7 +633,11 @@ fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
-        .title("Pico 2 · USB end ▲")
+        .title(if app.flipped {
+            "Pico 2 · rotated · SWD end ▲"
+        } else {
+            "Pico 2 · USB end ▲"
+        })
         .borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -570,15 +648,25 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let visible = usize::from(inner.height.saturating_sub(2)).min(HEADER_ROWS);
     let start = app
-        .cursor_row
+        .screen_cursor_row()
         .saturating_sub(visible / 2)
         .min(HEADER_ROWS - visible);
     let end = start + visible;
     let mut lines = Vec::with_capacity(visible + 2);
+    let top_end = if app.flipped {
+        "SWD DEBUG"
+    } else {
+        "USB CONNECTOR"
+    };
+    let bottom_end = if app.flipped {
+        "USB CONNECTOR"
+    } else {
+        "SWD DEBUG"
+    };
     let top = if visible == HEADER_ROWS {
-        "USB CONNECTOR".into()
+        top_end.into()
     } else if start == 0 {
-        format!("USB · header rows 1–{end} of {HEADER_ROWS}")
+        format!("{top_end} · rows 1–{end} of {HEADER_ROWS}")
     } else {
         format!("▲ more · header rows {}–{end} of {HEADER_ROWS}", start + 1)
     };
@@ -593,7 +681,7 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
     lines.push(centered_line(
         inner.width,
         if end == HEADER_ROWS {
-            "SWD DEBUG".into()
+            bottom_end.into()
         } else {
             "▼ more header rows".into()
         },
@@ -602,20 +690,30 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
-fn pin_row(width: u16, row: usize, app: &App) -> Line<'static> {
+fn pin_row(width: u16, screen_row: usize, app: &App) -> Line<'static> {
     let cell_width = usize::from((width - CENTER_WIDTH) / 2);
     let remainder = usize::from(width - CENTER_WIDTH) - cell_width * 2;
     let left_width = cell_width;
     let right_width = cell_width + remainder;
-    let center = match row {
+    let center = match screen_row {
         8 => "│ PICO │",
         9 => "│  2   │",
         _ => "│      │",
     };
+    let logical_row = if app.flipped {
+        HEADER_ROWS - 1 - screen_row
+    } else {
+        screen_row
+    };
+    let (left, left_side, right, right_side) = if app.flipped {
+        (RIGHT_HEADER[logical_row], 1, LEFT_HEADER[logical_row], 0)
+    } else {
+        (LEFT_HEADER[logical_row], 0, RIGHT_HEADER[logical_row], 1)
+    };
     Line::from(vec![
-        pin_cell(LEFT_HEADER[row], left_width, row, 0, app, false),
+        pin_cell(left, left_width, logical_row, left_side, app, false),
         Span::styled(center, Style::default().fg(Color::DarkGray)),
-        pin_cell(RIGHT_HEADER[row], right_width, row, 1, app, true),
+        pin_cell(right, right_width, logical_row, right_side, app, true),
     ])
 }
 
@@ -661,7 +759,7 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
     };
     let signals = PinSignal::ALL
         .into_iter()
-        .filter(|&signal| map.pin(signal) == gpio)
+        .filter(|&signal| map.is_enabled(signal.peripheral()) && map.pin(signal) == gpio)
         .collect::<Vec<_>>();
     let role = if signals.is_empty() {
         "GPIO".into()
@@ -674,8 +772,12 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
     };
     let changed = app.active_map().is_some_and(|active| {
         PinSignal::ALL.into_iter().any(|signal| {
-            active.pin(signal) != map.pin(signal)
-                && (active.pin(signal) == gpio || map.pin(signal) == gpio)
+            let active_enabled = active.is_enabled(signal.peripheral());
+            let draft_enabled = map.is_enabled(signal.peripheral());
+            (active_enabled != draft_enabled
+                || (draft_enabled && active.pin(signal) != map.pin(signal)))
+                && ((active_enabled && active.pin(signal) == gpio)
+                    || (draft_enabled && map.pin(signal) == gpio))
         })
     });
     (role, signals.len() > 1, changed)
@@ -703,7 +805,7 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
     if let Some(map) = app.edited
         && let Some(assigned) = PinSignal::ALL
             .into_iter()
-            .find(|&candidate| map.pin(candidate) == gpio)
+            .find(|&candidate| map.is_enabled(candidate.peripheral()) && map.pin(candidate) == gpio)
     {
         return signal_style(assigned);
     }
@@ -772,7 +874,10 @@ fn find_gpio(gpio: u8) -> Option<(usize, usize)> {
 }
 
 fn coupled_signal(signal: PinSignal) -> bool {
-    !matches!(signal, PinSignal::SpiCs0 | PinSignal::SpiCs1)
+    !matches!(
+        signal,
+        PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1
+    )
 }
 
 fn routed_map(
@@ -787,54 +892,92 @@ fn routed_map(
     }
 
     let routes: &[(PinSignal, u8)] = match signal {
-        PinSignal::UartTx => &[
-            (PinSignal::UartTx, pin),
-            (PinSignal::UartRx, pin.saturating_add(1)),
+        PinSignal::Uart0Tx => &[
+            (PinSignal::Uart0Tx, pin),
+            (PinSignal::Uart0Rx, pin.saturating_add(1)),
         ],
-        PinSignal::UartRx => &[
-            (PinSignal::UartTx, pin.saturating_sub(1)),
-            (PinSignal::UartRx, pin),
+        PinSignal::Uart0Rx => &[
+            (PinSignal::Uart0Tx, pin.saturating_sub(1)),
+            (PinSignal::Uart0Rx, pin),
         ],
-        PinSignal::I2cSda => &[
-            (PinSignal::I2cSda, pin),
-            (PinSignal::I2cScl, pin.saturating_add(1)),
+        PinSignal::Uart1Tx => &[
+            (PinSignal::Uart1Tx, pin),
+            (PinSignal::Uart1Rx, pin.saturating_add(1)),
         ],
-        PinSignal::I2cScl => &[
-            (PinSignal::I2cSda, pin.saturating_sub(1)),
-            (PinSignal::I2cScl, pin),
+        PinSignal::Uart1Rx => &[
+            (PinSignal::Uart1Tx, pin.saturating_sub(1)),
+            (PinSignal::Uart1Rx, pin),
         ],
-        PinSignal::SpiMiso => &[
-            (PinSignal::SpiMiso, pin),
-            (PinSignal::SpiSck, pin.saturating_add(2)),
-            (PinSignal::SpiMosi, pin.saturating_add(3)),
+        PinSignal::I2c0Sda => &[
+            (PinSignal::I2c0Sda, pin),
+            (PinSignal::I2c0Scl, pin.saturating_add(1)),
         ],
-        PinSignal::SpiSck => &[
-            (PinSignal::SpiMiso, pin.saturating_sub(2)),
-            (PinSignal::SpiSck, pin),
-            (PinSignal::SpiMosi, pin.saturating_add(1)),
+        PinSignal::I2c0Scl => &[
+            (PinSignal::I2c0Sda, pin.saturating_sub(1)),
+            (PinSignal::I2c0Scl, pin),
         ],
-        PinSignal::SpiMosi => &[
-            (PinSignal::SpiMiso, pin.saturating_sub(3)),
-            (PinSignal::SpiSck, pin.saturating_sub(1)),
-            (PinSignal::SpiMosi, pin),
+        PinSignal::I2c1Sda => &[
+            (PinSignal::I2c1Sda, pin),
+            (PinSignal::I2c1Scl, pin.saturating_add(1)),
         ],
-        PinSignal::SpiCs0 | PinSignal::SpiCs1 => unreachable!(),
+        PinSignal::I2c1Scl => &[
+            (PinSignal::I2c1Sda, pin.saturating_sub(1)),
+            (PinSignal::I2c1Scl, pin),
+        ],
+        PinSignal::Spi0Miso => &[
+            (PinSignal::Spi0Miso, pin),
+            (PinSignal::Spi0Sck, pin.saturating_add(2)),
+            (PinSignal::Spi0Mosi, pin.saturating_add(3)),
+        ],
+        PinSignal::Spi0Sck => &[
+            (PinSignal::Spi0Miso, pin.saturating_sub(2)),
+            (PinSignal::Spi0Sck, pin),
+            (PinSignal::Spi0Mosi, pin.saturating_add(1)),
+        ],
+        PinSignal::Spi0Mosi => &[
+            (PinSignal::Spi0Miso, pin.saturating_sub(3)),
+            (PinSignal::Spi0Sck, pin.saturating_sub(1)),
+            (PinSignal::Spi0Mosi, pin),
+        ],
+        PinSignal::Spi1Miso => &[
+            (PinSignal::Spi1Miso, pin),
+            (PinSignal::Spi1Sck, pin.saturating_add(2)),
+            (PinSignal::Spi1Mosi, pin.saturating_add(3)),
+        ],
+        PinSignal::Spi1Sck => &[
+            (PinSignal::Spi1Miso, pin.saturating_sub(2)),
+            (PinSignal::Spi1Sck, pin),
+            (PinSignal::Spi1Mosi, pin.saturating_add(1)),
+        ],
+        PinSignal::Spi1Mosi => &[
+            (PinSignal::Spi1Miso, pin.saturating_sub(3)),
+            (PinSignal::Spi1Sck, pin.saturating_sub(1)),
+            (PinSignal::Spi1Mosi, pin),
+        ],
+        PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1 => {
+            unreachable!()
+        }
     };
     if routes
         .iter()
         .any(|(signal, pin)| !signal.valid_pins().contains(pin))
     {
         return Err(match signal {
-            PinSignal::UartTx | PinSignal::UartRx => {
+            PinSignal::Uart0Tx | PinSignal::Uart0Rx | PinSignal::Uart1Tx | PinSignal::Uart1Rx => {
                 "selected pin has no complete UART pair on the Pico 2 header"
             }
-            PinSignal::I2cSda | PinSignal::I2cScl => {
+            PinSignal::I2c0Sda | PinSignal::I2c0Scl | PinSignal::I2c1Sda | PinSignal::I2c1Scl => {
                 "selected pin has no complete I²C pair on the Pico 2 header"
             }
-            PinSignal::SpiMiso | PinSignal::SpiSck | PinSignal::SpiMosi => {
-                "selected pin has no complete SPI group on the Pico 2 header"
+            PinSignal::Spi0Miso
+            | PinSignal::Spi0Sck
+            | PinSignal::Spi0Mosi
+            | PinSignal::Spi1Miso
+            | PinSignal::Spi1Sck
+            | PinSignal::Spi1Mosi => "selected pin has no complete SPI group on the Pico 2 header",
+            PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1 => {
+                unreachable!()
             }
-            PinSignal::SpiCs0 | PinSignal::SpiCs1 => unreachable!(),
         });
     }
     for &(signal, pin) in routes {
@@ -845,42 +988,89 @@ fn routed_map(
 
 fn display_signal(signal: PinSignal) -> &'static str {
     match signal {
-        PinSignal::UartTx => "UART TX",
-        PinSignal::UartRx => "UART RX",
-        PinSignal::I2cSda => "I²C SDA",
-        PinSignal::I2cScl => "I²C SCL",
-        PinSignal::SpiMiso => "SPI MISO",
-        PinSignal::SpiSck => "SPI SCK",
-        PinSignal::SpiMosi => "SPI MOSI",
-        PinSignal::SpiCs0 => "SPI CS0",
-        PinSignal::SpiCs1 => "SPI CS1",
+        PinSignal::Uart0Tx => "UART0 TX",
+        PinSignal::Uart0Rx => "UART0 RX",
+        PinSignal::Uart1Tx => "UART1 TX",
+        PinSignal::Uart1Rx => "UART1 RX",
+        PinSignal::I2c0Sda => "I²C0 SDA",
+        PinSignal::I2c0Scl => "I²C0 SCL",
+        PinSignal::I2c1Sda => "I²C1 SDA",
+        PinSignal::I2c1Scl => "I²C1 SCL",
+        PinSignal::Spi0Miso => "SPI0 MISO",
+        PinSignal::Spi0Sck => "SPI0 SCK",
+        PinSignal::Spi0Mosi => "SPI0 MOSI",
+        PinSignal::Spi0Cs0 => "SPI0 CS0",
+        PinSignal::Spi0Cs1 => "SPI0 CS1",
+        PinSignal::Spi1Miso => "SPI1 MISO",
+        PinSignal::Spi1Sck => "SPI1 SCK",
+        PinSignal::Spi1Mosi => "SPI1 MOSI",
+        PinSignal::Spi1Cs0 => "SPI1 CS0",
+        PinSignal::Spi1Cs1 => "SPI1 CS1",
     }
 }
 
 fn short_signal(signal: PinSignal) -> &'static str {
     match signal {
-        PinSignal::UartTx => "U-TX",
-        PinSignal::UartRx => "U-RX",
-        PinSignal::I2cSda => "I-SDA",
-        PinSignal::I2cScl => "I-SCL",
-        PinSignal::SpiMiso => "MISO",
-        PinSignal::SpiSck => "SCK",
-        PinSignal::SpiMosi => "MOSI",
-        PinSignal::SpiCs0 => "CS0",
-        PinSignal::SpiCs1 => "CS1",
+        PinSignal::Uart0Tx => "U0-TX",
+        PinSignal::Uart0Rx => "U0-RX",
+        PinSignal::Uart1Tx => "U1-TX",
+        PinSignal::Uart1Rx => "U1-RX",
+        PinSignal::I2c0Sda => "I0-SDA",
+        PinSignal::I2c0Scl => "I0-SCL",
+        PinSignal::I2c1Sda => "I1-SDA",
+        PinSignal::I2c1Scl => "I1-SCL",
+        PinSignal::Spi0Miso => "S0-MI",
+        PinSignal::Spi0Sck => "S0-CK",
+        PinSignal::Spi0Mosi => "S0-MO",
+        PinSignal::Spi0Cs0 => "S0-C0",
+        PinSignal::Spi0Cs1 => "S0-C1",
+        PinSignal::Spi1Miso => "S1-MI",
+        PinSignal::Spi1Sck => "S1-CK",
+        PinSignal::Spi1Mosi => "S1-MO",
+        PinSignal::Spi1Cs0 => "S1-C0",
+        PinSignal::Spi1Cs1 => "S1-C1",
     }
 }
 
 fn signal_style(signal: PinSignal) -> Style {
     Style::default().fg(match signal {
-        PinSignal::UartTx | PinSignal::UartRx => Color::Magenta,
-        PinSignal::I2cSda | PinSignal::I2cScl => Color::Cyan,
-        PinSignal::SpiMiso
-        | PinSignal::SpiSck
-        | PinSignal::SpiMosi
-        | PinSignal::SpiCs0
-        | PinSignal::SpiCs1 => Color::Yellow,
+        PinSignal::Uart0Tx | PinSignal::Uart0Rx | PinSignal::Uart1Tx | PinSignal::Uart1Rx => {
+            Color::Magenta
+        }
+        PinSignal::I2c0Sda | PinSignal::I2c0Scl | PinSignal::I2c1Sda | PinSignal::I2c1Scl => {
+            Color::Cyan
+        }
+        PinSignal::Spi0Miso
+        | PinSignal::Spi0Sck
+        | PinSignal::Spi0Mosi
+        | PinSignal::Spi0Cs0
+        | PinSignal::Spi0Cs1
+        | PinSignal::Spi1Miso
+        | PinSignal::Spi1Sck
+        | PinSignal::Spi1Mosi
+        | PinSignal::Spi1Cs0
+        | PinSignal::Spi1Cs1 => Color::Yellow,
     })
+}
+
+fn peripheral_name(peripheral: Peripheral) -> &'static str {
+    match peripheral {
+        Peripheral::Uart0 => "UART0",
+        Peripheral::Uart1 => "UART1",
+        Peripheral::I2c0 => "I²C0",
+        Peripheral::I2c1 => "I²C1",
+        Peripheral::Spi0 => "SPI0",
+        Peripheral::Spi1 => "SPI1",
+    }
+}
+
+fn bus_numbers(buses: [Option<i32>; 2]) -> String {
+    buses
+        .into_iter()
+        .enumerate()
+        .map(|(instance, bus)| format!("{instance}:{}", option(bus)))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn option(value: Option<impl ToString>) -> String {
@@ -901,8 +1091,8 @@ mod tests {
                 active: Some(DEFAULT_PIN_MAP.into()),
                 desired: Some(DEFAULT_PIN_MAP.into()),
                 generation: Some(4),
-                i2c_bus: Some(27),
-                spi_bus: Some(0),
+                i2c_buses: [Some(27), None],
+                spi_buses: [Some(0), None],
                 gpio_instance: Some(3),
             }],
             board: 0,
@@ -911,6 +1101,7 @@ mod tests {
             cursor_side: 0,
             edited: Some(DEFAULT_PIN_MAP),
             grouped: true,
+            flipped: false,
             default_pending: false,
             message: String::new(),
             message_error: false,
@@ -970,32 +1161,35 @@ mod tests {
     fn grouped_assignment_moves_i2c_uart_and_spi_routes_together() {
         let mut app = app();
 
-        app.signal = PinSignal::I2cSda as usize;
+        app.signal = PinSignal::I2c0Sda as usize;
         (app.cursor_row, app.cursor_side) = find_gpio(8).unwrap();
         app.assign_selected();
         let map = app.edited.unwrap();
-        assert_eq!((map.i2c_sda, map.i2c_scl), (8, 9));
+        assert_eq!((map.i2c_sda[0], map.i2c_scl[0]), (8, 9));
         assert!(map.validate().is_ok());
 
-        app.signal = PinSignal::UartRx as usize;
+        app.signal = PinSignal::Uart0Rx as usize;
         (app.cursor_row, app.cursor_side) = find_gpio(15).unwrap();
         app.assign_selected();
         let map = app.edited.unwrap();
-        assert_eq!((map.uart_tx, map.uart_rx), (14, 15));
+        assert_eq!((map.uart_tx[0], map.uart_rx[0]), (14, 15));
         assert!(map.validate().is_ok());
 
-        app.signal = PinSignal::SpiSck as usize;
+        app.signal = PinSignal::Spi0Sck as usize;
         (app.cursor_row, app.cursor_side) = find_gpio(6).unwrap();
         app.assign_selected();
         let map = app.edited.unwrap();
-        assert_eq!((map.spi_miso, map.spi_sck, map.spi_mosi), (4, 6, 7));
+        assert_eq!(
+            (map.spi_miso[0], map.spi_sck[0], map.spi_mosi[0]),
+            (4, 6, 7)
+        );
         assert!(map.validate().is_ok());
     }
 
     #[test]
     fn grouped_assignment_rejects_conflicts_without_changing_the_draft() {
         let mut app = app();
-        app.signal = PinSignal::SpiMiso as usize;
+        app.signal = PinSignal::Spi0Miso as usize;
         app.cursor_row = 0;
         app.assign_selected();
         assert_eq!(app.edited.unwrap(), DEFAULT_PIN_MAP);
@@ -1009,10 +1203,10 @@ mod tests {
     fn individual_assignment_retains_manual_invalid_drafts() {
         let mut app = app();
         app.toggle_grouped();
-        app.signal = PinSignal::SpiMiso as usize;
+        app.signal = PinSignal::Spi0Miso as usize;
         app.cursor_row = 0;
         app.assign_selected();
-        assert_eq!(app.edited.unwrap().spi_miso, 0);
+        assert_eq!(app.edited.unwrap().spi_miso[0], 0);
         assert!(app.message.contains("assigned to both"));
         assert!(app.message_error);
         assert!(app.dirty());
@@ -1031,13 +1225,83 @@ mod tests {
     #[test]
     fn chip_selects_remain_individually_assignable_in_grouped_mode() {
         let mut app = app();
-        app.signal = PinSignal::SpiCs0 as usize;
+        app.signal = PinSignal::Spi0Cs0 as usize;
         (app.cursor_row, app.cursor_side) = find_gpio(10).unwrap();
         app.assign_selected();
         let map = app.edited.unwrap();
-        assert_eq!(map.spi_chip_selects, [10, 21]);
-        assert_eq!((map.spi_miso, map.spi_sck, map.spi_mosi), (16, 18, 19));
+        assert_eq!(map.spi_chip_selects[0], [10, 21]);
+        assert_eq!(
+            (map.spi_miso[0], map.spi_sck[0], map.spi_mosi[0]),
+            (16, 18, 19)
+        );
         assert!(map.validate().is_ok());
+    }
+
+    #[test]
+    fn disabled_peripherals_release_gpio_and_can_be_rerouted_before_enabling() {
+        let mut app = app();
+        app.signal = PinSignal::Uart0Tx as usize;
+        app.toggle_peripheral();
+        let map = app.edited.unwrap();
+        assert!(!map.is_enabled(Peripheral::Uart0));
+        assert_eq!(pin_role(LEFT_HEADER[0], &app).0, "GPIO");
+
+        app.signal = PinSignal::Uart1Tx as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(4).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!((map.uart_tx[1], map.uart_rx[1]), (4, 5));
+        assert!(!map.is_enabled(Peripheral::Uart1));
+
+        app.toggle_peripheral();
+        assert!(!app.edited.unwrap().is_enabled(Peripheral::Uart1));
+        assert!(app.message.contains("cannot enable UART1"));
+
+        (app.cursor_row, app.cursor_side) = find_gpio(8).unwrap();
+        app.assign_selected();
+        app.toggle_peripheral();
+        assert!(app.edited.unwrap().is_enabled(Peripheral::Uart1));
+    }
+
+    #[test]
+    fn grouped_assignment_keeps_instance_one_signals_together() {
+        let mut app = app();
+        app.signal = PinSignal::Spi1Sck as usize;
+        (app.cursor_row, app.cursor_side) = find_gpio(10).unwrap();
+        app.assign_selected();
+        let map = app.edited.unwrap();
+        assert_eq!(
+            (map.spi_miso[1], map.spi_sck[1], map.spi_mosi[1]),
+            (8, 10, 11)
+        );
+        assert_eq!(
+            (map.spi_miso[0], map.spi_sck[0], map.spi_mosi[0]),
+            (16, 18, 19)
+        );
+    }
+
+    #[test]
+    fn flipped_view_rotates_headers_and_screen_navigation() {
+        let mut app = app();
+        app.flip();
+        let output = rendered(120, 40, &app);
+        assert!(output.contains("rotated · SWD end"));
+        assert!(output.find("SWD DEBUG").unwrap() < output.find("USB CONNECTOR").unwrap());
+        app.cursor_row = 19;
+        app.cursor_side = 1;
+        assert_eq!(app.selected_pin().physical, 21);
+        assert_eq!(app.screen_cursor_row(), 0);
+        app.cursor_row = 0;
+        app.cursor_side = 0;
+        assert_eq!(app.selected_pin().physical, 1);
+        assert_eq!(app.screen_cursor_row(), 19);
+
+        app.cursor_row = 10;
+        app.cursor_side = 1;
+        app.move_cursor(1, 0);
+        assert_eq!(app.cursor_row, 9);
+        app.move_cursor(0, 1);
+        assert_eq!(app.cursor_side, 0);
     }
 
     #[test]
@@ -1046,7 +1310,7 @@ mod tests {
         assert!(output.contains("USB CONNECTOR"));
         assert!(output.contains(" 1 GP0"));
         assert!(output.contains("VBUS 40"));
-        assert!(output.contains("UART TX"));
+        assert!(output.contains("UART0 TX"));
         assert!(output.contains("SWD DEBUG"));
     }
 
@@ -1064,7 +1328,7 @@ mod tests {
     #[test]
     fn compact_render_marks_omitted_lower_rows() {
         let output = rendered(80, 20, &app());
-        assert!(output.contains("USB · header rows 1–"));
+        assert!(output.contains("USB CONNECTOR · rows 1–"));
         assert!(output.contains("▼ more header rows"));
         assert!(!output.contains("SWD DEBUG"));
     }

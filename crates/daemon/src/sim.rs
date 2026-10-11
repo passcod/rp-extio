@@ -39,9 +39,16 @@ pub enum Command {
 #[serde(tag = "result", rename_all = "snake_case")]
 pub enum Response {
     Ok,
-    Created { i2c_bus: i32, spi_bus: i32 },
-    Observed { transactions: Vec<Transaction> },
-    Error { message: String },
+    Created {
+        i2c_buses: [Option<i32>; 2],
+        spi_buses: [Option<i32>; 2],
+    },
+    Observed {
+        transactions: Vec<Transaction>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 struct Expectation {

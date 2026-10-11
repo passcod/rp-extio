@@ -219,8 +219,8 @@ async fn serve_simulation(socket: PathBuf, kernel: Arc<Kernel>) -> std::io::Resu
                                         let buses = registration.buses;
                                         entry.insert(registration);
                                         sim::Response::Created {
-                                            i2c_bus: buses.i2c,
-                                            spi_bus: buses.spi,
+                                            i2c_buses: buses.i2c,
+                                            spi_buses: buses.spi,
                                         }
                                     }
                                     Err(error) => {

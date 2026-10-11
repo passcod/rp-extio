@@ -2,8 +2,8 @@
 
 pub const USB_MAGIC: [u8; 4] = *b"RPXB";
 pub const KERNEL_MAGIC: [u8; 4] = *b"RPKD";
-pub const VERSION_MAJOR: u8 = 1;
-pub const VERSION_MINOR: u8 = 3;
+pub const VERSION_MAJOR: u8 = 2;
+pub const VERSION_MINOR: u8 = 0;
 pub const USB_HEADER_LEN: usize = 24;
 pub const KERNEL_HEADER_LEN: usize = 32;
 pub const MAX_PAYLOAD: usize = 4096;
@@ -16,6 +16,7 @@ pub const CAP_I2C: u16 = 2;
 pub const CAP_SPI: u16 = 3;
 pub const CAP_UART: u16 = 4;
 pub const CAP_GPIO: u16 = 5;
+pub const CAP_PIN_CONFIG: u16 = 6;
 pub const GPIO_GET: u8 = 1;
 pub const GPIO_SET: u8 = 2;
 pub const GPIO_DIRECTION_INPUT: u8 = 3;
@@ -25,8 +26,9 @@ pub const GPIO_SNAPSHOT: u8 = 6;
 pub const HEADER_PINS: [u8; 26] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28,
 ];
-pub const GPIO_LINE_COUNT: usize = 17;
-pub const PIN_MAP_LEN: usize = 9;
+pub const MAX_GPIO_LINES: usize = HEADER_PINS.len();
+pub const PIN_SIGNAL_COUNT: usize = 18;
+pub const PIN_MAP_LEN: usize = PIN_SIGNAL_COUNT + 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -97,40 +99,129 @@ pub enum WireError {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum PinSignal {
-    UartTx = 0,
-    UartRx = 1,
-    I2cSda = 2,
-    I2cScl = 3,
-    SpiMiso = 4,
-    SpiSck = 5,
-    SpiMosi = 6,
-    SpiCs0 = 7,
-    SpiCs1 = 8,
+    Uart0Tx = 0,
+    Uart0Rx = 1,
+    Uart1Tx = 2,
+    Uart1Rx = 3,
+    I2c0Sda = 4,
+    I2c0Scl = 5,
+    I2c1Sda = 6,
+    I2c1Scl = 7,
+    Spi0Miso = 8,
+    Spi0Sck = 9,
+    Spi0Mosi = 10,
+    Spi0Cs0 = 11,
+    Spi0Cs1 = 12,
+    Spi1Miso = 13,
+    Spi1Sck = 14,
+    Spi1Mosi = 15,
+    Spi1Cs0 = 16,
+    Spi1Cs1 = 17,
 }
 
 impl PinSignal {
-    pub const ALL: [Self; PIN_MAP_LEN] = [
-        Self::UartTx,
-        Self::UartRx,
-        Self::I2cSda,
-        Self::I2cScl,
-        Self::SpiMiso,
-        Self::SpiSck,
-        Self::SpiMosi,
-        Self::SpiCs0,
-        Self::SpiCs1,
+    pub const ALL: [Self; PIN_SIGNAL_COUNT] = [
+        Self::Uart0Tx,
+        Self::Uart0Rx,
+        Self::Uart1Tx,
+        Self::Uart1Rx,
+        Self::I2c0Sda,
+        Self::I2c0Scl,
+        Self::I2c1Sda,
+        Self::I2c1Scl,
+        Self::Spi0Miso,
+        Self::Spi0Sck,
+        Self::Spi0Mosi,
+        Self::Spi0Cs0,
+        Self::Spi0Cs1,
+        Self::Spi1Miso,
+        Self::Spi1Sck,
+        Self::Spi1Mosi,
+        Self::Spi1Cs0,
+        Self::Spi1Cs1,
     ];
 
     pub const fn valid_pins(self) -> &'static [u8] {
         match self {
-            Self::UartTx => &[0, 2, 12, 14, 16, 18, 28],
-            Self::UartRx => &[1, 3, 13, 15, 17, 19],
-            Self::I2cSda => &[0, 4, 8, 12, 16, 20],
-            Self::I2cScl => &[1, 5, 9, 13, 17, 21],
-            Self::SpiMiso => &[0, 4, 16, 20],
-            Self::SpiSck => &[2, 6, 18, 22],
-            Self::SpiMosi => &[3, 7, 19],
-            Self::SpiCs0 | Self::SpiCs1 => &HEADER_PINS,
+            Self::Uart0Tx => &[0, 2, 12, 14, 16, 18, 28],
+            Self::Uart0Rx => &[1, 3, 13, 15, 17, 19],
+            Self::Uart1Tx => &[4, 6, 8, 10, 20, 22, 26],
+            Self::Uart1Rx => &[5, 7, 9, 11, 21, 27],
+            Self::I2c0Sda => &[0, 4, 8, 12, 16, 20],
+            Self::I2c0Scl => &[1, 5, 9, 13, 17, 21],
+            Self::I2c1Sda => &[2, 6, 10, 14, 18, 22, 26],
+            Self::I2c1Scl => &[3, 7, 11, 15, 19, 27],
+            Self::Spi0Miso => &[0, 4, 16, 20],
+            Self::Spi0Sck => &[2, 6, 18, 22],
+            Self::Spi0Mosi => &[3, 7, 19],
+            Self::Spi1Miso => &[8, 12, 28],
+            Self::Spi1Sck => &[10, 14, 26],
+            Self::Spi1Mosi => &[11, 15, 27],
+            Self::Spi0Cs0 | Self::Spi0Cs1 | Self::Spi1Cs0 | Self::Spi1Cs1 => &HEADER_PINS,
+        }
+    }
+
+    pub const fn peripheral(self) -> Peripheral {
+        match self {
+            Self::Uart0Tx | Self::Uart0Rx => Peripheral::Uart0,
+            Self::Uart1Tx | Self::Uart1Rx => Peripheral::Uart1,
+            Self::I2c0Sda | Self::I2c0Scl => Peripheral::I2c0,
+            Self::I2c1Sda | Self::I2c1Scl => Peripheral::I2c1,
+            Self::Spi0Miso | Self::Spi0Sck | Self::Spi0Mosi | Self::Spi0Cs0 | Self::Spi0Cs1 => {
+                Peripheral::Spi0
+            }
+            Self::Spi1Miso | Self::Spi1Sck | Self::Spi1Mosi | Self::Spi1Cs0 | Self::Spi1Cs1 => {
+                Peripheral::Spi1
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum Peripheral {
+    Uart0 = 0,
+    Uart1 = 1,
+    I2c0 = 2,
+    I2c1 = 3,
+    Spi0 = 4,
+    Spi1 = 5,
+}
+
+impl Peripheral {
+    pub const ALL: [Self; 6] = [
+        Self::Uart0,
+        Self::Uart1,
+        Self::I2c0,
+        Self::I2c1,
+        Self::Spi0,
+        Self::Spi1,
+    ];
+
+    pub const fn mask(self) -> u8 {
+        1 << self as u8
+    }
+
+    pub const fn signals(self) -> &'static [PinSignal] {
+        match self {
+            Self::Uart0 => &[PinSignal::Uart0Tx, PinSignal::Uart0Rx],
+            Self::Uart1 => &[PinSignal::Uart1Tx, PinSignal::Uart1Rx],
+            Self::I2c0 => &[PinSignal::I2c0Sda, PinSignal::I2c0Scl],
+            Self::I2c1 => &[PinSignal::I2c1Sda, PinSignal::I2c1Scl],
+            Self::Spi0 => &[
+                PinSignal::Spi0Miso,
+                PinSignal::Spi0Sck,
+                PinSignal::Spi0Mosi,
+                PinSignal::Spi0Cs0,
+                PinSignal::Spi0Cs1,
+            ],
+            Self::Spi1 => &[
+                PinSignal::Spi1Miso,
+                PinSignal::Spi1Sck,
+                PinSignal::Spi1Mosi,
+                PinSignal::Spi1Cs0,
+                PinSignal::Spi1Cs1,
+            ],
         }
     }
 }
@@ -153,6 +244,7 @@ pub enum PinValidationKind {
     InvalidRoute = 2,
     MismatchedPair = 3,
     DuplicatePin = 4,
+    InvalidEnableMask = 5,
 }
 
 impl TryFrom<u8> for PinValidationKind {
@@ -164,6 +256,7 @@ impl TryFrom<u8> for PinValidationKind {
             2 => Ok(Self::InvalidRoute),
             3 => Ok(Self::MismatchedPair),
             4 => Ok(Self::DuplicatePin),
+            5 => Ok(Self::InvalidEnableMask),
             _ => Err(WireError::Invalid),
         }
     }
@@ -211,25 +304,27 @@ impl PinValidationError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PinMap {
-    pub uart_tx: u8,
-    pub uart_rx: u8,
-    pub i2c_sda: u8,
-    pub i2c_scl: u8,
-    pub spi_miso: u8,
-    pub spi_sck: u8,
-    pub spi_mosi: u8,
-    pub spi_chip_selects: [u8; 2],
+    pub uart_tx: [u8; 2],
+    pub uart_rx: [u8; 2],
+    pub i2c_sda: [u8; 2],
+    pub i2c_scl: [u8; 2],
+    pub spi_miso: [u8; 2],
+    pub spi_sck: [u8; 2],
+    pub spi_mosi: [u8; 2],
+    pub spi_chip_selects: [[u8; 2]; 2],
+    pub enabled: u8,
 }
 
 pub const DEFAULT_PIN_MAP: PinMap = PinMap {
-    uart_tx: 0,
-    uart_rx: 1,
-    i2c_sda: 4,
-    i2c_scl: 5,
-    spi_miso: 16,
-    spi_sck: 18,
-    spi_mosi: 19,
-    spi_chip_selects: [17, 21],
+    uart_tx: [0, 8],
+    uart_rx: [1, 9],
+    i2c_sda: [4, 10],
+    i2c_scl: [5, 11],
+    spi_miso: [16, 12],
+    spi_sck: [18, 14],
+    spi_mosi: [19, 15],
+    spi_chip_selects: [[17, 21], [13, 20]],
+    enabled: Peripheral::Uart0.mask() | Peripheral::I2c0.mask() | Peripheral::Spi0.mask(),
 };
 
 impl Default for PinMap {
@@ -241,15 +336,25 @@ impl Default for PinMap {
 impl PinMap {
     pub const fn encode(self) -> [u8; PIN_MAP_LEN] {
         [
-            self.uart_tx,
-            self.uart_rx,
-            self.i2c_sda,
-            self.i2c_scl,
-            self.spi_miso,
-            self.spi_sck,
-            self.spi_mosi,
-            self.spi_chip_selects[0],
-            self.spi_chip_selects[1],
+            self.uart_tx[0],
+            self.uart_rx[0],
+            self.uart_tx[1],
+            self.uart_rx[1],
+            self.i2c_sda[0],
+            self.i2c_scl[0],
+            self.i2c_sda[1],
+            self.i2c_scl[1],
+            self.spi_miso[0],
+            self.spi_sck[0],
+            self.spi_mosi[0],
+            self.spi_chip_selects[0][0],
+            self.spi_chip_selects[0][1],
+            self.spi_miso[1],
+            self.spi_sck[1],
+            self.spi_mosi[1],
+            self.spi_chip_selects[1][0],
+            self.spi_chip_selects[1][1],
+            self.enabled,
         ]
     }
 
@@ -257,15 +362,19 @@ impl PinMap {
         if bytes.len() != PIN_MAP_LEN {
             return Err(WireError::Truncated);
         }
+        if bytes[PIN_SIGNAL_COUNT] & !0x3f != 0 {
+            return Err(WireError::Invalid);
+        }
         Ok(Self {
-            uart_tx: bytes[0],
-            uart_rx: bytes[1],
-            i2c_sda: bytes[2],
-            i2c_scl: bytes[3],
-            spi_miso: bytes[4],
-            spi_sck: bytes[5],
-            spi_mosi: bytes[6],
-            spi_chip_selects: [bytes[7], bytes[8]],
+            uart_tx: [bytes[0], bytes[2]],
+            uart_rx: [bytes[1], bytes[3]],
+            i2c_sda: [bytes[4], bytes[6]],
+            i2c_scl: [bytes[5], bytes[7]],
+            spi_miso: [bytes[8], bytes[13]],
+            spi_sck: [bytes[9], bytes[14]],
+            spi_mosi: [bytes[10], bytes[15]],
+            spi_chip_selects: [[bytes[11], bytes[12]], [bytes[16], bytes[17]]],
+            enabled: bytes[18],
         })
     }
 
@@ -275,19 +384,48 @@ impl PinMap {
 
     pub fn set_pin(&mut self, signal: PinSignal, pin: u8) {
         match signal {
-            PinSignal::UartTx => self.uart_tx = pin,
-            PinSignal::UartRx => self.uart_rx = pin,
-            PinSignal::I2cSda => self.i2c_sda = pin,
-            PinSignal::I2cScl => self.i2c_scl = pin,
-            PinSignal::SpiMiso => self.spi_miso = pin,
-            PinSignal::SpiSck => self.spi_sck = pin,
-            PinSignal::SpiMosi => self.spi_mosi = pin,
-            PinSignal::SpiCs0 => self.spi_chip_selects[0] = pin,
-            PinSignal::SpiCs1 => self.spi_chip_selects[1] = pin,
+            PinSignal::Uart0Tx => self.uart_tx[0] = pin,
+            PinSignal::Uart0Rx => self.uart_rx[0] = pin,
+            PinSignal::Uart1Tx => self.uart_tx[1] = pin,
+            PinSignal::Uart1Rx => self.uart_rx[1] = pin,
+            PinSignal::I2c0Sda => self.i2c_sda[0] = pin,
+            PinSignal::I2c0Scl => self.i2c_scl[0] = pin,
+            PinSignal::I2c1Sda => self.i2c_sda[1] = pin,
+            PinSignal::I2c1Scl => self.i2c_scl[1] = pin,
+            PinSignal::Spi0Miso => self.spi_miso[0] = pin,
+            PinSignal::Spi0Sck => self.spi_sck[0] = pin,
+            PinSignal::Spi0Mosi => self.spi_mosi[0] = pin,
+            PinSignal::Spi0Cs0 => self.spi_chip_selects[0][0] = pin,
+            PinSignal::Spi0Cs1 => self.spi_chip_selects[0][1] = pin,
+            PinSignal::Spi1Miso => self.spi_miso[1] = pin,
+            PinSignal::Spi1Sck => self.spi_sck[1] = pin,
+            PinSignal::Spi1Mosi => self.spi_mosi[1] = pin,
+            PinSignal::Spi1Cs0 => self.spi_chip_selects[1][0] = pin,
+            PinSignal::Spi1Cs1 => self.spi_chip_selects[1][1] = pin,
+        }
+    }
+
+    pub const fn is_enabled(self, peripheral: Peripheral) -> bool {
+        self.enabled & peripheral.mask() != 0
+    }
+
+    pub fn set_enabled(&mut self, peripheral: Peripheral, enabled: bool) {
+        if enabled {
+            self.enabled |= peripheral.mask();
+        } else {
+            self.enabled &= !peripheral.mask();
         }
     }
 
     pub fn validate(self) -> Result<(), PinValidationError> {
+        if self.enabled & !0x3f != 0 {
+            return Err(PinValidationError {
+                kind: PinValidationKind::InvalidEnableMask,
+                signal: PinSignal::Uart0Tx,
+                other: None,
+                pin: self.enabled,
+            });
+        }
         for signal in PinSignal::ALL {
             let pin = self.pin(signal);
             if !HEADER_PINS.contains(&pin) {
@@ -307,20 +445,28 @@ impl PinMap {
                 });
             }
         }
-        if self.i2c_scl != self.i2c_sda + 1 {
-            return Err(PinValidationError {
-                kind: PinValidationKind::MismatchedPair,
-                signal: PinSignal::I2cScl,
-                other: Some(PinSignal::I2cSda),
-                pin: self.i2c_scl,
-            });
+        for (sda, scl) in [
+            (PinSignal::I2c0Sda, PinSignal::I2c0Scl),
+            (PinSignal::I2c1Sda, PinSignal::I2c1Scl),
+        ] {
+            if self.pin(scl) != self.pin(sda) + 1 {
+                return Err(PinValidationError {
+                    kind: PinValidationKind::MismatchedPair,
+                    signal: scl,
+                    other: Some(sda),
+                    pin: self.pin(scl),
+                });
+            }
         }
         for (index, signal) in PinSignal::ALL.iter().copied().enumerate() {
+            if !self.is_enabled(signal.peripheral()) {
+                continue;
+            }
             let pin = self.pin(signal);
             if let Some(other) = PinSignal::ALL[..index]
                 .iter()
                 .copied()
-                .find(|&other| self.pin(other) == pin)
+                .find(|&other| self.is_enabled(other.peripheral()) && self.pin(other) == pin)
             {
                 return Err(PinValidationError {
                     kind: PinValidationKind::DuplicatePin,
@@ -333,18 +479,52 @@ impl PinMap {
         Ok(())
     }
 
-    pub fn gpio_pins(self) -> Result<[u8; GPIO_LINE_COUNT], PinValidationError> {
+    pub fn gpio_pins(self) -> Result<GpioPins, PinValidationError> {
         self.validate()?;
-        let assigned = self.encode();
-        let mut gpio = [0; GPIO_LINE_COUNT];
+        let mut assigned = [u8::MAX; PIN_SIGNAL_COUNT];
+        let mut assigned_len = 0;
+        for signal in PinSignal::ALL {
+            if self.is_enabled(signal.peripheral()) {
+                assigned[assigned_len] = self.pin(signal);
+                assigned_len += 1;
+            }
+        }
+        let mut gpio = [0; MAX_GPIO_LINES];
         let mut output = 0;
         for pin in HEADER_PINS {
-            if !assigned.contains(&pin) {
+            if !assigned[..assigned_len].contains(&pin) {
                 gpio[output] = pin;
                 output += 1;
             }
         }
-        Ok(gpio)
+        Ok(GpioPins {
+            pins: gpio,
+            len: output as u8,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GpioPins {
+    pins: [u8; MAX_GPIO_LINES],
+    len: u8,
+}
+
+impl GpioPins {
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.pins[..self.len()]
+    }
+
+    pub const fn into_array(self) -> [u8; MAX_GPIO_LINES] {
+        self.pins
     }
 }
 
@@ -682,48 +862,58 @@ mod tests {
     fn pin_maps_validate_routes_conflicts_and_gpio_derivation() {
         assert_eq!(DEFAULT_PIN_MAP.validate(), Ok(()));
         assert_eq!(
-            DEFAULT_PIN_MAP.gpio_pins().unwrap(),
-            [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
+            DEFAULT_PIN_MAP.gpio_pins().unwrap().as_slice(),
+            &[2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28]
         );
 
         let mut alternate = DEFAULT_PIN_MAP;
-        alternate.i2c_sda = 12;
-        alternate.i2c_scl = 13;
-        alternate.spi_chip_selects = [4, 5];
+        alternate.i2c_sda[0] = 12;
+        alternate.i2c_scl[0] = 13;
+        alternate.spi_chip_selects[0] = [4, 5];
         assert_eq!(PinMap::decode(&alternate.encode()), Ok(alternate));
         assert_eq!(alternate.validate(), Ok(()));
 
         let mut invalid = alternate;
-        invalid.spi_sck = 3;
+        invalid.spi_sck[0] = 3;
         assert_eq!(
             invalid.validate().unwrap_err(),
             PinValidationError {
                 kind: PinValidationKind::InvalidRoute,
-                signal: PinSignal::SpiSck,
+                signal: PinSignal::Spi0Sck,
                 other: None,
                 pin: 3,
             }
         );
 
         let mut duplicate = alternate;
-        duplicate.spi_chip_selects[0] = duplicate.uart_tx;
+        duplicate.spi_chip_selects[0][0] = duplicate.uart_tx[0];
         assert_eq!(
             duplicate.validate().unwrap_err(),
             PinValidationError {
                 kind: PinValidationKind::DuplicatePin,
-                signal: PinSignal::SpiCs0,
-                other: Some(PinSignal::UartTx),
-                pin: duplicate.uart_tx,
+                signal: PinSignal::Spi0Cs0,
+                other: Some(PinSignal::Uart0Tx),
+                pin: duplicate.uart_tx[0],
             }
         );
+
+        let mut all_enabled = DEFAULT_PIN_MAP;
+        all_enabled.enabled = 0x3f;
+        assert_eq!(all_enabled.validate(), Ok(()));
+        assert_eq!(all_enabled.gpio_pins().unwrap().len(), 8);
+
+        let mut none_enabled = DEFAULT_PIN_MAP;
+        none_enabled.enabled = 0;
+        assert_eq!(none_enabled.validate(), Ok(()));
+        assert_eq!(none_enabled.gpio_pins().unwrap().as_slice(), &HEADER_PINS);
     }
 
     #[test]
     fn pin_validation_errors_round_trip() {
         let error = PinValidationError {
             kind: PinValidationKind::MismatchedPair,
-            signal: PinSignal::I2cScl,
-            other: Some(PinSignal::I2cSda),
+            signal: PinSignal::I2c0Scl,
+            other: Some(PinSignal::I2c0Sda),
             pin: 9,
         };
         assert_eq!(PinValidationError::decode(&error.encode()), Ok(error));

@@ -14,30 +14,47 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-const ABI_MAJOR: u16 = 1;
+const ABI_MAJOR: u16 = 2;
 const IOC_MAGIC: u32 = b'R' as u32;
 const I2C_FUNCTIONALITY: u32 = 0x0eff_000b;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct RegistrationConfig {
-    pub i2c_speed_hz: u32,
+    pub i2c: [Option<I2cRegistration>; 2],
+    pub spi: [Option<SpiRegistration>; 2],
+    pub gpio_lines: u16,
+    pub gpio_pins: [u8; 26],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct I2cRegistration {
+    pub speed_hz: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SpiRegistration {
     pub spi_mode_bits: u32,
     pub spi_min_speed_hz: u32,
     pub spi_max_speed_hz: u32,
     pub spi_chip_selects: u16,
-    pub gpio_lines: u16,
-    pub gpio_pins: [u8; 17],
 }
 
 impl RegistrationConfig {
     pub const PICO2: Self = Self {
-        i2c_speed_hz: 100_000,
-        spi_mode_bits: 0x4f,
-        spi_min_speed_hz: 50_000,
-        spi_max_speed_hz: 20_000_000,
-        spi_chip_selects: 2,
+        i2c: [Some(I2cRegistration { speed_hz: 100_000 }), None],
+        spi: [
+            Some(SpiRegistration {
+                spi_mode_bits: 0x4f,
+                spi_min_speed_hz: 50_000,
+                spi_max_speed_hz: 20_000_000,
+                spi_chip_selects: 2,
+            }),
+            None,
+        ],
         gpio_lines: 17,
-        gpio_pins: [2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28],
+        gpio_pins: [
+            2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ],
     };
 }
 
@@ -54,6 +71,8 @@ struct IocVersion {
 struct IocCreateI2c {
     functionality: u32,
     speed_hz: u32,
+    bus_id: u8,
+    reserved: [u8; 3],
     instance_id: u32,
     bus_num: i32,
 }
@@ -64,7 +83,8 @@ struct IocCreateSpi {
     min_speed_hz: u32,
     max_speed_hz: u32,
     chip_selects: u16,
-    reserved: u16,
+    bus_id: u8,
+    reserved: u8,
     instance_id: u32,
     bus_num: i32,
 }
@@ -82,15 +102,15 @@ struct IocCreateGpio {
     instance_id: u32,
     features: u32,
     reserved2: u32,
-    pins: [u8; 17],
-    reserved3: [u8; 7],
+    pins: [u8; 26],
+    reserved3: [u8; 6],
 }
 
 const _: () = assert!(size_of::<IocVersion>() == 16);
-const _: () = assert!(size_of::<IocCreateI2c>() == 16);
+const _: () = assert!(size_of::<IocCreateI2c>() == 20);
 const _: () = assert!(size_of::<IocCreateSpi>() == 24);
 const _: () = assert!(size_of::<IocDestroy>() == 8);
-const _: () = assert!(size_of::<IocCreateGpio>() == 40);
+const _: () = assert!(size_of::<IocCreateGpio>() == 48);
 
 const IOC_GET_VERSION: libc::Ioctl = libc::_IOR::<IocVersion>(IOC_MAGIC, 0x00);
 const IOC_CREATE_I2C: libc::Ioctl = libc::_IOWR::<IocCreateI2c>(IOC_MAGIC, 0x01);
@@ -100,19 +120,20 @@ const IOC_CREATE_GPIO: libc::Ioctl = libc::_IOWR::<IocCreateGpio>(IOC_MAGIC, 0x0
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BusNumbers {
-    pub i2c: i32,
-    pub spi: i32,
+    pub i2c: [Option<i32>; 2],
+    pub spi: [Option<i32>; 2],
 }
 
 pub struct DeviceRegistration {
     kernel: Arc<Kernel>,
-    instance_ids: [u32; 3],
+    instance_ids: Vec<u32>,
+    gpio_instance_id: u32,
     pub buses: BusNumbers,
 }
 
 impl DeviceRegistration {
     pub fn gpio_instance_id(&self) -> u32 {
-        self.instance_ids[2]
+        self.gpio_instance_id
     }
 
     pub fn destroy(self) -> io::Result<()> {
@@ -163,35 +184,61 @@ impl Kernel {
         backend: Arc<dyn Backend>,
         config: RegistrationConfig,
     ) -> io::Result<DeviceRegistration> {
-        let mut i2c = IocCreateI2c {
-            functionality: I2C_FUNCTIONALITY,
-            speed_hz: config.i2c_speed_hz,
-            instance_id: 0,
-            bus_num: -1,
+        let mut instance_ids = Vec::new();
+        let mut buses = BusNumbers {
+            i2c: [None; 2],
+            spi: [None; 2],
         };
-        ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_I2C, &mut i2c)?;
-        self.backends
-            .write()
-            .unwrap()
-            .insert(i2c.instance_id, backend.clone());
-
-        let mut spi = IocCreateSpi {
-            mode_bits: config.spi_mode_bits,
-            min_speed_hz: config.spi_min_speed_hz,
-            max_speed_hz: config.spi_max_speed_hz,
-            chip_selects: config.spi_chip_selects,
-            reserved: 0,
-            instance_id: 0,
-            bus_num: -1,
-        };
-        if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_SPI, &mut spi) {
-            let _ = self.destroy_instance(i2c.instance_id);
-            return Err(error);
+        for (bus_id, registration) in config.i2c.into_iter().enumerate() {
+            let Some(registration) = registration else {
+                continue;
+            };
+            let mut create = IocCreateI2c {
+                functionality: I2C_FUNCTIONALITY,
+                speed_hz: registration.speed_hz,
+                bus_id: bus_id as u8,
+                reserved: [0; 3],
+                instance_id: 0,
+                bus_num: -1,
+            };
+            if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_I2C, &mut create)
+            {
+                self.destroy_instances(&instance_ids);
+                return Err(error);
+            }
+            instance_ids.push(create.instance_id);
+            buses.i2c[bus_id] = Some(create.bus_num);
+            self.backends
+                .write()
+                .unwrap()
+                .insert(create.instance_id, backend.clone());
         }
-        self.backends
-            .write()
-            .unwrap()
-            .insert(spi.instance_id, backend.clone());
+        for (bus_id, registration) in config.spi.into_iter().enumerate() {
+            let Some(registration) = registration else {
+                continue;
+            };
+            let mut create = IocCreateSpi {
+                mode_bits: registration.spi_mode_bits,
+                min_speed_hz: registration.spi_min_speed_hz,
+                max_speed_hz: registration.spi_max_speed_hz,
+                chip_selects: registration.spi_chip_selects,
+                bus_id: bus_id as u8,
+                reserved: 0,
+                instance_id: 0,
+                bus_num: -1,
+            };
+            if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_SPI, &mut create)
+            {
+                self.destroy_instances(&instance_ids);
+                return Err(error);
+            }
+            instance_ids.push(create.instance_id);
+            buses.spi[bus_id] = Some(create.bus_num);
+            self.backends
+                .write()
+                .unwrap()
+                .insert(create.instance_id, backend.clone());
+        }
         let mut gpio = IocCreateGpio {
             lines: config.gpio_lines,
             reserved: 0,
@@ -199,24 +246,22 @@ impl Kernel {
             features: 0,
             reserved2: 0,
             pins: config.gpio_pins,
-            reserved3: [0; 7],
+            reserved3: [0; 6],
         };
         if let Err(error) = ioctl(self.file.get_ref().as_raw_fd(), IOC_CREATE_GPIO, &mut gpio) {
-            let _ = self.destroy_instance(spi.instance_id);
-            let _ = self.destroy_instance(i2c.instance_id);
+            self.destroy_instances(&instance_ids);
             return Err(error);
         }
         self.backends
             .write()
             .unwrap()
             .insert(gpio.instance_id, backend);
+        instance_ids.push(gpio.instance_id);
         Ok(DeviceRegistration {
             kernel: self.clone(),
-            instance_ids: [i2c.instance_id, spi.instance_id, gpio.instance_id],
-            buses: BusNumbers {
-                i2c: i2c.bus_num,
-                spi: spi.bus_num,
-            },
+            instance_ids,
+            gpio_instance_id: gpio.instance_id,
+            buses,
         })
     }
 
@@ -259,6 +304,12 @@ impl Kernel {
         let result = ioctl(self.file.get_ref().as_raw_fd(), IOC_DESTROY, &mut destroy);
         self.backends.write().unwrap().remove(&instance_id);
         result
+    }
+
+    fn destroy_instances(&self, instance_ids: &[u32]) {
+        for &instance_id in instance_ids.iter().rev() {
+            let _ = self.destroy_instance(instance_id);
+        }
     }
 
     pub fn gpio_event(
@@ -402,7 +453,7 @@ impl Request {
                 if payload.len() != 4
                     || payload[0] < rp_extio_wire::GPIO_GET
                     || payload[0] > rp_extio_wire::GPIO_GET_DIRECTION
-                    || payload[1] >= RegistrationConfig::PICO2.gpio_lines as u8
+                    || payload[1] >= rp_extio_wire::MAX_GPIO_LINES as u8
                     || payload[2] > 1
                     || payload[3] != 0
                 {
@@ -535,13 +586,13 @@ mod tests {
     #[test]
     fn decodes_i2c_request_and_encodes_reply() {
         let payload = [
-            0, 2, 0, 0, 0x50, 0, 0, 0, 1, 0, 0, 0, 0xaa, 0x51, 0, 1, 0, 2, 0, 0, 0,
+            1, 2, 0, 0, 0x50, 0, 0, 0, 1, 0, 0, 0, 0xaa, 0x51, 0, 1, 0, 2, 0, 0, 0,
         ];
         let request = Request::decode(&frame(2, &payload)).unwrap();
         assert_eq!(
             request.transaction,
             Transaction::I2c {
-                bus_id: 0,
+                bus_id: 1,
                 messages: vec![
                     I2cMessage {
                         address: 0x50,
@@ -571,10 +622,14 @@ mod tests {
     #[test]
     fn decodes_spi_request_and_encodes_reply() {
         let payload = [
-            0, 1, 3, 0, 1, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 2, 0, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0,
+            1, 1, 3, 0, 1, 0, 0, 0, 0x40, 0x42, 0x0f, 0, 2, 0, 1, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0,
             0, 0, 0xaa, 0xbb,
         ];
         let request = Request::decode(&frame(3, &payload)).unwrap();
+        assert!(matches!(
+            request.transaction,
+            Transaction::Spi { bus_id: 1, .. }
+        ));
         let reply = request.encode_reply(BackendReply {
             status: 0,
             completed: 2,
@@ -635,7 +690,7 @@ mod tests {
 
         for payload in [
             &[rp_extio_wire::GPIO_GET, 0, 0][..],
-            &[rp_extio_wire::GPIO_GET, 17, 0, 0],
+            &[rp_extio_wire::GPIO_GET, 26, 0, 0],
             &[rp_extio_wire::GPIO_SNAPSHOT, 0, 0, 0],
             &[rp_extio_wire::GPIO_GET, 0, 2, 0],
             &[rp_extio_wire::GPIO_GET, 0, 0, 1],
