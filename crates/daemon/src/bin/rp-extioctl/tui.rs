@@ -207,6 +207,15 @@ impl App {
             .copied()
     }
 
+    fn selected_pwm_startup(&self) -> Option<PwmInfo> {
+        let channel = self.selected_signal().pwm_channel()? as u8;
+        self.current()?
+            .pwm_startup
+            .iter()
+            .find(|pwm| pwm.channel == channel)
+            .copied()
+    }
+
     fn screen_cursor_row(&self) -> usize {
         self.cursor_row
     }
@@ -667,12 +676,8 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::Char('i') if app.mode == UiMode::Operate => {
                 cycle_gpio_input(client, &mut app)?
             }
-            KeyCode::Char('w') if app.mode == UiMode::Operate => {
-                save_gpio_startup(client, &mut app)?
-            }
-            KeyCode::Char('x') if app.mode == UiMode::Operate => {
-                clear_gpio_startup(client, &mut app)?
-            }
+            KeyCode::Char('w') if app.mode == UiMode::Operate => save_startup(client, &mut app)?,
+            KeyCode::Char('x') if app.mode == UiMode::Operate => clear_startup(client, &mut app)?,
             KeyCode::Char('b') if app.mode == UiMode::Operate => {
                 app.button_active_low = !app.button_active_low;
                 app.message = format!(
@@ -898,7 +903,33 @@ fn cycle_gpio_input(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Er
     Ok(())
 }
 
-fn save_gpio_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+fn save_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    if let Some(channel) = app.selected_signal().pwm_channel() {
+        let Some(pwm) = app.pwm.filter(|pwm| pwm.channel == channel as u8) else {
+            set_app_error(
+                app,
+                format!("PWM{channel} is not enabled or has no live state"),
+            );
+            return Ok(());
+        };
+        let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+            set_app_error(app, "no board selected");
+            return Ok(());
+        };
+        handle_startup_response(
+            app,
+            client.request(&ControlRequest::PwmStartupSet { serial, pwm })?,
+            format!("PWM{channel} live state saved for daemon startup"),
+        );
+        return Ok(());
+    }
+    if let Some(output) = app.selected_signal().clock_output() {
+        app.message = format!(
+            "CLOCK{output} enable, route, source, and frequency are already saved with the pin map"
+        );
+        app.message_error = false;
+        return Ok(());
+    }
     let Some(gpio) = app.selected_gpio() else {
         set_app_error(app, "highlight a configured GPIO to save its live state");
         return Ok(());
@@ -926,7 +957,29 @@ fn save_gpio_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn E
     Ok(())
 }
 
-fn clear_gpio_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+fn clear_startup(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+    if let Some(channel) = app.selected_signal().pwm_channel() {
+        let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+            set_app_error(app, "no board selected");
+            return Ok(());
+        };
+        handle_startup_response(
+            app,
+            client.request(&ControlRequest::PwmStartupClear {
+                serial,
+                channel: channel as u8,
+            })?,
+            format!("PWM{channel} startup state forgotten"),
+        );
+        return Ok(());
+    }
+    if let Some(output) = app.selected_signal().clock_output() {
+        app.message = format!(
+            "CLOCK{output} has no separate startup state; disable it in route mode and apply"
+        );
+        app.message_error = false;
+        return Ok(());
+    }
     let Some(pin) = app.selected_pin().gpio else {
         set_app_error(app, "select a GPIO pin");
         return Ok(());
@@ -1395,6 +1448,17 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
     {
         role.push_str(" •");
     }
+    if app.mode == UiMode::Operate
+        && app.current().is_some_and(|board| {
+            board.pwm_startup.iter().any(|pwm| {
+                map.pwm_pins
+                    .get(pwm.channel as usize)
+                    .is_some_and(|&pin| pin == gpio)
+            })
+        })
+    {
+        role.push_str(" •");
+    }
     let changed = app.active_map().is_some_and(|active| {
         PinSignal::ALL.into_iter().any(|signal| {
             let active_enabled = active.is_signal_enabled(signal);
@@ -1514,8 +1578,20 @@ fn selected_runtime_detail(app: &App) -> String {
         } else {
             pwm.duty_ns as f64 * 100.0 / pwm.period_ns as f64
         };
+        let startup = app.selected_pwm_startup().map_or_else(
+            || "startup not saved".into(),
+            |saved| {
+                let saved_frequency = 1_000_000_000_u64.checked_div(saved.period_ns).unwrap_or(0);
+                let saved_duty = if saved.period_ns == 0 {
+                    0.0
+                } else {
+                    saved.duty_ns as f64 * 100.0 / saved.period_ns as f64
+                };
+                format!("startup {saved_frequency} Hz/{saved_duty:.1}%")
+            },
+        );
         return format!(
-            "PWM{}: {} · {frequency} Hz · {duty:.1}% · {}",
+            "PWM{}: {} · {frequency} Hz · {duty:.1}% · {} · {startup}",
             pwm.channel,
             if pwm.enabled {
                 "output enabled"
@@ -1523,6 +1599,20 @@ fn selected_runtime_detail(app: &App) -> String {
                 "output disabled"
             },
             if pwm.inverted { "inverted" } else { "normal" }
+        );
+    }
+    if let Some(output) = app.selected_signal().clock_output()
+        && let Some(map) = app.active_map()
+    {
+        return format!(
+            "CLOCK{output}: {:?} · target {} Hz · {} · persisted in pin map",
+            map.clock_sources[output],
+            map.clock_hz[output],
+            if map.is_signal_enabled(app.selected_signal()) {
+                "enabled"
+            } else {
+                "disabled"
+            }
         );
     }
     if let Some(gpio) = app.selected_gpio() {
@@ -1553,20 +1643,6 @@ fn selected_runtime_detail(app: &App) -> String {
                 "active low"
             } else {
                 "active high"
-            }
-        );
-    }
-    if let Some(output) = app.selected_signal().clock_output()
-        && let Some(map) = app.active_map()
-    {
-        return format!(
-            "CLOCK{output}: {:?} · target {} Hz · {}",
-            map.clock_sources[output],
-            map.clock_hz[output],
-            if map.is_signal_enabled(app.selected_signal()) {
-                "enabled"
-            } else {
-                "disabled"
             }
         );
     }
@@ -2124,6 +2200,11 @@ mod tests {
         assert!(adc.contains("ADC0: 2048 raw · 1650 mV"));
 
         app.adc = None;
+        let mut map = DEFAULT_PIN_MAP;
+        map.set_signal_enabled(PinSignal::Pwm1A, true);
+        app.boards[0].active = Some(map.into());
+        app.edited = Some(map);
+        app.signal = PinSignal::Pwm1A as usize;
         app.pwm = Some(PwmInfo {
             channel: 2,
             enabled: true,
@@ -2131,8 +2212,17 @@ mod tests {
             period_ns: 1_000_000,
             duty_ns: 250_000,
         });
+        app.boards[0].pwm_startup = vec![app.pwm.unwrap()];
+        (app.cursor_row, app.cursor_side) = find_gpio(map.pin(PinSignal::Pwm1A)).unwrap();
         let pwm = rendered(120, 40, &app);
         assert!(pwm.contains("PWM2: output enabled · 1000 Hz · 25.0% · normal"));
+        assert!(pwm.contains("startup 1000 Hz/25.0%"));
+        assert!(pwm.contains("P1-A •"));
+
+        app.pwm = None;
+        app.signal = PinSignal::Clock0 as usize;
+        let clock = rendered(120, 40, &app);
+        assert!(clock.contains("persisted in pin map"));
     }
 
     #[test]
