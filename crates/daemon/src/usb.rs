@@ -1,5 +1,6 @@
 use crate::{
     backend::{Backend, BackendReply, Transaction},
+    control::{BoardInfo, ConfigStore, ControlRequest, ControlResponse},
     kernel::{DeviceRegistration, Kernel, RegistrationConfig},
 };
 use async_trait::async_trait;
@@ -16,13 +17,14 @@ use rp_extio_wire::{
 use std::{
     collections::HashMap,
     io,
+    path::PathBuf,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub const DEVELOPMENT_VID: u16 = 0xcafe;
 pub const DEVELOPMENT_PID: u16 = 0x4010;
@@ -54,28 +56,54 @@ impl std::fmt::Display for ConfigureError {
 impl std::error::Error for ConfigureError {}
 
 struct ConnectedDevice {
+    serial: String,
     backend: Arc<UsbBackend>,
     registration: DeviceRegistration,
     gpio_poll: tokio::task::JoinHandle<()>,
+    config: NegotiatedConfig,
 }
 
-pub async fn run(kernel: Arc<Kernel>) -> io::Result<()> {
+pub struct ControlCall {
+    pub request: ControlRequest,
+    pub response: oneshot::Sender<ControlResponse>,
+}
+
+pub async fn run(
+    kernel: Arc<Kernel>,
+    config_path: PathBuf,
+    strict: bool,
+    mut control: mpsc::Receiver<ControlCall>,
+) -> io::Result<()> {
+    let mut config = ConfigStore::load(config_path)?;
     let mut watch = nusb::watch_devices().map_err(nusb_error)?;
     let initial: Vec<_> = nusb::list_devices()
         .await
         .map_err(nusb_error)?
         .filter(matches_bridge)
         .collect();
+    if strict {
+        for serial in config.boards().keys() {
+            if !initial
+                .iter()
+                .any(|info| info.serial_number() == Some(serial.as_str()))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("configured rp-extio board {serial} is not connected"),
+                ));
+            }
+        }
+    }
     let (failed_tx, mut failed_rx) = mpsc::unbounded_channel();
     let mut devices = HashMap::new();
     for info in initial {
-        try_connect(&kernel, &failed_tx, &mut devices, info).await;
+        try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
     }
     loop {
         tokio::select! {
             event = watch.next() => match event {
                 Some(nusb::hotplug::HotplugEvent::Connected(info)) if matches_bridge(&info) => {
-                    try_connect(&kernel, &failed_tx, &mut devices, info).await;
+                    try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
                 }
                 Some(nusb::hotplug::HotplugEvent::Disconnected(id)) => {
                     remove_device(&mut devices, &id).await;
@@ -86,6 +114,13 @@ pub async fn run(kernel: Arc<Kernel>) -> io::Result<()> {
             failed = failed_rx.recv() => match failed {
                 Some(id) => remove_device(&mut devices, &id).await,
                 None => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "USB failure channel closed")),
+            },
+            call = control.recv() => match call {
+                Some(call) => {
+                    let response = handle_control(&kernel, &mut config, &mut devices, call.request).await;
+                    let _ = call.response.send(response);
+                }
+                None => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "control channel closed")),
             },
         }
     }
@@ -102,6 +137,7 @@ fn matches_bridge(info: &DeviceInfo) -> bool {
 async fn try_connect(
     kernel: &Arc<Kernel>,
     failed: &mpsc::UnboundedSender<DeviceId>,
+    desired: &ConfigStore,
     devices: &mut HashMap<DeviceId, ConnectedDevice>,
     info: DeviceInfo,
 ) {
@@ -109,7 +145,11 @@ async fn try_connect(
     if devices.contains_key(&id) {
         return;
     }
-    let (backend, config) = match UsbBackend::connect(&info, failed.clone()).await {
+    let Some(serial) = info.serial_number().map(str::to_owned) else {
+        eprintln!("refusing rp-extio USB device without stable serial number");
+        return;
+    };
+    let (backend, mut config) = match UsbBackend::connect(&info, failed.clone()).await {
         Ok(connected) => connected,
         Err(error) => {
             eprintln!(
@@ -119,23 +159,27 @@ async fn try_connect(
             return;
         }
     };
-    match kernel.register_device(backend.clone(), config.registration) {
-        Ok(registration) => {
-            let gpio_instance_id = registration.gpio_instance_id();
-            let gpio_poll = tokio::spawn(poll_gpio(
-                backend.clone(),
-                kernel.clone(),
-                gpio_instance_id,
-                config.registration.gpio_lines,
-            ));
-            devices.insert(
-                id,
-                ConnectedDevice {
-                    backend,
-                    registration,
-                    gpio_poll,
-                },
+    if let Some(map) = desired.get(&serial)
+        && map != config.pin_map
+    {
+        config = match backend
+            .configure_pins(map, config.generation.wrapping_add(1))
+            .await
+        {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("failed to configure rp-extio USB device {serial}: {error}");
+                return;
+            }
+        };
+    }
+    match register_device(kernel, backend.clone(), serial.clone(), config) {
+        Ok(device) => {
+            eprintln!(
+                "rp-extio {serial}: generation {}, {:?}",
+                config.generation, config.pin_map
             );
+            devices.insert(id, device);
         }
         Err(error) => {
             eprintln!(
@@ -147,11 +191,242 @@ async fn try_connect(
     }
 }
 
+fn register_device(
+    kernel: &Arc<Kernel>,
+    backend: Arc<UsbBackend>,
+    serial: String,
+    config: NegotiatedConfig,
+) -> io::Result<ConnectedDevice> {
+    let registration = kernel.register_device(backend.clone(), config.registration)?;
+    let gpio_instance_id = registration.gpio_instance_id();
+    let gpio_poll = tokio::spawn(poll_gpio(
+        backend.clone(),
+        kernel.clone(),
+        gpio_instance_id,
+        config.registration.gpio_lines,
+    ));
+    Ok(ConnectedDevice {
+        serial,
+        backend,
+        registration,
+        gpio_poll,
+        config,
+    })
+}
+
 async fn remove_device(devices: &mut HashMap<DeviceId, ConnectedDevice>, id: &DeviceId) {
     if let Some(device) = devices.remove(id) {
         device.gpio_poll.abort();
         device.backend.disconnect().await;
         let _ = device.registration.destroy();
+    }
+}
+
+fn board_info(device: &ConnectedDevice, desired: Option<PinMap>) -> BoardInfo {
+    BoardInfo {
+        serial: device.serial.clone(),
+        connected: true,
+        active: Some(device.config.pin_map.into()),
+        desired: desired.map(Into::into),
+        generation: Some(device.config.generation),
+        i2c_bus: Some(device.registration.buses.i2c),
+        spi_bus: Some(device.registration.buses.spi),
+        gpio_instance: Some(device.registration.gpio_instance_id()),
+    }
+}
+
+fn disconnected_info(serial: String, desired: PinMap) -> BoardInfo {
+    BoardInfo {
+        serial,
+        connected: false,
+        active: None,
+        desired: Some(desired.into()),
+        generation: None,
+        i2c_bus: None,
+        spi_bus: None,
+        gpio_instance: None,
+    }
+}
+
+fn find_device(devices: &HashMap<DeviceId, ConnectedDevice>, serial: &str) -> Option<DeviceId> {
+    devices
+        .iter()
+        .find_map(|(id, device)| (device.serial == serial).then_some(*id))
+}
+
+async fn handle_control(
+    kernel: &Arc<Kernel>,
+    store: &mut ConfigStore,
+    devices: &mut HashMap<DeviceId, ConnectedDevice>,
+    request: ControlRequest,
+) -> ControlResponse {
+    match request {
+        ControlRequest::List => {
+            let mut boards: Vec<_> = devices
+                .values()
+                .map(|device| board_info(device, store.get(&device.serial)))
+                .collect();
+            for (serial, map) in store.boards() {
+                if !devices.values().any(|device| device.serial == *serial) {
+                    boards.push(disconnected_info(serial.clone(), *map));
+                }
+            }
+            boards.sort_by(|left, right| left.serial.cmp(&right.serial));
+            ControlResponse::Boards { boards }
+        }
+        ControlRequest::Show { serial } => {
+            if let Some(id) = find_device(devices, &serial) {
+                ControlResponse::Board {
+                    board: board_info(&devices[&id], store.get(&serial)),
+                }
+            } else if let Some(map) = store.get(&serial) {
+                ControlResponse::Board {
+                    board: disconnected_info(serial, map),
+                }
+            } else {
+                ControlResponse::error("unknown_board", format!("unknown rp-extio board {serial}"))
+            }
+        }
+        ControlRequest::Set {
+            serial,
+            generation,
+            map,
+        } => {
+            let map = PinMap::from(map);
+            if let Err(error) = map.validate() {
+                return ControlResponse::validation(error);
+            }
+            change_map(kernel, store, devices, serial, generation, map, false).await
+        }
+        ControlRequest::Default { serial, generation } => {
+            change_map(
+                kernel,
+                store,
+                devices,
+                serial,
+                generation,
+                rp_extio_wire::DEFAULT_PIN_MAP,
+                true,
+            )
+            .await
+        }
+        ControlRequest::Reload => {
+            if let Err(error) = store.reload() {
+                return ControlResponse::error("configuration", error.to_string());
+            }
+            let changes: Vec<_> = devices
+                .iter()
+                .filter_map(|(id, device)| {
+                    let desired = store
+                        .get(&device.serial)
+                        .unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
+                    (desired != device.config.pin_map).then_some((*id, desired))
+                })
+                .collect();
+            for (id, map) in changes {
+                if let Err(response) = reconfigure(kernel, devices, id, map).await {
+                    return response;
+                }
+            }
+            ControlResponse::Ok
+        }
+    }
+}
+
+async fn change_map(
+    kernel: &Arc<Kernel>,
+    store: &mut ConfigStore,
+    devices: &mut HashMap<DeviceId, ConnectedDevice>,
+    serial: String,
+    generation: u64,
+    map: PinMap,
+    remove_persistent: bool,
+) -> ControlResponse {
+    let Some(id) = find_device(devices, &serial) else {
+        return ControlResponse::error(
+            "disconnected",
+            format!("rp-extio board {serial} is not connected"),
+        );
+    };
+    let active = devices[&id].config;
+    if active.generation != generation {
+        return ControlResponse::error(
+            "generation_conflict",
+            format!(
+                "rp-extio board {serial} changed from generation {generation} to {}",
+                active.generation
+            ),
+        );
+    }
+    if active.pin_map != map
+        && let Err(response) = reconfigure(kernel, devices, id, map).await
+    {
+        return response;
+    }
+
+    let persisted = if remove_persistent {
+        store.remove(&serial)
+    } else {
+        store.set(serial.clone(), map)
+    };
+    if let Err(error) = persisted {
+        if active.pin_map != map
+            && let Some(id) = find_device(devices, &serial)
+        {
+            let _ = reconfigure(kernel, devices, id, active.pin_map).await;
+        }
+        return ControlResponse::error("configuration", error.to_string());
+    }
+    let id = find_device(devices, &serial).unwrap();
+    ControlResponse::Applied {
+        board: board_info(&devices[&id], store.get(&serial)),
+    }
+}
+
+async fn reconfigure(
+    kernel: &Arc<Kernel>,
+    devices: &mut HashMap<DeviceId, ConnectedDevice>,
+    id: DeviceId,
+    map: PinMap,
+) -> Result<(), ControlResponse> {
+    let device = devices.remove(&id).unwrap();
+    let ConnectedDevice {
+        serial,
+        backend,
+        registration,
+        gpio_poll,
+        config: old_config,
+    } = device;
+    gpio_poll.abort();
+    if let Err(error) = registration.destroy() {
+        if let Ok(restored) = register_device(kernel, backend, serial, old_config) {
+            devices.insert(id, restored);
+        }
+        return Err(ControlResponse::error("kernel", error.to_string()));
+    }
+    let generation = old_config.generation.wrapping_add(1);
+    let new_config = match backend.configure_pins(map, generation).await {
+        Ok(config) => config,
+        Err(ConfigureError::Rejected(error)) => {
+            if let Ok(restored) = register_device(kernel, backend, serial, old_config) {
+                devices.insert(id, restored);
+            }
+            return Err(ControlResponse::validation(error));
+        }
+        Err(ConfigureError::Transport(error)) => {
+            backend.disconnect().await;
+            return Err(ControlResponse::error("usb", error.to_string()));
+        }
+    };
+    match register_device(kernel, backend.clone(), serial, new_config) {
+        Ok(device) => {
+            devices.insert(id, device);
+            Ok(())
+        }
+        Err(error) => {
+            backend.disconnect().await;
+            Err(ControlResponse::error("kernel", error.to_string()))
+        }
     }
 }
 

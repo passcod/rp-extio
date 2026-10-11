@@ -199,6 +199,12 @@ impl ConfigStore {
         self.boards = boards;
     }
 
+    pub fn reload(&mut self) -> io::Result<()> {
+        let replacement = Self::load(self.path.clone())?;
+        self.boards = replacement.boards;
+        Ok(())
+    }
+
     pub fn set(&mut self, serial: String, map: PinMap) -> io::Result<()> {
         let previous = self.boards.insert(serial.clone(), map);
         if let Err(error) = self.save() {
