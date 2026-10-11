@@ -6,9 +6,13 @@ use rp_extiod::control::{BoardInfo, ControlRequest, ControlResponse, PinMapConfi
 use std::{
     error::Error,
     io::{BufRead, BufReader, Write},
-    os::unix::net::UnixStream,
+    os::unix::{fs::FileTypeExt, net::UnixStream},
     path::{Path, PathBuf},
+    process::Command as ProcessCommand,
 };
+
+const CONTROL_DEVICE: &str = "/dev/rp-extio-control";
+const CONTROL_SYSFS_DEVICE: &str = "/sys/class/misc/rp-extio-control";
 
 #[derive(Parser)]
 #[command(version, about = "Configure rp-extio Pico 2 pin routing")]
@@ -23,12 +27,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Load the kernel module and ensure its control device exists
+    Prepare {
+        /// Insert this development module instead of loading an installed module
+        #[arg(long)]
+        module: Option<PathBuf>,
+    },
     List,
-    Show { serial: String },
+    Show {
+        serial: String,
+    },
     Set(SetArgs),
-    Default { serial: String },
+    Default {
+        serial: String,
+    },
     Reload,
-    Tui { serial: Option<String> },
+    Tui {
+        serial: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -99,8 +115,18 @@ impl Client {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let cli = Cli::parse();
+    if let Command::Prepare { module } = &cli.command {
+        prepare(module.as_deref())?;
+        if cli.json {
+            println!(r#"{{"result":"ready","control":"{CONTROL_DEVICE}"}}"#);
+        } else {
+            println!("ready: {CONTROL_DEVICE}");
+        }
+        return Ok(());
+    }
     let mut client = Client::connect(&cli.socket)?;
     match cli.command {
+        Command::Prepare { .. } => unreachable!(),
         Command::List => output(client.request(&ControlRequest::List)?, cli.json),
         Command::Show { serial } => {
             output(client.request(&ControlRequest::Show { serial })?, cli.json)
@@ -153,6 +179,62 @@ fn main() -> Result<(), Box<dyn Error>> {
         Command::Reload => output(client.request(&ControlRequest::Reload)?, cli.json),
         Command::Tui { serial } => tui::run(&mut client, serial.as_deref()),
     }
+}
+
+fn prepare(module: Option<&Path>) -> Result<(), Box<dyn Error>> {
+    let control = Path::new(CONTROL_DEVICE);
+    if is_character_device(control)? {
+        return Ok(());
+    }
+
+    let sysfs = Path::new(CONTROL_SYSFS_DEVICE);
+    if !sysfs.exists() {
+        match module {
+            Some(path) => run("insmod", [path.as_os_str()])?,
+            None => run("modprobe", [std::ffi::OsStr::new("rp_extio")])?,
+        }
+    }
+    if !sysfs.exists() {
+        return Err(format!("rp_extio loaded without creating {CONTROL_SYSFS_DEVICE}").into());
+    }
+
+    if !is_character_device(control)? {
+        run(
+            "udevadm",
+            [
+                std::ffi::OsStr::new("trigger"),
+                std::ffi::OsStr::new("--action=add"),
+                std::ffi::OsStr::new("--settle"),
+                sysfs.as_os_str(),
+            ],
+        )?;
+    }
+    if !is_character_device(control)? {
+        return Err(
+            format!("{CONTROL_DEVICE} is not a character device after udev settled").into(),
+        );
+    }
+    Ok(())
+}
+
+fn is_character_device(path: &Path) -> std::io::Result<bool> {
+    match path.symlink_metadata() {
+        Ok(metadata) => Ok(metadata.file_type().is_char_device()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn run<I, S>(program: &str, arguments: I) -> Result<(), Box<dyn Error>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<std::ffi::OsStr>,
+{
+    let status = ProcessCommand::new(program).args(arguments).status()?;
+    if !status.success() {
+        return Err(format!("{program} exited with {status}").into());
+    }
+    Ok(())
 }
 
 fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {

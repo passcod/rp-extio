@@ -122,12 +122,10 @@ runzero install -m 0644 linux/Makefile linux/dkms.conf \
 runzero dkms add -m rp-extio -v 0.1.0
 runzero dkms build -m rp-extio -v 0.1.0
 runzero dkms install -m rp-extio -v 0.1.0
-runzero modprobe rp_extio
 ```
 
-This creates `/dev/rp-extio-control`, owned by root with mode `0600`. One daemon
-may open it. Closing the control device unregisters every I2C, SPI, and GPIO
-instance and wakes outstanding bus operations with `ENODEV`.
+The service preparation step below loads the installed module and creates its
+control device.
 
 To remove this version:
 
@@ -150,6 +148,23 @@ runzero install -m 0644 dist/rp-extiod.service \
   /etc/systemd/system/rp-extiod.service
 systemctl daemon-reload
 systemctl enable --now rp-extiod.service
+```
+
+The service runs `rp-extioctl prepare` before starting the daemon, so service
+startup loads the module and repairs a missing control-device node without a
+separate manual step.
+`/dev/rp-extio-control` is owned by root with mode `0600`, and one daemon may
+open it. Closing it unregisters every I2C, SPI, and GPIO instance and wakes
+outstanding bus operations with `ENODEV`.
+
+For a manual start, or a development build that has not been installed with
+DKMS, prepare the control device explicitly:
+
+```sh
+runzero rp-extioctl prepare
+
+make -C linux
+runzero target/debug/rp-extioctl prepare --module linux/rp_extio.ko
 ```
 
 The daemon watches for matching USB devices, negotiates protocol version and

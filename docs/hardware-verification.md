@@ -441,6 +441,16 @@ Verify DKMS rebuild after a kernel upgrade, boot-time module loading, daemon
 startup before and after the Pico is connected, service restart, uninstall,
 and removal of all installed files and device nodes.
 
+Also remove `/dev/rp-extio-control` while the daemon is stopped, then start the
+service. Its `rp-extioctl prepare` pre-start must load `rp_extio` when needed,
+trigger and settle the misc-device udev event, recreate the character device,
+and allow the daemon to start. For an uninstalled development module, exercise
+the equivalent manual path:
+
+```sh
+runzero target/debug/rp-extioctl prepare --module linux/rp_extio.ko
+```
+
 ## ADC and PWM stretch fixtures
 
 ADC and PWM are not exposed by the current USB protocol, daemon, or Linux
