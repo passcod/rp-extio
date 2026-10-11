@@ -277,52 +277,57 @@ impl Board for Pico2Board<'_> {
         request: &I2cRequest<'_>,
         reads: &mut [u8],
     ) -> Result<usize, BusFailure> {
-        let deadline = Self::now_us().saturating_add(TRANSACTION_DEADLINE_US);
-        self.recover_i2c(deadline)?;
-        let mut read_offset = 0;
+        let result = (|| {
+            let deadline = Self::now_us().saturating_add(TRANSACTION_DEADLINE_US);
+            self.recover_i2c(deadline)?;
+            let mut read_offset = 0;
 
-        for (completed, message) in request.messages().enumerate() {
-            let completed = completed as u32;
-            let message = message.map_err(|_| BusFailure::new(Status::BadFrame, completed))?;
-            let result = (|| {
-                self.i2c_start(deadline)?;
-                let read = message.flags & I2C_READ != 0;
-                if !self.address(
-                    message.address,
-                    message.flags & I2C_TEN_BIT != 0,
-                    read,
-                    deadline,
-                )? {
-                    return Err(BusFailure::new(Status::Nack, completed));
-                }
-                if read {
-                    for index in 0..message.len as usize {
-                        reads[read_offset] =
-                            self.i2c_read_byte(index + 1 < message.len as usize, deadline)?;
-                        read_offset += 1;
+            for (completed, message) in request.messages().enumerate() {
+                let completed = completed as u32;
+                let message = message.map_err(|_| BusFailure::new(Status::BadFrame, completed))?;
+                let result = (|| {
+                    self.i2c_start(deadline)?;
+                    let read = message.flags & I2C_READ != 0;
+                    if !self.address(
+                        message.address,
+                        message.flags & I2C_TEN_BIT != 0,
+                        read,
+                        deadline,
+                    )? {
+                        return Err(BusFailure::new(Status::Nack, completed));
                     }
-                } else {
-                    for &byte in message.write_data {
-                        if !self.i2c_write_byte(byte, deadline)? {
-                            return Err(BusFailure::new(Status::Nack, completed));
+                    if read {
+                        for index in 0..message.len as usize {
+                            reads[read_offset] =
+                                self.i2c_read_byte(index + 1 < message.len as usize, deadline)?;
+                            read_offset += 1;
+                        }
+                    } else {
+                        for &byte in message.write_data {
+                            if !self.i2c_write_byte(byte, deadline)? {
+                                return Err(BusFailure::new(Status::Nack, completed));
+                            }
                         }
                     }
+                    Ok(())
+                })();
+                if let Err(mut failure) = result {
+                    failure.completed = completed;
+                    if failure.status != Status::ArbitrationLost {
+                        let _ = self.i2c_stop(deadline);
+                    }
+                    return Err(failure);
                 }
-                Ok(())
-            })();
-            if let Err(mut failure) = result {
-                failure.completed = completed;
-                if failure.status != Status::ArbitrationLost {
-                    let _ = self.i2c_stop(deadline);
-                } else {
-                    self.sda.set_high();
-                    self.scl.set_high();
-                }
-                return Err(failure);
             }
-        }
-        self.i2c_stop(deadline)?;
-        Ok(read_offset)
+            self.i2c_stop(deadline)?;
+            Ok(read_offset)
+        })();
+
+        // A failed STOP can return while SDA is still asserted, particularly when SCL is held
+        // low. Never allow one failed transaction to leave either open-drain output enabled.
+        self.sda.set_high();
+        self.scl.set_high();
+        result
     }
 
     fn spi_message(
