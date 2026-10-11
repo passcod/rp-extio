@@ -110,6 +110,14 @@ struct SetArgs {
     enable_spi1: bool,
     #[arg(long, conflicts_with = "enable_spi1")]
     disable_spi1: bool,
+    #[arg(long, conflicts_with = "disable_spi0_cs1")]
+    enable_spi0_cs1: bool,
+    #[arg(long, conflicts_with = "enable_spi0_cs1")]
+    disable_spi0_cs1: bool,
+    #[arg(long, conflicts_with = "disable_spi1_cs1")]
+    enable_spi1_cs1: bool,
+    #[arg(long, conflicts_with = "enable_spi1_cs1")]
+    disable_spi1_cs1: bool,
 }
 
 pub(crate) struct Client {
@@ -234,6 +242,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 && enable_edits
                     .iter()
                     .all(|(_, enable, disable)| !enable && !disable)
+                && !arguments.enable_spi0_cs1
+                && !arguments.disable_spi0_cs1
+                && !arguments.enable_spi1_cs1
+                && !arguments.disable_spi1_cs1
             {
                 return Err("set requires at least one route or enable/disable option".into());
             }
@@ -245,6 +257,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             for (peripheral, enable, disable) in enable_edits {
                 if enable || disable {
                     map.set_enabled(peripheral, enable);
+                }
+            }
+            for (bus, enable, disable) in [
+                (0, arguments.enable_spi0_cs1, arguments.disable_spi0_cs1),
+                (1, arguments.enable_spi1_cs1, arguments.disable_spi1_cs1),
+            ] {
+                if enable || disable {
+                    map.set_spi_cs1_enabled(bus, enable);
                 }
             }
             map.validate()
@@ -407,7 +427,29 @@ fn print_map(label: &str, config: PinMapConfig) {
             }
         );
         for &signal in peripheral.signals() {
-            println!("    {:10} GP{}", signal_name(signal), map.pin(signal));
+            let state = match signal {
+                PinSignal::Spi0Cs1 => {
+                    if map.spi_cs1_enabled(0) {
+                        " enabled"
+                    } else {
+                        " disabled"
+                    }
+                }
+                PinSignal::Spi1Cs1 => {
+                    if map.spi_cs1_enabled(1) {
+                        " enabled"
+                    } else {
+                        " disabled"
+                    }
+                }
+                _ => "",
+            };
+            println!(
+                "    {:10} GP{}{}",
+                signal_name(signal),
+                map.pin(signal),
+                state
+            );
         }
     }
     let gpio = map.gpio_pins().unwrap();
@@ -476,6 +518,7 @@ mod tests {
             "7",
             "--disable-uart0",
             "--enable-uart1",
+            "--disable-spi0-cs1",
         ])
         .unwrap();
         let Command::Set(arguments) = cli.command else {
@@ -485,6 +528,7 @@ mod tests {
         assert_eq!(arguments.uart1_rx, Some(7));
         assert!(arguments.disable_uart0);
         assert!(arguments.enable_uart1);
+        assert!(arguments.disable_spi0_cs1);
     }
 
     #[test]
@@ -496,6 +540,16 @@ mod tests {
                 "ABC",
                 "--enable-spi1",
                 "--disable-spi1",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "rp-extioctl",
+                "set",
+                "ABC",
+                "--enable-spi0-cs1",
+                "--disable-spi0-cs1",
             ])
             .is_err()
         );

@@ -130,6 +130,8 @@ Supported variables and defaults are:
 | `RP_EXTIO_I2C1_ENABLED` | false | boolean |
 | `RP_EXTIO_SPI0_ENABLED` | true | boolean |
 | `RP_EXTIO_SPI1_ENABLED` | false | boolean |
+| `RP_EXTIO_SPI0_CS1_ENABLED` | true | boolean |
+| `RP_EXTIO_SPI1_CS1_ENABLED` | true | boolean |
 
 The old unqualified instance-0 names, such as `RP_EXTIO_I2C_SDA`, remain
 aliases when the corresponding `RP_EXTIO_I2C0_SDA` variable is unset.
@@ -263,6 +265,7 @@ rp-extioctl set 125DBCCF0BCA4BEF \
   --spi1-miso GP8 --spi1-sck GP10 --spi1-mosi GP11 \
   --spi1-cs0 GP14 --spi1-cs1 GP15 --enable-spi1
 rp-extioctl set 125DBCCF0BCA4BEF --disable-uart0
+rp-extioctl set 125DBCCF0BCA4BEF --disable-spi0-cs1
 ```
 
 Every route option is instance-qualified. The old unqualified options such as
@@ -270,6 +273,9 @@ Every route option is instance-qualified. The old unqualified options such as
 `uart1`, `i2c0`, `i2c1`, `spi0`, and `spi1` has matching `--enable-*` and
 `--disable-*` options. Routes can be edited while an instance is disabled;
 enabling it later atomically rejects any conflict with the active instances.
+Each SPI instance also has `--enable-spiN-cs1` and `--disable-spiN-cs1`.
+Disabling CS1 leaves CS0 and the controller active, removes the second spidev
+child, and returns the remembered CS1 pin to GPIO.
 
 Every accepted change removes and recreates that board's enabled Linux I2C and
 SPI instances and its GPIO controller, so rediscover their numbers and GPIO
@@ -304,11 +310,13 @@ temporarily invalid draft for manual correction. Valid routes are highlighted;
 conflicts, mismatched I2C pairs, changed pins, exported GPIO lines, power pins,
 grounds, and current Linux bus assignments remain visible on the board.
 
-`e` toggles the selected signal's entire peripheral instance. Disabling it
-immediately previews its pins as GPIO; enabling validates all of its remembered
-routes before changing the draft. `f` mirrors the diagram left-to-right for a
-board mounted belly up, keeping USB at the top while showing the pin headers as
-viewed from the back. Arrow movement remains aligned with the screen.
+`e` toggles the selected signal's entire peripheral instance, except that a
+selected SPI CS1 toggles only that optional second chip select. Disabling an
+instance or CS1 immediately previews its pins as GPIO; enabling validates all
+of its remembered routes before changing the draft. `f` mirrors the diagram
+left-to-right for a board mounted belly up, keeping USB at the top while showing
+the pin headers as viewed from the back. Arrow movement remains aligned with the
+screen.
 Orientation is not persisted.
 
 `a` applies the complete draft atomically, `d` loads the firmware defaults into
@@ -330,10 +338,10 @@ The persistent file is JSON and always contains complete maps:
       "i2c1_enabled": false, "i2c1_sda": 10, "i2c1_scl": 11,
       "spi0_enabled": true,
       "spi0_miso": 16, "spi0_sck": 18, "spi0_mosi": 19,
-      "spi0_cs0": 17, "spi0_cs1": 21,
+      "spi0_cs0": 17, "spi0_cs1_enabled": false, "spi0_cs1": 21,
       "spi1_enabled": false,
       "spi1_miso": 12, "spi1_sck": 14, "spi1_mosi": 15,
-      "spi1_cs0": 13, "spi1_cs1": 20
+      "spi1_cs0": 13, "spi1_cs1_enabled": true, "spi1_cs1": 20
     }
   }
 }
@@ -341,6 +349,8 @@ The persistent file is JSON and always contains complete maps:
 
 Version-1 files are loaded by placing their routes on instance 0 and retaining
 the disabled instance-1 defaults. The next successful save writes version 2.
+Version-2 maps without the CS1 enable fields load with both second chip selects
+enabled.
 
 This release uses USB protocol major 2 and kernel ABI major 2. Rebuild and
 install the module and daemon, and flash the matching firmware, as one upgrade;

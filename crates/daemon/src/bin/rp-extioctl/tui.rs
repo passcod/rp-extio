@@ -271,19 +271,25 @@ impl App {
         self.message_error = false;
     }
 
-    fn toggle_peripheral(&mut self) {
-        let peripheral = self.selected_signal().peripheral();
+    fn toggle_selected_enabled(&mut self) {
+        let signal = self.selected_signal();
+        let peripheral = signal.peripheral();
         let Some(mut candidate) = self.edited else {
             self.message = "board is disconnected".into();
             self.message_error = true;
             return;
         };
-        let enabled = candidate.is_enabled(peripheral);
-        candidate.set_enabled(peripheral, !enabled);
+        let cs1_bus = cs1_bus(signal);
+        let enabled = signal_toggle_enabled(candidate, signal);
+        if let Some(bus) = cs1_bus {
+            candidate.set_spi_cs1_enabled(bus, !enabled);
+        } else {
+            candidate.set_enabled(peripheral, !enabled);
+        }
         if !enabled && let Err(error) = candidate.validate() {
             self.message = format!(
                 "cannot enable {}: {}",
-                peripheral_name(peripheral),
+                cs1_bus.map_or_else(|| peripheral_name(peripheral), |_| display_signal(signal)),
                 rp_extiod::control::format_validation(error)
             );
             self.message_error = true;
@@ -293,7 +299,7 @@ impl App {
         self.default_pending = false;
         self.message = format!(
             "{} {}; press a to apply",
-            peripheral_name(peripheral),
+            cs1_bus.map_or_else(|| peripheral_name(peripheral), |_| display_signal(signal)),
             if enabled { "disabled" } else { "enabled" }
         );
         self.message_error = false;
@@ -404,7 +410,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
             KeyCode::BackTab => app.cycle_signal(-1),
             KeyCode::Enter | KeyCode::Char(' ') => app.assign_selected(),
             KeyCode::Char('g') => app.toggle_grouped(),
-            KeyCode::Char('e') => app.toggle_peripheral(),
+            KeyCode::Char('e') => app.toggle_selected_enabled(),
             KeyCode::Char('f') => app.flip(),
             KeyCode::Char('u') => app.undo(),
             KeyCode::Char('d') => app.load_default(),
@@ -552,7 +558,7 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
             format!(
                 "GP{} ({})",
                 map.pin(selected),
-                if map.is_enabled(selected.peripheral()) {
+                if signal_toggle_enabled(map, selected) {
                     "enabled"
                 } else {
                     "disabled"
@@ -605,7 +611,7 @@ fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let active = active.map(|map| map.pin(signal));
             let enabled = app
                 .edited
-                .is_some_and(|map| map.is_enabled(signal.peripheral()));
+                .is_some_and(|map| signal_toggle_enabled(map, signal));
             let route = match (active, draft) {
                 (Some(old), Some(new)) if old != new => format!("GP{old} → GP{new}"),
                 (_, Some(pin)) => format!("GP{pin}"),
@@ -750,7 +756,7 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
     };
     let signals = PinSignal::ALL
         .into_iter()
-        .filter(|&signal| map.is_enabled(signal.peripheral()) && map.pin(signal) == gpio)
+        .filter(|&signal| map.is_signal_enabled(signal) && map.pin(signal) == gpio)
         .collect::<Vec<_>>();
     let role = if signals.is_empty() {
         "GPIO".into()
@@ -763,8 +769,8 @@ fn pin_role(pin: HeaderPin, app: &App) -> (String, bool, bool) {
     };
     let changed = app.active_map().is_some_and(|active| {
         PinSignal::ALL.into_iter().any(|signal| {
-            let active_enabled = active.is_enabled(signal.peripheral());
-            let draft_enabled = map.is_enabled(signal.peripheral());
+            let active_enabled = active.is_signal_enabled(signal);
+            let draft_enabled = map.is_signal_enabled(signal);
             (active_enabled != draft_enabled
                 || (draft_enabled && active.pin(signal) != map.pin(signal)))
                 && ((active_enabled && active.pin(signal) == gpio)
@@ -795,7 +801,7 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
     if let Some(map) = app.edited
         && let Some(assigned) = PinSignal::ALL
             .into_iter()
-            .find(|&candidate| map.is_enabled(candidate.peripheral()) && map.pin(candidate) == gpio)
+            .find(|&candidate| map.is_signal_enabled(candidate) && map.pin(candidate) == gpio)
     {
         return signal_style(assigned);
     }
@@ -867,6 +873,21 @@ fn coupled_signal(signal: PinSignal) -> bool {
     !matches!(
         signal,
         PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1
+    )
+}
+
+fn cs1_bus(signal: PinSignal) -> Option<usize> {
+    match signal {
+        PinSignal::Spi0Cs1 => Some(0),
+        PinSignal::Spi1Cs1 => Some(1),
+        _ => None,
+    }
+}
+
+fn signal_toggle_enabled(map: PinMap, signal: PinSignal) -> bool {
+    cs1_bus(signal).map_or_else(
+        || map.is_enabled(signal.peripheral()),
+        |bus| map.spi_cs1_enabled(bus),
     )
 }
 
@@ -1273,7 +1294,7 @@ mod tests {
     fn disabled_peripherals_release_gpio_and_can_be_rerouted_before_enabling() {
         let mut app = app();
         app.signal = PinSignal::Uart0Tx as usize;
-        app.toggle_peripheral();
+        app.toggle_selected_enabled();
         let map = app.edited.unwrap();
         assert!(!map.is_enabled(Peripheral::Uart0));
         assert_eq!(pin_role(LEFT_HEADER[0], &app).0, "GPIO");
@@ -1285,14 +1306,35 @@ mod tests {
         assert_eq!((map.uart_tx[1], map.uart_rx[1]), (4, 5));
         assert!(!map.is_enabled(Peripheral::Uart1));
 
-        app.toggle_peripheral();
+        app.toggle_selected_enabled();
         assert!(!app.edited.unwrap().is_enabled(Peripheral::Uart1));
         assert!(app.message.contains("cannot enable UART1"));
 
         (app.cursor_row, app.cursor_side) = find_gpio(8).unwrap();
         app.assign_selected();
-        app.toggle_peripheral();
+        app.toggle_selected_enabled();
         assert!(app.edited.unwrap().is_enabled(Peripheral::Uart1));
+    }
+
+    #[test]
+    fn second_chip_select_can_be_disabled_without_disabling_spi() {
+        let mut app = app();
+        app.signal = PinSignal::Spi0Cs1 as usize;
+        let (row, side) = find_gpio(DEFAULT_PIN_MAP.spi_chip_selects[0][1]).unwrap();
+
+        app.toggle_selected_enabled();
+        let map = app.edited.unwrap();
+        assert!(map.is_enabled(Peripheral::Spi0));
+        assert!(!map.spi_cs1_enabled(0));
+        assert_eq!(map.spi_chip_select_count(0), 1);
+        assert_eq!(
+            pin_role([LEFT_HEADER, RIGHT_HEADER][side][row], &app).0,
+            "GPIO"
+        );
+        assert!(app.message.contains("SPI0 CS1 disabled"));
+
+        app.toggle_selected_enabled();
+        assert!(app.edited.unwrap().spi_cs1_enabled(0));
     }
 
     #[test]

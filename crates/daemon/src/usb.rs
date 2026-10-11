@@ -964,7 +964,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut offset = 0;
     let mut generation = None;
     let mut i2c: [Option<(u32, [u8; 2])>; 2] = [None; 2];
-    let mut spi: [Option<(u32, u32, u32, u16, [u8; 5])>; 2] = [None; 2];
+    let mut spi: [Option<(u32, u32, u32, u16, Vec<u8>)>; 2] = [None, None];
     let mut uart: [Option<[u8; 2]>; 2] = [None; 2];
     let mut pin_map = None;
     let mut gpio_pins: Option<Vec<u8>> = None;
@@ -1018,7 +1018,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                 if value.len() < 16
                     || bus >= spi.len()
                     || spi[bus].is_some()
-                    || value[1] != 2
+                    || !(1..=2).contains(&value[1])
                     || value.len() != 15 + value[1] as usize
                 {
                     return Err(invalid("invalid SPI capability"));
@@ -1034,7 +1034,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                     minimum,
                     maximum,
                     value[1] as u16,
-                    value[12..17].try_into().unwrap(),
+                    value[12..].to_vec(),
                 ));
             }
             CAP_UART => {
@@ -1090,14 +1090,17 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
             return Err(invalid("capabilities do not match enabled peripherals"));
         }
         if i2c[bus].is_some_and(|(_, pins)| pins != [pin_map.i2c_sda[bus], pin_map.i2c_scl[bus]])
-            || spi[bus].is_some_and(|(_, _, _, _, pins)| {
-                pins != [
+            || spi[bus].as_ref().is_some_and(|(_, _, _, count, pins)| {
+                let mut expected = vec![
                     pin_map.spi_sck[bus],
                     pin_map.spi_mosi[bus],
                     pin_map.spi_miso[bus],
                     pin_map.spi_chip_selects[bus][0],
-                    pin_map.spi_chip_selects[bus][1],
-                ]
+                ];
+                if pin_map.spi_cs1_enabled(bus) {
+                    expected.push(pin_map.spi_chip_selects[bus][1]);
+                }
+                *count != u16::from(pin_map.spi_chip_select_count(bus)) || *pins != expected
             })
             || uart[bus].is_some_and(|pins| pins != [pin_map.uart_tx[bus], pin_map.uart_rx[bus]])
         {
@@ -1181,7 +1184,8 @@ mod tests {
                 capability_record(&mut payload, CAP_I2C, &value);
             }
             if map.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]) {
-                let mut value = vec![bus as u8, 2];
+                let chip_selects = map.spi_chip_select_count(bus);
+                let mut value = vec![bus as u8, chip_selects];
                 value.extend_from_slice(&0x4f_u16.to_le_bytes());
                 value.extend_from_slice(&50_000_u32.to_le_bytes());
                 value.extend_from_slice(&20_000_000_u32.to_le_bytes());
@@ -1190,8 +1194,10 @@ mod tests {
                     map.spi_mosi[bus],
                     map.spi_miso[bus],
                     map.spi_chip_selects[bus][0],
-                    map.spi_chip_selects[bus][1],
                 ]);
+                if map.spi_cs1_enabled(bus) {
+                    value.push(map.spi_chip_selects[bus][1]);
+                }
                 capability_record(&mut payload, CAP_SPI, &value);
             }
             if map.is_enabled([Peripheral::Uart0, Peripheral::Uart1][bus]) {
@@ -1247,6 +1253,18 @@ mod tests {
         assert_eq!(all_disabled.registration.i2c, [None; 2]);
         assert_eq!(all_disabled.registration.spi, [None; 2]);
         assert_eq!(all_disabled.registration.gpio_lines, 26);
+    }
+
+    #[test]
+    fn parses_spi_with_only_cs0_enabled() {
+        let mut map = rp_extio_wire::DEFAULT_PIN_MAP;
+        map.set_spi_cs1_enabled(0, false);
+        let negotiated = parse_capabilities(&capabilities(map)).unwrap();
+        assert_eq!(negotiated.registration.spi[0].unwrap().spi_chip_selects, 1);
+        assert!(
+            negotiated.registration.gpio_pins[..negotiated.registration.gpio_lines as usize]
+                .contains(&map.spi_chip_selects[0][1])
+        );
     }
 
     #[test]

@@ -11,7 +11,6 @@ pub use rp_extio_wire::DEFAULT_PIN_MAP;
 pub const I2C_SPEED_HZ: u32 = 100_000;
 pub const SPI_MIN_SPEED_HZ: u32 = 50_000;
 pub const SPI_MAX_SPEED_HZ: u32 = 20_000_000;
-pub const SPI_CHIP_SELECTS: u8 = 2;
 pub const UART_BAUD: u32 = 115_200;
 
 pub const SPI_CPHA: u16 = 1 << 0;
@@ -165,16 +164,17 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
             })?;
         }
         if pins.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]) {
-            record(&mut out, CAP_SPI, 17, |out| {
+            let chip_selects = pins.spi_chip_select_count(bus);
+            record(&mut out, CAP_SPI, 15 + u16::from(chip_selects), |out| {
                 out.push(bus as u8)?;
-                out.push(SPI_CHIP_SELECTS)?;
+                out.push(chip_selects)?;
                 out.u16(SPI_SUPPORTED_MODES)?;
                 out.u32(SPI_MIN_SPEED_HZ)?;
                 out.u32(SPI_MAX_SPEED_HZ)?;
                 out.push(pins.spi_sck[bus])?;
                 out.push(pins.spi_mosi[bus])?;
                 out.push(pins.spi_miso[bus])?;
-                out.extend(&pins.spi_chip_selects[bus])
+                out.extend(&pins.spi_chip_selects[bus][..chip_selects as usize])
             })?;
         }
         if pins.is_enabled([Peripheral::Uart0, Peripheral::Uart1][bus]) {
@@ -292,7 +292,11 @@ fn spi<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<u
     };
     if !board.pin_map().is_enabled(peripheral)
         || request.mode & !SPI_SUPPORTED_MODES != 0
-        || (request.mode & SPI_NO_CS == 0 && request.chip_select >= SPI_CHIP_SELECTS)
+        || (request.mode & SPI_NO_CS == 0
+            && request.chip_select
+                >= board
+                    .pin_map()
+                    .spi_chip_select_count(request.bus_id as usize))
     {
         return Err(BusFailure::new(Status::Unsupported, 0));
     }
@@ -613,5 +617,36 @@ mod tests {
             );
             assert_eq!(reply.header.status, Status::BadFrame);
         }
+    }
+
+    #[test]
+    fn spi_rejects_disabled_second_chip_select() {
+        let mut request = [0; 29];
+        request[0] = 0;
+        request[1] = 1;
+        request[4] = 1;
+        request[8..12].copy_from_slice(&1_000_000_u32.to_le_bytes());
+        request[12] = 1;
+        request[28] = 0x5a;
+        let mut board = Stub::default();
+        board.pin_map.set_spi_cs1_enabled(0, false);
+        let mut response = [0; MAX_PAYLOAD];
+
+        let disabled = dispatch(
+            header(Operation::SpiMessage, request.len()),
+            &request,
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(disabled.header.status, Status::Unsupported);
+
+        request[1] = 0;
+        let cs0 = dispatch(
+            header(Operation::SpiMessage, request.len()),
+            &request,
+            &mut board,
+            &mut response,
+        );
+        assert_eq!(cs0.header.status, Status::Ok);
     }
 }

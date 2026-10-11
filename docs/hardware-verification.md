@@ -138,43 +138,47 @@ Perform this section with one stock UF2; do not rebuild between routes.
 3. Move I2C0 to a second valid pair, move the wires, and repeat the read.
 4. Move SPI0 MISO/SCK/MOSI and both chip selects to another conflict-free map,
    rediscover both spidev children, and repeat loopback and device-ID reads.
-5. Move UART0 TX/RX, reconnect the signal wires without reconnecting USB, and
+5. Disable SPI0 CS1 while leaving SPI0 enabled. Confirm the second spidev child
+   disappears, CS0 traffic continues, GP21 returns to the GPIO controller, and
+   requests for chip select 1 are rejected. Re-enable CS1 and confirm the child
+   and route return.
+6. Move UART0 TX/RX, reconnect the signal wires without reconnecting USB, and
    verify both CDC-to-UART and UART-to-CDC traffic. Restore the startup map
    before enabling all remembered instance-1 routes below.
-6. Enable I2C1 on its remembered GP10/GP11 route. Confirm a second I2C adapter
+7. Enable I2C1 on its remembered GP10/GP11 route. Confirm a second I2C adapter
    appears, each adapter reaches only its wired bus, and the GPIO count falls
    from 17 to 15.
-7. Enable SPI1 on its remembered GP12/GP14/GP15, CS GP13/GP20 route. Confirm a
+8. Enable SPI1 on its remembered GP12/GP14/GP15, CS GP13/GP20 route. Confirm a
    second controller with two children appears, exercise both SPI instances,
    and confirm the GPIO count falls to 10.
-8. Enable UART1 on GP8/GP9, exercise the second ACM path in both directions,
+9. Enable UART1 on GP8/GP9, exercise the second ACM path in both directions,
    and confirm the GPIO count falls to 8. The two ACM devices must have remained
    enumerated throughout.
-9. Disable each second instance again. Its remembered routes must stay visible,
+10. Disable each second instance again. Its remembered routes must stay visible,
    its I2C or SPI Linux bus must disappear, and its pins must return to the GPIO
    list in ascending GPIO order.
-10. Disable all six peripherals. Confirm there are no I2C or SPI buses for the
+11. Disable all six peripherals. Confirm there are no I2C or SPI buses for the
     board, both ACM devices remain, and the GPIO controller exposes all 26
     header GPIOs. Restore the startup state with `rp-extioctl default SERIAL`.
-11. Attempt an invalid mux route and a duplicate enabled assignment. The
+12. Attempt an invalid mux route and a duplicate enabled assignment. The
     client or firmware must reject each one while the previous buses and active
     map remain usable.
-12. Change remembered routes while an instance is disabled, including a route
+13. Change remembered routes while an instance is disabled, including a route
     overlapping an enabled peripheral. The edit may be saved, but enabling the
     conflicting instance must fail atomically without changing the active map.
-13. Start two `rp-extioctl set` operations from the same observed generation.
+14. Start two `rp-extioctl set` operations from the same observed generation.
    One may apply; the other must report a generation conflict.
-14. Restart the daemon and then reset the Pico. The persistent map must be
+15. Restart the daemon and then reset the Pico. The persistent map must be
    reapplied in both cases before Linux buses appear.
-15. Run `rp-extioctl default SERIAL`; the startup map must return, its
+16. Run `rp-extioctl default SERIAL`; the startup map must return, its
     persistent entry must disappear, and Linux buses must be rediscovered.
-16. Run `rp-extioctl tui SERIAL`, exercise every signal selector, grouped moves
+17. Run `rp-extioctl tui SERIAL`, exercise every signal selector, grouped moves
     within both hardware instances, the `e` enable toggle, conflict display,
     apply, refresh, reload, and default action. Press `f` and confirm the board
     mirrors left-to-right as viewed belly up, without exchanging the USB and
     SWD ends, and that arrow navigation remains screen-relative. Exit with both
     `q` and an interrupt and confirm the terminal is restored.
-17. With UART0 on GP0/GP1, assign SPI0 SCK to GP2 in grouped mode. Confirm the
+18. With UART0 on GP0/GP1, assign SPI0 SCK to GP2 in grouped mode. Confirm the
     TUI falls back to changing SCK alone, retains the existing MISO/MOSI routes,
     and leaves the draft valid.
 
@@ -401,6 +405,7 @@ re-enable SPI0 and repeat in the opposite direction.
 - Loopback returns every transmitted byte at representative lengths and
   speeds.
 - Both chip selects address only their intended peripheral.
+- Disabling CS1 leaves CS0 operational and releases only the CS1 pin to GPIO.
 - SPI0 and SPI1 remain isolated and can operate concurrently on separate pins.
 - Flash erase, program, and readback succeed in the dedicated test region.
 - Multi-segment chip-select lifetime and delay fields match the request.

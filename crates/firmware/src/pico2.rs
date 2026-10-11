@@ -129,7 +129,7 @@ impl<'d> Pico2Board<'d> {
                 .pin_map
                 .is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus])
             {
-                for index in 0..2 {
+                for index in 0..self.pin_map.spi_chip_select_count(bus) as usize {
                     let level = if self.cs_active_high[bus][index] {
                         Level::Low
                     } else {
@@ -388,7 +388,9 @@ impl<'d> Pico2Board<'d> {
                 self.release(map.i2c_scl[bus]);
             }
             if map.is_enabled([Peripheral::Spi0, Peripheral::Spi1][bus]) {
-                for chip_select in map.spi_chip_selects[bus] {
+                for &chip_select in
+                    &map.spi_chip_selects[bus][..map.spi_chip_select_count(bus) as usize]
+                {
                     self.set_output(chip_select, Level::High);
                 }
                 for pin in [map.spi_miso[bus], map.spi_sck[bus], map.spi_mosi[bus]] {

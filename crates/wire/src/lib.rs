@@ -29,6 +29,8 @@ pub const HEADER_PINS: [u8; 26] = [
 pub const MAX_GPIO_LINES: usize = HEADER_PINS.len();
 pub const PIN_SIGNAL_COUNT: usize = 18;
 pub const PIN_MAP_LEN: usize = PIN_SIGNAL_COUNT + 1;
+const SPI0_CS1_DISABLE_MASK: u8 = 1 << 6;
+const SPI1_CS1_DISABLE_MASK: u8 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
@@ -362,9 +364,6 @@ impl PinMap {
         if bytes.len() != PIN_MAP_LEN {
             return Err(WireError::Truncated);
         }
-        if bytes[PIN_SIGNAL_COUNT] & !0x3f != 0 {
-            return Err(WireError::Invalid);
-        }
         Ok(Self {
             uart_tx: [bytes[0], bytes[2]],
             uart_rx: [bytes[1], bytes[3]],
@@ -417,15 +416,35 @@ impl PinMap {
         }
     }
 
-    pub fn validate(self) -> Result<(), PinValidationError> {
-        if self.enabled & !0x3f != 0 {
-            return Err(PinValidationError {
-                kind: PinValidationKind::InvalidEnableMask,
-                signal: PinSignal::Uart0Tx,
-                other: None,
-                pin: self.enabled,
-            });
+    pub const fn spi_cs1_enabled(self, bus: usize) -> bool {
+        self.enabled & [SPI0_CS1_DISABLE_MASK, SPI1_CS1_DISABLE_MASK][bus] == 0
+    }
+
+    pub fn set_spi_cs1_enabled(&mut self, bus: usize, enabled: bool) {
+        let mask = [SPI0_CS1_DISABLE_MASK, SPI1_CS1_DISABLE_MASK][bus];
+        if enabled {
+            self.enabled &= !mask;
+        } else {
+            self.enabled |= mask;
         }
+    }
+
+    pub const fn spi_chip_select_count(self, bus: usize) -> u8 {
+        1 + self.spi_cs1_enabled(bus) as u8
+    }
+
+    pub const fn is_signal_enabled(self, signal: PinSignal) -> bool {
+        if !self.is_enabled(signal.peripheral()) {
+            return false;
+        }
+        match signal {
+            PinSignal::Spi0Cs1 => self.spi_cs1_enabled(0),
+            PinSignal::Spi1Cs1 => self.spi_cs1_enabled(1),
+            _ => true,
+        }
+    }
+
+    pub fn validate(self) -> Result<(), PinValidationError> {
         for signal in PinSignal::ALL {
             let pin = self.pin(signal);
             if !HEADER_PINS.contains(&pin) {
@@ -459,14 +478,14 @@ impl PinMap {
             }
         }
         for (index, signal) in PinSignal::ALL.iter().copied().enumerate() {
-            if !self.is_enabled(signal.peripheral()) {
+            if !self.is_signal_enabled(signal) {
                 continue;
             }
             let pin = self.pin(signal);
             if let Some(other) = PinSignal::ALL[..index]
                 .iter()
                 .copied()
-                .find(|&other| self.is_enabled(other.peripheral()) && self.pin(other) == pin)
+                .find(|&other| self.is_signal_enabled(other) && self.pin(other) == pin)
             {
                 return Err(PinValidationError {
                     kind: PinValidationKind::DuplicatePin,
@@ -484,7 +503,7 @@ impl PinMap {
         let mut assigned = [u8::MAX; PIN_SIGNAL_COUNT];
         let mut assigned_len = 0;
         for signal in PinSignal::ALL {
-            if self.is_enabled(signal.peripheral()) {
+            if self.is_signal_enabled(signal) {
                 assigned[assigned_len] = self.pin(signal);
                 assigned_len += 1;
             }
@@ -901,6 +920,22 @@ mod tests {
         all_enabled.enabled = 0x3f;
         assert_eq!(all_enabled.validate(), Ok(()));
         assert_eq!(all_enabled.gpio_pins().unwrap().len(), 8);
+
+        let mut one_chip_select = DEFAULT_PIN_MAP;
+        one_chip_select.set_spi_cs1_enabled(0, false);
+        assert_eq!(
+            PinMap::decode(&one_chip_select.encode()),
+            Ok(one_chip_select)
+        );
+        assert_eq!(one_chip_select.spi_chip_select_count(0), 1);
+        assert!(!one_chip_select.is_signal_enabled(PinSignal::Spi0Cs1));
+        assert!(
+            one_chip_select
+                .gpio_pins()
+                .unwrap()
+                .as_slice()
+                .contains(&one_chip_select.spi_chip_selects[0][1])
+        );
 
         let mut none_enabled = DEFAULT_PIN_MAP;
         none_enabled.enabled = 0;

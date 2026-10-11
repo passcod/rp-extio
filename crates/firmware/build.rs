@@ -37,7 +37,7 @@ fn main() {
     fs::copy("memory.x", output.join("memory.x")).unwrap();
     println!("cargo:rustc-link-search={}", output.display());
 
-    let pins = PinMap {
+    let mut pins = PinMap {
         uart_tx: [
             configured_alias(
                 "RP_EXTIO_UART0_TX",
@@ -128,6 +128,20 @@ fn main() {
             }
         }),
     };
+    pins.set_spi_cs1_enabled(
+        0,
+        configured_enabled(
+            "RP_EXTIO_SPI0_CS1_ENABLED",
+            DEFAULT_PIN_MAP.spi_cs1_enabled(0),
+        ),
+    );
+    pins.set_spi_cs1_enabled(
+        1,
+        configured_enabled(
+            "RP_EXTIO_SPI1_CS1_ENABLED",
+            DEFAULT_PIN_MAP.spi_cs1_enabled(1),
+        ),
+    );
     pins.validate()
         .unwrap_or_else(|error| panic!("invalid default pin map: {error:?}"));
     fs::write(

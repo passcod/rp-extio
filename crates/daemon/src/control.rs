@@ -7,6 +7,10 @@ use std::{
     path::{Path, PathBuf},
 };
 
+const fn enabled_by_default() -> bool {
+    true
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PinMapConfig {
@@ -27,12 +31,16 @@ pub struct PinMapConfig {
     pub spi0_sck: u8,
     pub spi0_mosi: u8,
     pub spi0_cs0: u8,
+    #[serde(default = "enabled_by_default")]
+    pub spi0_cs1_enabled: bool,
     pub spi0_cs1: u8,
     pub spi1_enabled: bool,
     pub spi1_miso: u8,
     pub spi1_sck: u8,
     pub spi1_mosi: u8,
     pub spi1_cs0: u8,
+    #[serde(default = "enabled_by_default")]
+    pub spi1_cs1_enabled: bool,
     pub spi1_cs1: u8,
 }
 
@@ -56,12 +64,14 @@ impl From<PinMap> for PinMapConfig {
             spi0_sck: map.spi_sck[0],
             spi0_mosi: map.spi_mosi[0],
             spi0_cs0: map.spi_chip_selects[0][0],
+            spi0_cs1_enabled: map.spi_cs1_enabled(0),
             spi0_cs1: map.spi_chip_selects[0][1],
             spi1_enabled: map.is_enabled(Peripheral::Spi1),
             spi1_miso: map.spi_miso[1],
             spi1_sck: map.spi_sck[1],
             spi1_mosi: map.spi_mosi[1],
             spi1_cs0: map.spi_chip_selects[1][0],
+            spi1_cs1_enabled: map.spi_cs1_enabled(1),
             spi1_cs1: map.spi_chip_selects[1][1],
         }
     }
@@ -82,7 +92,7 @@ impl From<PinMapConfig> for PinMap {
                 enabled |= peripheral.mask();
             }
         }
-        Self {
+        let mut pins = Self {
             uart_tx: [map.uart0_tx, map.uart1_tx],
             uart_rx: [map.uart0_rx, map.uart1_rx],
             i2c_sda: [map.i2c0_sda, map.i2c1_sda],
@@ -92,7 +102,10 @@ impl From<PinMapConfig> for PinMap {
             spi_mosi: [map.spi0_mosi, map.spi1_mosi],
             spi_chip_selects: [[map.spi0_cs0, map.spi0_cs1], [map.spi1_cs0, map.spi1_cs1]],
             enabled,
-        }
+        };
+        pins.set_spi_cs1_enabled(0, map.spi0_cs1_enabled);
+        pins.set_spi_cs1_enabled(1, map.spi1_cs1_enabled);
+        pins
     }
 }
 
@@ -523,5 +536,28 @@ mod tests {
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(saved["version"], 2);
         assert_eq!(saved["boards"]["ABC"]["uart1_enabled"], false);
+    }
+
+    #[test]
+    fn existing_version_two_maps_default_second_chip_selects_on() {
+        let config: PinMapConfig = serde_json::from_str(
+            r#"{
+                "uart0_enabled": true, "uart0_tx": 0, "uart0_rx": 1,
+                "uart1_enabled": false, "uart1_tx": 8, "uart1_rx": 9,
+                "i2c0_enabled": true, "i2c0_sda": 4, "i2c0_scl": 5,
+                "i2c1_enabled": false, "i2c1_sda": 10, "i2c1_scl": 11,
+                "spi0_enabled": true,
+                "spi0_miso": 16, "spi0_sck": 18, "spi0_mosi": 19,
+                "spi0_cs0": 17, "spi0_cs1": 21,
+                "spi1_enabled": false,
+                "spi1_miso": 12, "spi1_sck": 14, "spi1_mosi": 15,
+                "spi1_cs0": 13, "spi1_cs1": 20
+            }"#,
+        )
+        .unwrap();
+        assert!(config.spi0_cs1_enabled);
+        assert!(config.spi1_cs1_enabled);
+        let map = PinMap::from(config);
+        assert_eq!(map.enabled, rp_extio_wire::DEFAULT_PIN_MAP.enabled);
     }
 }
