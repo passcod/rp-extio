@@ -471,8 +471,9 @@ impl<'d> Pico2Board<'d> {
         }
         for output in 0..rp_extio_wire::CLOCK_OUTPUT_COUNT {
             if map.clock_enabled & (1 << output) != 0 {
-                Self::configure_clock(output, map.clock_sources[output], map.clock_hz[output])
-                    .expect("clock configuration was validated");
+                self.pin_map.clock_hz[output] =
+                    Self::configure_clock(output, map.clock_sources[output], map.clock_hz[output])
+                        .expect("clock configuration was validated");
                 Self::set_function(map.clock_pins[output], 9);
                 pac::CLOCKS
                     .clk_gpout_ctrl(output)
@@ -576,13 +577,11 @@ impl Board for Pico2Board<'_> {
 
     fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError> {
         map.validate()?;
-        let mut map = map;
         for output in 0..rp_extio_wire::CLOCK_OUTPUT_COUNT {
             if map.clock_enabled & (1 << output) == 0 {
                 continue;
             }
-            let Some((_, _, effective)) =
-                Self::clock_divider(map.clock_sources[output], map.clock_hz[output])
+            let Some(_) = Self::clock_divider(map.clock_sources[output], map.clock_hz[output])
             else {
                 return Err(PinValidationError {
                     kind: PinValidationKind::InvalidRoute,
@@ -591,7 +590,6 @@ impl Board for Pico2Board<'_> {
                     pin: map.clock_pins[output],
                 });
             };
-            map.clock_hz[output] = effective;
         }
         self.apply_pin_map(map);
         self.generation = generation;
