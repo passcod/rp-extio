@@ -221,11 +221,18 @@ impl App {
             self.message_error = true;
             return;
         }
-        let Some(map) = self.edited else {
+        let Some(mut map) = self.edited else {
             self.message = "board is disconnected".into();
             self.message_error = true;
             return;
         };
+        let auto_enabled = !map.is_signal_enabled(signal);
+        if auto_enabled {
+            map.set_enabled(signal.peripheral(), true);
+            if let Some(bus) = cs1_bus(signal) {
+                map.set_spi_cs1_enabled(bus, true);
+            }
+        }
         let (candidate, moved_group) = match preferred_routed_map(map, signal, gpio, self.grouped) {
             Ok(candidate) => candidate,
             Err(RouteError::Incomplete(message)) => {
@@ -234,28 +241,50 @@ impl App {
                 return;
             }
             Err(RouteError::Invalid(error)) => {
-                self.message = format!(
-                    "grouped move rejected: {}",
-                    rp_extiod::control::format_validation(error)
-                );
+                self.message = if auto_enabled {
+                    format!(
+                        "cannot assign and enable {}: {}",
+                        enable_target(signal),
+                        rp_extiod::control::format_validation(error)
+                    )
+                } else {
+                    format!(
+                        "grouped move rejected: {}",
+                        rp_extiod::control::format_validation(error)
+                    )
+                };
                 self.message_error = true;
                 return;
             }
         };
+        if auto_enabled && let Err(error) = candidate.validate() {
+            self.message = format!(
+                "cannot assign and enable {}: {}",
+                enable_target(signal),
+                rp_extiod::control::format_validation(error)
+            );
+            self.message_error = true;
+            return;
+        }
         self.edited = Some(candidate);
         self.default_pending = false;
         if let Err(error) = candidate.validate() {
             self.message = rp_extiod::control::format_validation(error);
             self.message_error = true;
         } else {
-            self.message = if moved_group {
-                "draft route group updated; press a to apply"
+            self.message = if auto_enabled {
+                format!(
+                    "{} routed and enabled; press a to apply",
+                    enable_target(signal)
+                )
+            } else if moved_group {
+                "draft route group updated; press a to apply".into()
             } else if self.grouped && coupled_signal(signal) {
                 "group could not move together; selected route updated individually; press a to apply"
+                    .into()
             } else {
-                "draft route updated; press a to apply"
-            }
-            .into();
+                "draft route updated; press a to apply".into()
+            };
             self.message_error = false;
         }
     }
@@ -884,6 +913,13 @@ fn cs1_bus(signal: PinSignal) -> Option<usize> {
     }
 }
 
+fn enable_target(signal: PinSignal) -> &'static str {
+    cs1_bus(signal).map_or_else(
+        || peripheral_name(signal.peripheral()),
+        |_| display_signal(signal),
+    )
+}
+
 fn signal_toggle_enabled(map: PinMap, signal: PinSignal) -> bool {
     cs1_bus(signal).map_or_else(
         || map.is_enabled(signal.peripheral()),
@@ -1291,7 +1327,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_peripherals_release_gpio_and_can_be_rerouted_before_enabling() {
+    fn assigning_disabled_peripheral_auto_enables_or_rejects_atomically() {
         let mut app = app();
         app.signal = PinSignal::Uart0Tx as usize;
         app.toggle_selected_enabled();
@@ -1303,17 +1339,18 @@ mod tests {
         (app.cursor_row, app.cursor_side) = find_gpio(4).unwrap();
         app.assign_selected();
         let map = app.edited.unwrap();
-        assert_eq!((map.uart_tx[1], map.uart_rx[1]), (4, 5));
+        assert_eq!((map.uart_tx[1], map.uart_rx[1]), (8, 9));
         assert!(!map.is_enabled(Peripheral::Uart1));
+        assert!(app.message.contains("cannot assign and enable UART1"));
+        assert!(app.message_error);
 
-        app.toggle_selected_enabled();
-        assert!(!app.edited.unwrap().is_enabled(Peripheral::Uart1));
-        assert!(app.message.contains("cannot enable UART1"));
-
-        (app.cursor_row, app.cursor_side) = find_gpio(8).unwrap();
+        (app.cursor_row, app.cursor_side) = find_gpio(6).unwrap();
         app.assign_selected();
-        app.toggle_selected_enabled();
-        assert!(app.edited.unwrap().is_enabled(Peripheral::Uart1));
+        let map = app.edited.unwrap();
+        assert_eq!((map.uart_tx[1], map.uart_rx[1]), (6, 7));
+        assert!(map.is_enabled(Peripheral::Uart1));
+        assert!(app.message.contains("UART1 routed and enabled"));
+        assert!(!app.message_error);
     }
 
     #[test]
@@ -1333,8 +1370,10 @@ mod tests {
         );
         assert!(app.message.contains("SPI0 CS1 disabled"));
 
-        app.toggle_selected_enabled();
+        (app.cursor_row, app.cursor_side) = (row, side);
+        app.assign_selected();
         assert!(app.edited.unwrap().spi_cs1_enabled(0));
+        assert!(app.message.contains("SPI0 CS1 routed and enabled"));
     }
 
     #[test]

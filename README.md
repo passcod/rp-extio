@@ -310,6 +310,10 @@ temporarily invalid draft for manual correction. Valid routes are highlighted;
 conflicts, mismatched I2C pairs, changed pins, exported GPIO lines, power pins,
 grounds, and current Linux bus assignments remain visible on the board.
 
+Assigning a disabled peripheral with Enter or Space also enables it when the
+resulting map is valid. If enabling it would create a conflict, the TUI leaves
+the draft unchanged and reports the conflicting route.
+
 `e` toggles the selected signal's entire peripheral instance, except that a
 selected SPI CS1 toggles only that optional second chip select. Disabling an
 instance or CS1 immediately previews its pins as GPIO; enabling validates all
