@@ -1420,11 +1420,7 @@ fn selected_runtime_detail(app: &App) -> String {
         return format!("ADC{}: {} raw · {} mV", adc.channel, adc.raw, millivolts);
     }
     if let Some(pwm) = app.pwm {
-        let frequency = if pwm.period_ns == 0 {
-            0
-        } else {
-            1_000_000_000_u64 / pwm.period_ns
-        };
+        let frequency = 1_000_000_000_u64.checked_div(pwm.period_ns).unwrap_or(0);
         let duty = if pwm.period_ns == 0 {
             0.0
         } else {
