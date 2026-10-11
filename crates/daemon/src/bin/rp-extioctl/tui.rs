@@ -1360,8 +1360,12 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         error.clone()
     } else if let Some(error) = validation {
         rp_extiod::control::format_validation(error)
-    } else if app.dirty() {
+    } else if app.dirty() && app.mode == UiMode::Route {
         "draft is valid; press a to apply".into()
+    } else if app.dirty() {
+        "route draft pending; press v to return to route mode".into()
+    } else if app.mode == UiMode::Operate {
+        "live state refreshes while idle; mutations may request Polkit authorization".into()
     } else {
         "active map; move to a valid highlighted GPIO and press Enter to assign".into()
     };
@@ -2005,6 +2009,7 @@ mod tests {
         assert!(gpio.contains("OPERATE"));
         assert!(gpio.contains("GPIO I↑ H"));
         assert!(gpio.contains("button released (active low)"));
+        assert!(gpio.contains("live state refreshes while idle"));
 
         app.adc = Some(AdcReading {
             channel: 0,
