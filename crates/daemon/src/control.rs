@@ -1041,6 +1041,21 @@ mod tests {
             serde_json::from_slice::<ControlRequest>(&encoded).unwrap(),
             request
         );
+        let request = ControlRequest::PwmStartupSet {
+            serial: "ABC".into(),
+            pwm: PwmInfo {
+                channel: 6,
+                enabled: true,
+                inverted: false,
+                period_ns: 1_000_000,
+                duty_ns: 250_000,
+            },
+        };
+        let encoded = serde_json::to_vec(&request).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ControlRequest>(&encoded).unwrap(),
+            request
+        );
         let request = ControlRequest::GpioStartupSet {
             serial: "ABC".into(),
             startup: GpioStartup::Input {
@@ -1137,6 +1152,13 @@ mod tests {
             ControlRequest::GpioStartupClear {
                 serial: "ABC".into(),
                 pin: 22,
+            }
+            .requires_authorization()
+        );
+        assert!(
+            ControlRequest::PwmStartupClear {
+                serial: "ABC".into(),
+                channel: 6,
             }
             .requires_authorization()
         );
