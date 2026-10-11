@@ -263,6 +263,14 @@ pub enum ControlRequest {
         pin: u8,
         bias: GpioBias,
     },
+    GpioStartupSet {
+        serial: String,
+        startup: GpioStartup,
+    },
+    GpioStartupClear {
+        serial: String,
+        pin: u8,
+    },
 }
 
 impl ControlRequest {
@@ -284,6 +292,21 @@ pub enum GpioBias {
     None,
     PullUp,
     PullDown,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "direction", rename_all = "snake_case", deny_unknown_fields)]
+pub enum GpioStartup {
+    Input { pin: u8, bias: GpioBias },
+    Output { pin: u8, value: bool },
+}
+
+impl GpioStartup {
+    pub const fn pin(self) -> u8 {
+        match self {
+            Self::Input { pin, .. } | Self::Output { pin, .. } => pin,
+        }
+    }
 }
 
 impl GpioBias {
@@ -350,6 +373,7 @@ pub struct BoardInfo {
     pub gpio_instance: Option<u32>,
     pub iio_device: Option<i32>,
     pub pwm_chip: Option<i32>,
+    pub gpio_startup: Vec<GpioStartup>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -431,6 +455,22 @@ struct ConfigFile {
     boards: BTreeMap<String, PinMapConfig>,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFileV4 {
+    version: u32,
+    boards: BTreeMap<String, BoardConfigV4>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct BoardConfigV4 {
+    #[serde(flatten)]
+    pin_map: PinMapConfig,
+    #[serde(default)]
+    gpio_startup: Vec<GpioStartup>,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LegacyConfigFile {
@@ -470,11 +510,12 @@ impl From<LegacyPinMapConfig> for PinMap {
 pub struct ConfigStore {
     path: PathBuf,
     boards: BTreeMap<String, PinMap>,
+    gpio_startup: BTreeMap<String, Vec<GpioStartup>>,
 }
 
 impl ConfigStore {
     pub fn load(path: PathBuf) -> io::Result<Self> {
-        let boards = match fs::read(&path) {
+        let (boards, gpio_startup) = match fs::read(&path) {
             Ok(bytes) => {
                 let value: serde_json::Value =
                     serde_json::from_slice(&bytes).map_err(invalid_data)?;
@@ -487,26 +528,46 @@ impl ConfigStore {
                             "configuration version is missing or invalid",
                         )
                     })?;
-                let maps: BTreeMap<String, PinMap> = match version {
+                let (maps, startup): (BTreeMap<String, PinMap>, _) = match version {
                     1 => {
                         let config: LegacyConfigFile =
                             serde_json::from_value(value).map_err(invalid_data)?;
                         debug_assert_eq!(config.version, 1);
-                        config
-                            .boards
-                            .into_iter()
-                            .map(|(serial, map)| (serial, map.into()))
-                            .collect()
+                        (
+                            config
+                                .boards
+                                .into_iter()
+                                .map(|(serial, map)| (serial, map.into()))
+                                .collect(),
+                            BTreeMap::new(),
+                        )
                     }
                     2 | 3 => {
                         let config: ConfigFile =
                             serde_json::from_value(value).map_err(invalid_data)?;
                         debug_assert!(matches!(config.version, 2 | 3));
-                        config
-                            .boards
-                            .into_iter()
-                            .map(|(serial, map)| (serial, map.into()))
-                            .collect()
+                        (
+                            config
+                                .boards
+                                .into_iter()
+                                .map(|(serial, map)| (serial, map.into()))
+                                .collect(),
+                            BTreeMap::new(),
+                        )
+                    }
+                    4 => {
+                        let config: ConfigFileV4 =
+                            serde_json::from_value(value).map_err(invalid_data)?;
+                        debug_assert_eq!(config.version, 4);
+                        let mut maps = BTreeMap::new();
+                        let mut startup = BTreeMap::new();
+                        for (serial, board) in config.boards {
+                            maps.insert(serial.clone(), board.pin_map.into());
+                            if !board.gpio_startup.is_empty() {
+                                startup.insert(serial, board.gpio_startup);
+                            }
+                        }
+                        (maps, startup)
                     }
                     _ => {
                         return Err(io::Error::new(
@@ -515,7 +576,8 @@ impl ConfigStore {
                         ));
                     }
                 };
-                maps.into_iter()
+                let boards = maps
+                    .into_iter()
                     .map(|(serial, map)| {
                         map.validate().map_err(|error| {
                             io::Error::new(
@@ -528,12 +590,28 @@ impl ConfigStore {
                         })?;
                         Ok((serial, map))
                     })
-                    .collect::<io::Result<_>>()?
+                    .collect::<io::Result<BTreeMap<_, _>>>()?;
+                for (serial, entries) in &startup {
+                    let map = boards.get(serial).expect("version 4 board has a pin map");
+                    validate_gpio_startup(map, entries).map_err(|message| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid GPIO startup state for {serial}: {message}"),
+                        )
+                    })?;
+                }
+                (boards, startup)
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => BTreeMap::new(),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                (BTreeMap::new(), BTreeMap::new())
+            }
             Err(error) => return Err(error),
         };
-        Ok(Self { path, boards })
+        Ok(Self {
+            path,
+            boards,
+            gpio_startup,
+        })
     }
 
     pub fn boards(&self) -> &BTreeMap<String, PinMap> {
@@ -544,17 +622,29 @@ impl ConfigStore {
         self.boards.get(serial).copied()
     }
 
+    pub fn contains_board(&self, serial: &str) -> bool {
+        self.boards.contains_key(serial)
+    }
+
+    pub fn gpio_startup(&self, serial: &str) -> &[GpioStartup] {
+        self.gpio_startup.get(serial).map_or(&[], Vec::as_slice)
+    }
+
     pub fn replace(&mut self, boards: BTreeMap<String, PinMap>) {
         self.boards = boards;
+        self.gpio_startup.clear();
     }
 
     pub fn reload(&mut self) -> io::Result<()> {
         let replacement = Self::load(self.path.clone())?;
         self.boards = replacement.boards;
+        self.gpio_startup = replacement.gpio_startup;
         Ok(())
     }
 
     pub fn set(&mut self, serial: String, map: PinMap) -> io::Result<()> {
+        validate_gpio_startup(&map, self.gpio_startup(&serial))
+            .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
         let previous = self.boards.insert(serial.clone(), map);
         if let Err(error) = self.save() {
             match previous {
@@ -568,10 +658,50 @@ impl ConfigStore {
 
     pub fn remove(&mut self, serial: &str) -> io::Result<()> {
         let previous = self.boards.remove(serial);
+        let previous_startup = self.gpio_startup.remove(serial);
         if let Err(error) = self.save() {
             if let Some(previous) = previous {
                 self.boards.insert(serial.into(), previous);
             }
+            if let Some(previous) = previous_startup {
+                self.gpio_startup.insert(serial.into(), previous);
+            }
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn set_gpio_startup(&mut self, serial: String, startup: GpioStartup) -> io::Result<()> {
+        let map = self
+            .boards
+            .get(&serial)
+            .copied()
+            .unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
+        let previous_map = self.boards.insert(serial.clone(), map);
+        let previous = self.gpio_startup.get(&serial).cloned();
+        let entries = self.gpio_startup.entry(serial.clone()).or_default();
+        entries.retain(|entry| entry.pin() != startup.pin());
+        entries.push(startup);
+        entries.sort_by_key(|entry| entry.pin());
+        if let Err(error) = self.save() {
+            restore_entry(&mut self.boards, &serial, previous_map);
+            restore_entry(&mut self.gpio_startup, &serial, previous);
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn clear_gpio_startup(&mut self, serial: &str, pin: u8) -> io::Result<()> {
+        let previous = self.gpio_startup.get(serial).cloned();
+        let Some(entries) = self.gpio_startup.get_mut(serial) else {
+            return Ok(());
+        };
+        entries.retain(|entry| entry.pin() != pin);
+        if entries.is_empty() {
+            self.gpio_startup.remove(serial);
+        }
+        if let Err(error) = self.save() {
+            restore_entry(&mut self.gpio_startup, serial, previous);
             return Err(error);
         }
         Ok(())
@@ -591,12 +721,20 @@ impl ConfigStore {
                 .write(true)
                 .create_new(true)
                 .open(&temporary)?;
-            let config = ConfigFile {
-                version: 3,
+            let config = ConfigFileV4 {
+                version: 4,
                 boards: self
                     .boards
                     .iter()
-                    .map(|(serial, map)| (serial.clone(), (*map).into()))
+                    .map(|(serial, map)| {
+                        (
+                            serial.clone(),
+                            BoardConfigV4 {
+                                pin_map: (*map).into(),
+                                gpio_startup: self.gpio_startup(serial).to_vec(),
+                            },
+                        )
+                    })
                     .collect(),
             };
             serde_json::to_writer_pretty(&mut file, &config).map_err(io::Error::other)?;
@@ -610,6 +748,33 @@ impl ConfigStore {
         }
         result
     }
+}
+
+fn restore_entry<T>(map: &mut BTreeMap<String, T>, key: &str, value: Option<T>) {
+    match value {
+        Some(value) => {
+            map.insert(key.into(), value);
+        }
+        None => {
+            map.remove(key);
+        }
+    }
+}
+
+pub fn validate_gpio_startup(map: &PinMap, entries: &[GpioStartup]) -> Result<(), String> {
+    let pins = map.gpio_pins().map_err(|error| format_validation(error))?;
+    let mut seen = Vec::new();
+    for entry in entries {
+        let pin = entry.pin();
+        if !pins.as_slice().contains(&pin) {
+            return Err(format!("GP{pin} is not configured as GPIO"));
+        }
+        if seen.contains(&pin) {
+            return Err(format!("GP{pin} has more than one startup state"));
+        }
+        seen.push(pin);
+    }
+    Ok(())
 }
 
 pub fn signal_name(signal: PinSignal) -> &'static str {
@@ -745,6 +910,10 @@ mod tests {
                 gpio_instance: Some(99),
                 iio_device: Some(2),
                 pwm_chip: Some(1),
+                gpio_startup: vec![GpioStartup::Output {
+                    pin: 22,
+                    value: true,
+                }],
             },
         };
         let encoded = serde_json::to_vec(&response).unwrap();
@@ -839,7 +1008,7 @@ mod tests {
 
         store.set("ABC".into(), map).unwrap();
         let saved: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
-        assert_eq!(saved["version"], 3);
+        assert_eq!(saved["version"], 4);
         assert_eq!(saved["boards"]["ABC"]["uart1_enabled"], false);
         assert_eq!(
             saved["boards"]["ABC"]["adc_enabled"],
@@ -871,5 +1040,118 @@ mod tests {
         assert_eq!(map.adc_enabled, 0);
         assert_eq!(map.pwm_enabled, 0);
         assert_eq!(map.clock_enabled, 0);
+    }
+
+    #[test]
+    fn version_four_gpio_startup_round_trips() {
+        let directory = TemporaryDirectory::new("gpio-startup-roundtrip");
+        let path = directory.0.join("config.json");
+        let mut store = ConfigStore::load(path.clone()).unwrap();
+        store
+            .set_gpio_startup(
+                "ABC".into(),
+                GpioStartup::Output {
+                    pin: 22,
+                    value: true,
+                },
+            )
+            .unwrap();
+        store
+            .set_gpio_startup(
+                "ABC".into(),
+                GpioStartup::Input {
+                    pin: 28,
+                    bias: GpioBias::PullUp,
+                },
+            )
+            .unwrap();
+
+        let loaded = ConfigStore::load(path).unwrap();
+        assert_eq!(
+            loaded.gpio_startup("ABC"),
+            &[
+                GpioStartup::Output {
+                    pin: 22,
+                    value: true,
+                },
+                GpioStartup::Input {
+                    pin: 28,
+                    bias: GpioBias::PullUp,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn version_four_rejects_duplicate_and_peripheral_gpio_startup_pins() {
+        let directory = TemporaryDirectory::new("gpio-startup-validation");
+        let path = directory.0.join("config.json");
+        let board =
+            serde_json::to_value(PinMapConfig::from(rp_extio_wire::DEFAULT_PIN_MAP)).unwrap();
+        let mut board = board.as_object().unwrap().clone();
+        board.insert(
+            "gpio_startup".into(),
+            serde_json::json!([
+                {"direction":"output", "pin":22, "value":true},
+                {"direction":"input", "pin":22, "bias":"pull_up"}
+            ]),
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 4,
+                "boards": {"ABC": board}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ConfigStore::load(path.clone())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("more than one startup state")
+        );
+
+        board.insert(
+            "gpio_startup".into(),
+            serde_json::json!([{"direction":"output", "pin":0, "value":true}]),
+        );
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({
+                "version": 4,
+                "boards": {"ABC": board}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(
+            ConfigStore::load(path)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("GP0 is not configured as GPIO")
+        );
+    }
+
+    #[test]
+    fn pin_map_cannot_claim_a_persisted_gpio() {
+        let directory = TemporaryDirectory::new("gpio-startup-map-conflict");
+        let path = directory.0.join("config.json");
+        let mut store = ConfigStore::load(path).unwrap();
+        store
+            .set_gpio_startup(
+                "ABC".into(),
+                GpioStartup::Output {
+                    pin: 22,
+                    value: false,
+                },
+            )
+            .unwrap();
+        let mut map = rp_extio_wire::DEFAULT_PIN_MAP;
+        map.pwm_pins[6] = 22;
+        map.pwm_enabled |= 1 << 6;
+        assert!(store.set("ABC".into(), map).is_err());
     }
 }
