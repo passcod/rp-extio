@@ -48,6 +48,28 @@ const SPI0_CS1_DISABLE_MASK: u8 = 1 << 6;
 const SPI1_CS1_DISABLE_MASK: u8 = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ClockDivider {
+    pub integer: u16,
+    pub fraction: u16,
+    pub effective_hz: u32,
+}
+
+pub const fn clock_divider(source_hz: u32, target_hz: u32) -> Option<ClockDivider> {
+    if source_hz == 0 || target_hz == 0 || target_hz > source_hz {
+        return None;
+    }
+    let divisor = (source_hz as u64 * 65_536 + target_hz as u64 / 2) / target_hz as u64;
+    if divisor < 65_536 || divisor > u32::MAX as u64 {
+        return None;
+    }
+    Some(ClockDivider {
+        integer: (divisor >> 16) as u16,
+        fraction: divisor as u16,
+        effective_hz: ((source_hz as u64 * 65_536) / divisor) as u32,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u8)]
 pub enum Operation {
     Hello = 1,
@@ -1304,6 +1326,23 @@ mod tests {
         let mut invalid = state.encode(PWM_APPLY);
         invalid[12..20].copy_from_slice(&21_000_000_u64.to_le_bytes());
         assert_eq!(PwmState::decode(&invalid), Err(WireError::Invalid));
+    }
+
+    #[test]
+    fn clock_dividers_validate_and_report_quantized_frequency() {
+        assert_eq!(clock_divider(150_000_000, 0), None);
+        assert_eq!(clock_divider(48_000_000, 50_000_000), None);
+        assert_eq!(
+            clock_divider(150_000_000, 1_000_000),
+            Some(ClockDivider {
+                integer: 150,
+                fraction: 0,
+                effective_hz: 1_000_000,
+            })
+        );
+        let divided = clock_divider(12_000_000, 32_768).unwrap();
+        assert!(divided.effective_hz.abs_diff(32_768) <= 1);
+        assert_eq!(clock_divider(150_000_000, 1), None);
     }
 
     #[test]

@@ -11,7 +11,7 @@ use rp_extio_wire::{
     ClockSource, GPIO_BIAS_NONE, GPIO_BIAS_PULL_DOWN, GPIO_BIAS_PULL_UP, GPIO_DIRECTION_INPUT,
     GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET, GPIO_SET_BIAS, HEADER_PINS,
     I2C_READ, I2C_TEN_BIT, I2cRequest, Peripheral, PinMap, PinSignal, PinValidationError,
-    PinValidationKind, PwmState, SpiRequest, Status,
+    PinValidationKind, PwmState, SpiRequest, Status, clock_divider,
 };
 
 const TRANSACTION_DEADLINE_US: u64 = 5_000_000;
@@ -495,36 +495,25 @@ impl<'d> Pico2Board<'d> {
         }
     }
 
-    fn clock_divider(source: ClockSource, target_hz: u32) -> Option<(u16, u16, u32)> {
+    fn clock_divider(source: ClockSource, target_hz: u32) -> Option<rp_extio_wire::ClockDivider> {
         let (_, source_hz) = Self::clock_source(source);
-        if target_hz == 0 || target_hz > source_hz {
-            return None;
-        }
-        let divisor =
-            (u64::from(source_hz) * 65_536 + u64::from(target_hz) / 2) / u64::from(target_hz);
-        if !(65_536..=u64::from(u32::MAX)).contains(&divisor) {
-            return None;
-        }
-        let integer = (divisor >> 16) as u16;
-        let fraction = divisor as u16;
-        let effective = ((u64::from(source_hz) * 65_536) / divisor) as u32;
-        Some((integer, fraction, effective))
+        clock_divider(source_hz, target_hz)
     }
 
     fn configure_clock(output: usize, source: ClockSource, target_hz: u32) -> Option<u32> {
         let (source_select, _) = Self::clock_source(source);
-        let (integer, fraction, effective) = Self::clock_divider(source, target_hz)?;
+        let divider = Self::clock_divider(source, target_hz)?;
         pac::CLOCKS
             .clk_gpout_ctrl(output)
             .modify(|register| register.set_enable(false));
         pac::CLOCKS.clk_gpout_div(output).write(|register| {
-            register.set_int(integer);
-            register.set_frac(fraction);
+            register.set_int(divider.integer);
+            register.set_frac(divider.fraction);
         });
         pac::CLOCKS
             .clk_gpout_ctrl(output)
             .modify(|register| register.set_auxsrc(source_select.into()));
-        Some(effective)
+        Some(divider.effective_hz)
     }
 
     fn spi_transfer(bus: usize, byte: u8) -> u8 {
