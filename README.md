@@ -112,6 +112,22 @@ change after a daemon or board reconnect.
 
 ## Install the Linux module
 
+With DKMS and the running kernel's headers installed, build and install the
+module, release binaries, and systemd unit with:
+
+```sh
+just install
+just enable
+```
+
+`just install` does not enable or start the service. `just enable` performs the
+same installation and then enables and starts it. To replace an already loaded
+development module after rebuilding, use `just restart`; it stops the daemon,
+unloads the module without force, and starts the service again.
+
+The recipe refreshes this version's DKMS build for the running kernel. The
+module's DKMS configuration enables automatic rebuilds after kernel upgrades.
+
 Install the compiler, make, DKMS, and headers for the running kernel. To stage
 version 0.1.0 for DKMS:
 

@@ -15,7 +15,7 @@ PrivateTmp=yes
 ProtectHome=yes
 ProtectSystem=strict
 ConfigurationDirectory=rp-extio
-ReadWritePaths=/etc/rp-extio
+ReadWritePaths=/etc/rp-extio /run
 
 [Install]
 WantedBy=multi-user.target
