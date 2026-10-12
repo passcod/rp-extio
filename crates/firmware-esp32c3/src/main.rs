@@ -61,6 +61,7 @@ fn main() -> ! {
 		],
 		peripherals.I2C0,
 		peripherals.SPI2,
+		peripherals.UART1,
 		peripherals.ADC1,
 		(adc0, adc1, adc2, adc3, adc4),
 		peripherals.LEDC,

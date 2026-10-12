@@ -1641,13 +1641,14 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 				format!("  LED #{:02x}{:02x}{:02x}", led.red, led.green, led.blue)
 			});
 			format!(
-				"{} {} · {}  gen {}  I²C {}  SPI {}{}",
+				"{} {} · {}  gen {}  I²C {}  SPI {}  UART {}{}",
 				if board.connected { "●" } else { "○" },
 				board.serial,
 				board.board_name,
 				option(board.generation),
 				bus_numbers(board.i2c_buses),
 				bus_numbers(board.spi_buses),
+				tty_numbers(board.uart_ttys),
 				led,
 			)
 		},
@@ -2592,6 +2593,19 @@ fn bus_numbers(buses: [Option<i32>; 2]) -> String {
 		.join(",")
 }
 
+fn tty_numbers(ttys: [Option<i32>; 2]) -> String {
+	ttys.into_iter()
+		.enumerate()
+		.map(|(instance, tty)| {
+			format!(
+				"{instance}:{}",
+				tty.map_or_else(|| "-".into(), |index| format!("ttyRPE{index}"))
+			)
+		})
+		.collect::<Vec<_>>()
+		.join(",")
+}
+
 fn option(value: Option<impl ToString>) -> String {
 	value.map_or_else(|| "-".into(), |value| value.to_string())
 }
@@ -2619,6 +2633,7 @@ mod tests {
 				generation: Some(4),
 				i2c_buses: [Some(27), None],
 				spi_buses: [Some(0), None],
+				uart_ttys: [None; 2],
 				gpio_instance: Some(3),
 				iio_device: Some(0),
 				pwm_chip: Some(0),

@@ -923,7 +923,7 @@ fn adc_millivolts(raw: u16, reference_mv: u16, resolution_bits: u8) -> u32 {
 
 fn board_summary(board: &BoardInfo) -> String {
 	format!(
-		"{}  {:12}  generation={}  enabled={} i2c={} spi={} iio={} pwm={}",
+		"{}  {:12}  generation={}  enabled={} i2c={} spi={} uart={} iio={} pwm={}",
 		board.serial,
 		if board.connected {
 			"connected"
@@ -954,6 +954,7 @@ fn board_summary(board: &BoardInfo) -> String {
 		),
 		bus_numbers(board.i2c_buses),
 		bus_numbers(board.spi_buses),
+		tty_numbers(board.uart_ttys),
 		board
 			.iio_device
 			.map_or_else(|| "-".into(), |number| format!("iio:device{number}")),
@@ -1099,6 +1100,19 @@ fn bus_numbers(buses: [Option<i32>; 2]) -> String {
 		.map(|(instance, bus)| match bus {
 			Some(bus) => format!("{instance}:{bus}"),
 			None => format!("{instance}:-"),
+		})
+		.collect::<Vec<_>>()
+		.join(",")
+}
+
+fn tty_numbers(ttys: [Option<i32>; 2]) -> String {
+	ttys.into_iter()
+		.enumerate()
+		.map(|(instance, tty)| {
+			format!(
+				"{instance}:{}",
+				tty.map_or_else(|| "-".into(), |index| format!("ttyRPE{index}"))
+			)
 		})
 		.collect::<Vec<_>>()
 		.join(",")
@@ -1407,6 +1421,7 @@ mod tests {
 			generation: Some(3),
 			i2c_buses: [Some(7), None],
 			spi_buses: [Some(2), None],
+			uart_ttys: [None, Some(1)],
 			gpio_instance: Some(9),
 			iio_device: Some(4),
 			pwm_chip: Some(5),
@@ -1418,6 +1433,7 @@ mod tests {
 		assert!(summary.contains("enabled=uart0,i2c0,spi0"));
 		assert!(summary.contains("i2c=0:7,1:-"));
 		assert!(summary.contains("spi=0:2,1:-"));
+		assert!(summary.contains("uart=0:-,1:ttyRPE1"));
 		assert!(summary.contains("iio=iio:device4"));
 		assert!(summary.contains("pwm=pwmchip5"));
 	}

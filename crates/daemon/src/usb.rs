@@ -5,7 +5,10 @@ use crate::{
 		GpioStartup, LedInfo, PwmInfo, validate_buttons_for, validate_gpio_startup_for,
 		validate_pwm_startup_for,
 	},
-	kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
+	kernel::{
+		DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration,
+		UartRegistration,
+	},
 	serial::SerialBackend,
 };
 use async_trait::async_trait;
@@ -585,6 +588,7 @@ fn board_info(
 		generation: Some(device.config.generation),
 		i2c_buses: device.registration.buses.i2c,
 		spi_buses: device.registration.buses.spi,
+		uart_ttys: device.registration.buses.uart,
 		gpio_instance: Some(device.registration.gpio_instance_id()),
 		iio_device: device.registration.iio_device,
 		pwm_chip: device.registration.pwm_chip,
@@ -630,6 +634,7 @@ fn disconnected_info(
 		generation: None,
 		i2c_buses: [None; 2],
 		spi_buses: [None; 2],
+		uart_ttys: [None; 2],
 		gpio_instance: None,
 		iio_device: None,
 		pwm_chip: None,
@@ -2086,6 +2091,29 @@ pub(crate) fn encode_transaction(transaction: &Transaction) -> io::Result<(Opera
 			}
 			Ok((Operation::SpiMessage, payload))
 		}
+		Transaction::Uart {
+			bus_id,
+			baud,
+			data_bits,
+			stop_bits,
+			parity,
+			rx_len,
+			tx,
+		} => {
+			let tx_len: u16 = tx
+				.len()
+				.try_into()
+				.map_err(|_| invalid("UART write is too large"))?;
+			payload.extend_from_slice(&[*bus_id, *data_bits, *stop_bits, *parity]);
+			payload.extend_from_slice(&baud.to_le_bytes());
+			payload.extend_from_slice(&rx_len.to_le_bytes());
+			payload.extend_from_slice(&tx_len.to_le_bytes());
+			payload.extend_from_slice(tx);
+			if payload.len() > MAX_PAYLOAD {
+				return Err(invalid("UART transaction is too large"));
+			}
+			Ok((Operation::UartTransfer, payload))
+		}
 		Transaction::Gpio {
 			command,
 			line,
@@ -2168,6 +2196,25 @@ pub(crate) fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Re
 				completed,
 				data: reply.payload[metadata_len..].to_vec(),
 				effective_speeds,
+			})
+		}
+		Transaction::Uart { rx_len, tx, .. } => {
+			if reply.payload.len() < rp_extio_wire::UART_REPLY_HEADER_LEN {
+				return Err(invalid("UART reply is missing counts"));
+			}
+			let written = u16::from_le_bytes(reply.payload[..2].try_into().unwrap());
+			let read = u16::from_le_bytes(reply.payload[2..4].try_into().unwrap());
+			if written as usize > tx.len()
+				|| read > *rx_len
+				|| reply.payload.len() != rp_extio_wire::UART_REPLY_HEADER_LEN + read as usize
+			{
+				return Err(invalid("invalid successful UART reply"));
+			}
+			Ok(BackendReply {
+				status: Status::Ok as i32,
+				completed: written.into(),
+				data: reply.payload[rp_extio_wire::UART_REPLY_HEADER_LEN..].to_vec(),
+				effective_speeds: Vec::new(),
 			})
 		}
 		Transaction::Gpio { command, .. } => {
@@ -2254,7 +2301,7 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 	let mut board = None;
 	let mut i2c: [Option<(u32, u16, [u8; 2])>; 2] = [None; 2];
 	let mut spi: [Option<(u32, u32, u32, u16, Vec<u8>)>; 2] = [None, None];
-	let mut uart: [Option<[u8; 2]>; 2] = [None; 2];
+	let mut uart: [Option<([u8; 2], u8, u32, u32)>; 2] = [None; 2];
 	let mut pin_map = None;
 	let mut gpio_pins: Option<Vec<u8>> = None;
 	let mut adc = None;
@@ -2356,15 +2403,27 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 			}
 			CAP_UART => {
 				let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
+				let flags = value.get(3).copied().unwrap_or(u8::MAX);
+				let default_baud = value
+					.get(4..8)
+					.map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+					.unwrap_or(0);
+				let max_baud = value
+					.get(8..12)
+					.map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+					.unwrap_or(0);
 				if value.len() != 12
 					|| bus >= uart.len()
 					|| uart[bus].is_some()
-					|| value[3] != 0
-					|| value[8..12] != [0; 4]
+					|| flags & !rp_extio_wire::UART_CAP_DAEMON_BACKED != 0
+					|| default_baud == 0
+					|| (flags & rp_extio_wire::UART_CAP_DAEMON_BACKED != 0
+						&& max_baud < default_baud)
+					|| (flags == 0 && max_baud != 0)
 				{
 					return Err(invalid("invalid UART capability"));
 				}
-				uart[bus] = Some([value[1], value[2]]);
+				uart[bus] = Some(([value[1], value[2]], flags, default_baud, max_baud));
 			}
 			CAP_PIN_CONFIG => {
 				if pin_map.is_some() {
@@ -2482,7 +2541,8 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 					expected.push(pin_map.spi_chip_selects[bus][1]);
 				}
 				*count != u16::from(pin_map.spi_chip_select_count(bus)) || *pins != expected
-			}) || uart[bus].is_some_and(|pins| pins != [pin_map.uart_tx[bus], pin_map.uart_rx[bus]])
+			}) || uart[bus]
+			.is_some_and(|(pins, _, _, _)| pins != [pin_map.uart_tx[bus], pin_map.uart_rx[bus]])
 		{
 			return Err(invalid("capability pins do not match pin configuration"));
 		}
@@ -2538,6 +2598,16 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 						}
 					},
 				)
+			}),
+			uart: uart.map(|capability| {
+				capability.and_then(|(_, flags, default_baud, max_baud)| {
+					(flags & rp_extio_wire::UART_CAP_DAEMON_BACKED != 0).then_some(
+						UartRegistration {
+							default_baud,
+							max_baud,
+						},
+					)
+				})
 			}),
 			gpio_lines: gpio_pins.len() as u16,
 			gpio_pins: gpio_array,

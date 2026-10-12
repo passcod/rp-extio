@@ -9,13 +9,14 @@ use esp_hal::{
 		channel::{self, ChannelIFace},
 		timer::{self, TimerIFace},
 	},
-	peripherals::{ADC1, GPIO0, GPIO1, GPIO2, GPIO3, GPIO4, I2C0, LEDC, RMT, SPI2},
+	peripherals::{ADC1, GPIO0, GPIO1, GPIO2, GPIO3, GPIO4, I2C0, LEDC, RMT, SPI2, UART1},
 	rmt::{Channel, PulseCode, Rmt, Tx, TxChannelConfig, TxChannelCreator},
 	spi::{
 		BitOrder, Mode,
 		master::{Config as SpiConfig, Spi},
 	},
 	time::Rate,
+	uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
 use rp_extio_firmware::{
 	Board, BusFailure, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ,
@@ -25,7 +26,8 @@ use rp_extio_wire::{
 	BoardKind, DeviceIdentity, ESP32_C3_GPIO_PINS, GPIO_BIAS_NONE, GPIO_BIAS_PULL_DOWN,
 	GPIO_BIAS_PULL_UP, GPIO_DIRECTION_INPUT, GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION,
 	GPIO_SET, GPIO_SET_BIAS, I2C_READ, I2C_TEN_BIT, I2cRequest, LedState, PinMap,
-	PinValidationError, PwmState, SPI_CS_CHANGE, SpiRequest, Status,
+	PinValidationError, PwmState, SPI_CS_CHANGE, SpiRequest, Status, UART_PARITY_EVEN,
+	UART_PARITY_NONE, UART_PARITY_ODD,
 };
 
 pub struct Esp32C3Board<'d> {
@@ -33,6 +35,7 @@ pub struct Esp32C3Board<'d> {
 	route_pins: [AnyPin<'d>; ESP32_C3_GPIO_PINS.len()],
 	i2c: Option<I2c<'d, esp_hal::Blocking>>,
 	spi: Option<Spi<'d, esp_hal::Blocking>>,
+	uart: Option<Uart<'d, esp_hal::Blocking>>,
 	adc: Adc<'d, ADC1<'d>, esp_hal::Blocking>,
 	adc0: AdcPin<GPIO0<'d>, ADC1<'d>>,
 	adc1: AdcPin<GPIO1<'d>, ADC1<'d>>,
@@ -56,6 +59,7 @@ impl<'d> Esp32C3Board<'d> {
 		route_pins: [AnyPin<'d>; ESP32_C3_GPIO_PINS.len()],
 		i2c: I2C0<'d>,
 		spi: SPI2<'d>,
+		uart: UART1<'d>,
 		adc: ADC1<'d>,
 		adc_pins: (GPIO0<'d>, GPIO1<'d>, GPIO2<'d>, GPIO3<'d>, GPIO4<'d>),
 		ledc: LEDC<'d>,
@@ -101,6 +105,7 @@ impl<'d> Esp32C3Board<'d> {
 			spi: Some(
 				Spi::new(spi, SpiConfig::default().with_frequency(Rate::from_khz(50))).unwrap(),
 			),
+			uart: Some(Uart::new(uart, UartConfig::default()).unwrap()),
 			adc: Adc::new(adc, adc_config),
 			adc0,
 			adc1,
@@ -165,6 +170,15 @@ impl<'d> Esp32C3Board<'d> {
 				pin.set_high();
 				pin.set_output_enable(true);
 			}
+		}
+		if self.pin_map.is_enabled(rp_extio_wire::Peripheral::Uart1) {
+			let uart = self
+				.uart
+				.take()
+				.unwrap()
+				.with_tx(self.route_flex(self.pin_map.uart_tx[1]))
+				.with_rx(self.route_flex(self.pin_map.uart_rx[1]));
+			self.uart = Some(uart);
 		}
 	}
 
@@ -268,6 +282,70 @@ impl Board for Esp32C3Board<'_> {
 
 	fn pwm_clock_hz(&self) -> u32 {
 		80_000_000
+	}
+
+	fn uart_daemon_backed(&self, bus: u8) -> bool {
+		bus == 1
+	}
+
+	fn uart_max_baud(&self, bus: u8) -> u32 {
+		if bus == 1 { 5_000_000 } else { 0 }
+	}
+
+	fn uart_transfer(
+		&mut self,
+		bus: u8,
+		baud: u32,
+		data_bits: u8,
+		stop_bits: u8,
+		parity: u8,
+		tx: &[u8],
+		rx: &mut [u8],
+	) -> Result<(usize, usize), BusFailure> {
+		if bus != 1 {
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		}
+		let data_bits = match data_bits {
+			5 => DataBits::_5,
+			6 => DataBits::_6,
+			7 => DataBits::_7,
+			8 => DataBits::_8,
+			_ => return Err(BusFailure::new(Status::BadFrame, 0)),
+		};
+		let stop_bits = match stop_bits {
+			1 => StopBits::_1,
+			2 => StopBits::_2,
+			_ => return Err(BusFailure::new(Status::BadFrame, 0)),
+		};
+		let parity = match parity {
+			UART_PARITY_NONE => Parity::None,
+			UART_PARITY_EVEN => Parity::Even,
+			UART_PARITY_ODD => Parity::Odd,
+			_ => return Err(BusFailure::new(Status::BadFrame, 0)),
+		};
+		let uart = self.uart.as_mut().unwrap();
+		uart.apply_config(
+			&UartConfig::default()
+				.with_baudrate(baud)
+				.with_data_bits(data_bits)
+				.with_stop_bits(stop_bits)
+				.with_parity(parity),
+		)
+		.map_err(|_| BusFailure::new(Status::Unsupported, 0))?;
+		let mut written = 0;
+		while written < tx.len() {
+			let count = uart
+				.write(&tx[written..])
+				.map_err(|_| BusFailure::new(Status::IoError, written as u32))?;
+			if count == 0 {
+				break;
+			}
+			written += count;
+		}
+		let read = uart
+			.read_buffered(rx)
+			.map_err(|_| BusFailure::new(Status::IoError, written as u32))?;
+		Ok((written, read))
 	}
 
 	fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError> {
@@ -377,51 +455,55 @@ impl Board for Esp32C3Board<'_> {
 			self.pin_mut(cs_pin)
 				.set_level(if cs_high { Level::High } else { Level::Low });
 		}
-		let mut outcome = SpiOutcome::new();
-		let mut offset = 0;
-		let delay = Delay::new();
-		for (index, segment) in request.segments().enumerate() {
-			let segment = segment.map_err(|_| BusFailure::new(Status::BadFrame, offset as u32))?;
-			if !(SPI_MIN_SPEED_HZ..=SPI_MAX_SPEED_HZ).contains(&segment.speed_hz) {
-				return Err(BusFailure::new(Status::Unsupported, offset as u32));
-			}
-			let config = SpiConfig::default()
-				.with_frequency(Rate::from_hz(segment.speed_hz))
-				.with_mode(mode)
-				.with_read_bit_order(order)
-				.with_write_bit_order(order);
-			let spi = self.spi.as_mut().unwrap();
-			spi.apply_config(&config)
-				.map_err(|_| BusFailure::new(Status::Unsupported, offset as u32))?;
-			let end = offset + segment.len as usize;
-			receive[offset..end].copy_from_slice(segment.tx);
-			if segment.word_delay_ns == 0 {
-				spi.transfer(&mut receive[offset..end])
-					.map_err(|_| BusFailure::new(Status::IoError, offset as u32))?;
-			} else {
-				for byte in &mut receive[offset..end] {
-					spi.transfer(core::slice::from_mut(byte))
+		let result = (|| {
+			let mut outcome = SpiOutcome::new();
+			let mut offset = 0;
+			let delay = Delay::new();
+			for (index, segment) in request.segments().enumerate() {
+				let segment =
+					segment.map_err(|_| BusFailure::new(Status::BadFrame, offset as u32))?;
+				if !(SPI_MIN_SPEED_HZ..=SPI_MAX_SPEED_HZ).contains(&segment.speed_hz) {
+					return Err(BusFailure::new(Status::Unsupported, offset as u32));
+				}
+				let config = SpiConfig::default()
+					.with_frequency(Rate::from_hz(segment.speed_hz))
+					.with_mode(mode)
+					.with_read_bit_order(order)
+					.with_write_bit_order(order);
+				let spi = self.spi.as_mut().unwrap();
+				spi.apply_config(&config)
+					.map_err(|_| BusFailure::new(Status::Unsupported, offset as u32))?;
+				let end = offset + segment.len as usize;
+				receive[offset..end].copy_from_slice(segment.tx);
+				if segment.word_delay_ns == 0 {
+					spi.transfer(&mut receive[offset..end])
 						.map_err(|_| BusFailure::new(Status::IoError, offset as u32))?;
-					delay.delay_nanos(segment.word_delay_ns);
+				} else {
+					for byte in &mut receive[offset..end] {
+						spi.transfer(core::slice::from_mut(byte))
+							.map_err(|_| BusFailure::new(Status::IoError, offset as u32))?;
+						delay.delay_nanos(segment.word_delay_ns);
+					}
+				}
+				offset = end;
+				outcome.completed_bytes = offset as u32;
+				outcome.effective_speeds[index] = segment.speed_hz;
+				delay.delay_nanos(segment.delay_ns);
+				if let Some(cs_pin) = cs_pin.filter(|_| segment.flags & SPI_CS_CHANGE != 0) {
+					self.pin_mut(cs_pin)
+						.set_level(if cs_high { Level::Low } else { Level::High });
+					delay.delay_nanos(segment.cs_change_delay_ns);
+					self.pin_mut(cs_pin)
+						.set_level(if cs_high { Level::High } else { Level::Low });
 				}
 			}
-			offset = end;
-			outcome.completed_bytes = offset as u32;
-			outcome.effective_speeds[index] = segment.speed_hz;
-			delay.delay_nanos(segment.delay_ns);
-			if let Some(cs_pin) = cs_pin.filter(|_| segment.flags & SPI_CS_CHANGE != 0) {
-				self.pin_mut(cs_pin)
-					.set_level(if cs_high { Level::Low } else { Level::High });
-				delay.delay_nanos(segment.cs_change_delay_ns);
-				self.pin_mut(cs_pin)
-					.set_level(if cs_high { Level::High } else { Level::Low });
-			}
-		}
+			Ok(outcome)
+		})();
 		if let Some(cs_pin) = cs_pin {
 			self.pin_mut(cs_pin)
 				.set_level(if cs_high { Level::Low } else { Level::High });
 		}
-		Ok(outcome)
+		result
 	}
 
 	fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {

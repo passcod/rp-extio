@@ -9,6 +9,7 @@
 #include <linux/iio/iio.h>
 #include <linux/idr.h>
 #include <linux/jiffies.h>
+#include <linux/kfifo.h>
 #include <linux/kmod.h>
 #include <linux/list.h>
 #include <linux/miscdevice.h>
@@ -22,6 +23,10 @@
 #include <linux/slab.h>
 #include <linux/spi/spi.h>
 #include <linux/string.h>
+#include <linux/tty.h>
+#include <linux/tty_driver.h>
+#include <linux/tty_flip.h>
+#include <linux/tty_port.h>
 #include <linux/uaccess.h>
 #include <linux/unaligned.h>
 #include <linux/version.h>
@@ -38,6 +43,7 @@
 #define RPE_OP_GPIO_EVENT 5
 #define RPE_OP_ADC 6
 #define RPE_OP_PWM 7
+#define RPE_OP_UART 9
 
 #define RPE_GPIO_GET 1
 #define RPE_GPIO_SET 2
@@ -56,6 +62,16 @@
 #define RPE_PWM_ENABLED BIT(0)
 #define RPE_PWM_INVERTED BIT(1)
 #define RPE_PWM_STATE_SIZE 20
+
+#define RPE_UART_REQUEST_HEADER_SIZE 12
+#define RPE_UART_REPLY_HEADER_SIZE 4
+#define RPE_UART_TX_FIFO_SIZE 4096
+#define RPE_UART_BATCH_SIZE 512
+#define RPE_UART_POLL_DELAY msecs_to_jiffies(10)
+#define RPE_MAX_TTYS 256
+#define RPE_UART_PARITY_NONE 0
+#define RPE_UART_PARITY_EVEN 1
+#define RPE_UART_PARITY_ODD 2
 
 #define RPE_STATUS_OK 0
 #define RPE_STATUS_NACK 1
@@ -81,6 +97,7 @@ enum rpe_instance_type {
 	RPE_INSTANCE_GPIO,
 	RPE_INSTANCE_ADC,
 	RPE_INSTANCE_PWM,
+	RPE_INSTANCE_UART,
 };
 
 struct rpe_session;
@@ -125,6 +142,21 @@ struct rpe_instance {
 			u32 clock_hz;
 			bool registering;
 		} pwm;
+		struct {
+			struct tty_port port;
+			struct delayed_work work;
+			DECLARE_KFIFO_PTR(tx_fifo, u8);
+			spinlock_t tx_lock;
+			spinlock_t config_lock;
+			u32 baud;
+			u32 max_baud;
+			u8 data_bits;
+			u8 stop_bits;
+			u8 parity;
+			u8 bus_id;
+			int index;
+			bool disconnected;
+		} uart;
 	};
 };
 
@@ -156,6 +188,8 @@ struct rpe_session {
 static DEFINE_MUTEX(rpe_open_lock);
 static bool rpe_opened;
 static struct miscdevice rpe_misc;
+static struct tty_driver *rpe_tty_driver;
+static DEFINE_IDA(rpe_tty_ids);
 
 static_assert(sizeof(struct rpe_ioc_version) == 16);
 static_assert(sizeof(struct rpe_ioc_create_i2c) == 20);
@@ -164,6 +198,7 @@ static_assert(sizeof(struct rpe_ioc_destroy) == 8);
 static_assert(sizeof(struct rpe_ioc_create_gpio) == 48);
 static_assert(sizeof(struct rpe_ioc_create_adc) == 16);
 static_assert(sizeof(struct rpe_ioc_create_pwm) == 16);
+static_assert(sizeof(struct rpe_ioc_create_uart) == 20);
 
 static void rpe_put16(u8 *p, u16 value)
 {
@@ -755,6 +790,250 @@ static const struct pwm_ops rpe_pwm_ops = {
 	.get_state = rpe_pwm_get_state,
 };
 
+static void rpe_uart_work(struct work_struct *work)
+{
+	struct rpe_instance *instance = container_of(to_delayed_work(work),
+						      struct rpe_instance, uart.work);
+	struct rpe_request *request;
+	unsigned long flags;
+	u8 tx[RPE_UART_BATCH_SIZE];
+	u32 baud;
+	u16 tx_len, written, read_len;
+	u8 data_bits, stop_bits, parity;
+	bool active, pending;
+	int ret;
+
+	if (READ_ONCE(instance->uart.disconnected))
+		return;
+	spin_lock_irqsave(&instance->uart.tx_lock, flags);
+	tx_len = kfifo_out_peek(&instance->uart.tx_fifo, tx, sizeof(tx));
+	spin_unlock_irqrestore(&instance->uart.tx_lock, flags);
+	active = tty_port_active(&instance->uart.port);
+	if (!active && !tx_len)
+		return;
+	request = kzalloc(sizeof(*request), GFP_KERNEL);
+	if (!request)
+		goto retry;
+	INIT_LIST_HEAD(&request->node);
+	spin_lock_irqsave(&instance->uart.config_lock, flags);
+	baud = instance->uart.baud;
+	data_bits = instance->uart.data_bits;
+	stop_bits = instance->uart.stop_bits;
+	parity = instance->uart.parity;
+	spin_unlock_irqrestore(&instance->uart.config_lock, flags);
+	request->request[RPE_HEADER_SIZE] = instance->uart.bus_id;
+	request->request[RPE_HEADER_SIZE + 1] = data_bits;
+	request->request[RPE_HEADER_SIZE + 2] = stop_bits;
+	request->request[RPE_HEADER_SIZE + 3] = parity;
+	rpe_put32(request->request + RPE_HEADER_SIZE + 4, baud);
+	rpe_put16(request->request + RPE_HEADER_SIZE + 8,
+		  active ? RPE_UART_BATCH_SIZE : 0);
+	rpe_put16(request->request + RPE_HEADER_SIZE + 10, tx_len);
+	memcpy(request->request + RPE_HEADER_SIZE + RPE_UART_REQUEST_HEADER_SIZE,
+	       tx, tx_len);
+	request->instance = instance;
+	mutex_lock(&instance->transaction_lock);
+	rpe_make_header(request, RPE_OP_UART,
+			RPE_UART_REQUEST_HEADER_SIZE + tx_len);
+	ret = rpe_submit(instance, request);
+	if (!ret) {
+		if (request->reply_len < RPE_UART_REPLY_HEADER_SIZE) {
+			ret = -EPROTO;
+		} else {
+			written = rpe_get16(request->reply);
+			read_len = rpe_get16(request->reply + 2);
+			if (written > tx_len || read_len > RPE_UART_BATCH_SIZE ||
+			    request->reply_len != RPE_UART_REPLY_HEADER_SIZE + read_len) {
+				ret = -EPROTO;
+			} else {
+				spin_lock_irqsave(&instance->uart.tx_lock, flags);
+				kfifo_skip_count(&instance->uart.tx_fifo, written);
+				pending = !kfifo_is_empty(&instance->uart.tx_fifo);
+				spin_unlock_irqrestore(&instance->uart.tx_lock, flags);
+				if (read_len) {
+					tty_insert_flip_string(&instance->uart.port,
+						request->reply + RPE_UART_REPLY_HEADER_SIZE,
+						read_len);
+					tty_flip_buffer_push(&instance->uart.port);
+				}
+				if (written)
+					tty_port_tty_wakeup(&instance->uart.port);
+				mutex_unlock(&instance->transaction_lock);
+				kfree(request);
+				if (!READ_ONCE(instance->uart.disconnected) &&
+				    (pending || tty_port_active(&instance->uart.port)))
+					schedule_delayed_work(&instance->uart.work,
+						pending ? 0 : RPE_UART_POLL_DELAY);
+				return;
+			}
+		}
+	}
+	mutex_unlock(&instance->transaction_lock);
+	kfree(request);
+retry:
+	if (!READ_ONCE(instance->uart.disconnected) &&
+	    (tty_port_active(&instance->uart.port) || tx_len))
+		schedule_delayed_work(&instance->uart.work, RPE_UART_POLL_DELAY);
+}
+
+static int rpe_uart_activate(struct tty_port *port, struct tty_struct *tty)
+{
+	struct rpe_instance *instance = container_of(port, struct rpe_instance, uart.port);
+
+	schedule_delayed_work(&instance->uart.work, 0);
+	return 0;
+}
+
+static void rpe_uart_shutdown(struct tty_port *port)
+{
+	struct rpe_instance *instance = container_of(port, struct rpe_instance, uart.port);
+
+	cancel_delayed_work_sync(&instance->uart.work);
+}
+
+static bool rpe_uart_carrier_raised(struct tty_port *port)
+{
+	return true;
+}
+
+static const struct tty_port_operations rpe_uart_port_ops = {
+	.carrier_raised = rpe_uart_carrier_raised,
+	.activate = rpe_uart_activate,
+	.shutdown = rpe_uart_shutdown,
+};
+
+static int rpe_tty_install(struct tty_driver *driver, struct tty_struct *tty)
+{
+	struct tty_port *port = driver->ports[tty->index];
+	struct rpe_instance *instance;
+	int ret;
+
+	if (!port)
+		return -ENODEV;
+	instance = container_of(port, struct rpe_instance, uart.port);
+	ret = tty_port_install(port, driver, tty);
+	if (ret)
+		return ret;
+	tty->driver_data = instance;
+	tty_termios_encode_baud_rate(&tty->termios, instance->uart.baud,
+				     instance->uart.baud);
+	return 0;
+}
+
+static int rpe_tty_open(struct tty_struct *tty, struct file *file)
+{
+	struct rpe_instance *instance = tty->driver_data;
+
+	if (!instance || READ_ONCE(instance->uart.disconnected))
+		return -ENODEV;
+	return tty_port_open(&instance->uart.port, tty, file);
+}
+
+static void rpe_tty_close(struct tty_struct *tty, struct file *file)
+{
+	struct rpe_instance *instance = tty->driver_data;
+
+	if (instance)
+		tty_port_close(&instance->uart.port, tty, file);
+}
+
+static ssize_t rpe_tty_write(struct tty_struct *tty, const u8 *buf, size_t count)
+{
+	struct rpe_instance *instance = tty->driver_data;
+	unsigned long flags;
+	unsigned int written;
+
+	if (!instance || READ_ONCE(instance->uart.disconnected))
+		return -ENODEV;
+	spin_lock_irqsave(&instance->uart.tx_lock, flags);
+	written = kfifo_in(&instance->uart.tx_fifo, buf, count);
+	spin_unlock_irqrestore(&instance->uart.tx_lock, flags);
+	if (written)
+		schedule_delayed_work(&instance->uart.work, 0);
+	return written;
+}
+
+static unsigned int rpe_tty_write_room(struct tty_struct *tty)
+{
+	struct rpe_instance *instance = tty->driver_data;
+	unsigned long flags;
+	unsigned int room;
+
+	if (!instance || READ_ONCE(instance->uart.disconnected))
+		return 0;
+	spin_lock_irqsave(&instance->uart.tx_lock, flags);
+	room = kfifo_avail(&instance->uart.tx_fifo);
+	spin_unlock_irqrestore(&instance->uart.tx_lock, flags);
+	return room;
+}
+
+static unsigned int rpe_tty_chars_in_buffer(struct tty_struct *tty)
+{
+	struct rpe_instance *instance = tty->driver_data;
+	unsigned long flags;
+	unsigned int count;
+
+	if (!instance)
+		return 0;
+	spin_lock_irqsave(&instance->uart.tx_lock, flags);
+	count = kfifo_len(&instance->uart.tx_fifo);
+	spin_unlock_irqrestore(&instance->uart.tx_lock, flags);
+	return count;
+}
+
+static void rpe_tty_flush_buffer(struct tty_struct *tty)
+{
+	struct rpe_instance *instance = tty->driver_data;
+	unsigned long flags;
+
+	if (!instance)
+		return;
+	spin_lock_irqsave(&instance->uart.tx_lock, flags);
+	kfifo_reset(&instance->uart.tx_fifo);
+	spin_unlock_irqrestore(&instance->uart.tx_lock, flags);
+	tty_port_tty_wakeup(&instance->uart.port);
+}
+
+static void rpe_tty_set_termios(struct tty_struct *tty, const struct ktermios *old)
+{
+	struct rpe_instance *instance = tty->driver_data;
+	unsigned long flags;
+	u32 baud;
+	u8 data_bits, stop_bits, parity;
+
+	if (!instance)
+		return;
+	baud = clamp_t(u32, tty_get_baud_rate(tty), 1, instance->uart.max_baud);
+	switch (tty->termios.c_cflag & CSIZE) {
+	case CS5: data_bits = 5; break;
+	case CS6: data_bits = 6; break;
+	case CS7: data_bits = 7; break;
+	default: data_bits = 8; break;
+	}
+	stop_bits = tty->termios.c_cflag & CSTOPB ? 2 : 1;
+	parity = !(tty->termios.c_cflag & PARENB) ? RPE_UART_PARITY_NONE :
+		(tty->termios.c_cflag & PARODD ? RPE_UART_PARITY_ODD : RPE_UART_PARITY_EVEN);
+	tty_termios_encode_baud_rate(&tty->termios, baud, baud);
+	spin_lock_irqsave(&instance->uart.config_lock, flags);
+	instance->uart.baud = baud;
+	instance->uart.data_bits = data_bits;
+	instance->uart.stop_bits = stop_bits;
+	instance->uart.parity = parity;
+	spin_unlock_irqrestore(&instance->uart.config_lock, flags);
+	schedule_delayed_work(&instance->uart.work, 0);
+}
+
+static const struct tty_operations rpe_tty_ops = {
+	.install = rpe_tty_install,
+	.open = rpe_tty_open,
+	.close = rpe_tty_close,
+	.write = rpe_tty_write,
+	.write_room = rpe_tty_write_room,
+	.chars_in_buffer = rpe_tty_chars_in_buffer,
+	.flush_buffer = rpe_tty_flush_buffer,
+	.set_termios = rpe_tty_set_termios,
+};
+
 static void rpe_gpio_irq_mask(struct irq_data *data)
 {
 	struct gpio_chip *chip = irq_data_get_irq_chip_data(data);
@@ -985,9 +1264,18 @@ static void rpe_destroy_instance(struct rpe_instance *instance)
 	} else if (instance->type == RPE_INSTANCE_ADC) {
 		iio_device_unregister(instance->adc.device);
 		iio_device_free(instance->adc.device);
-	} else {
+	} else if (instance->type == RPE_INSTANCE_PWM) {
 		pwmchip_remove(instance->pwm.chip);
 		pwmchip_put(instance->pwm.chip);
+	} else {
+		WRITE_ONCE(instance->uart.disconnected, true);
+		tty_port_unregister_device(&instance->uart.port, rpe_tty_driver,
+					   instance->uart.index);
+		tty_port_tty_vhangup(&instance->uart.port);
+		cancel_delayed_work_sync(&instance->uart.work);
+		tty_port_destroy(&instance->uart.port);
+		kfifo_free(&instance->uart.tx_fifo);
+		ida_free(&rpe_tty_ids, instance->uart.index);
 	}
 	ida_free(&instance->session->instance_ids, instance->id);
 	kfree(instance);
@@ -1184,6 +1472,75 @@ free_instance:
 	return ret;
 }
 
+static int rpe_create_uart(struct rpe_session *session, void __user *argument)
+{
+	struct rpe_ioc_create_uart create;
+	struct rpe_instance *instance;
+	struct device *device;
+	int ret;
+
+	if (copy_from_user(&create, argument, sizeof(create)))
+		return -EFAULT;
+	if (!create.default_baud || !create.max_baud ||
+	    create.default_baud > create.max_baud || create.bus_id > 1 ||
+	    memchr_inv(create.reserved, 0, sizeof(create.reserved)))
+		return -EINVAL;
+	instance = kzalloc(sizeof(*instance), GFP_KERNEL);
+	if (!instance)
+		return -ENOMEM;
+	instance->session = session;
+	instance->type = RPE_INSTANCE_UART;
+	instance->uart.baud = create.default_baud;
+	instance->uart.max_baud = create.max_baud;
+	instance->uart.data_bits = 8;
+	instance->uart.stop_bits = 1;
+	instance->uart.parity = RPE_UART_PARITY_NONE;
+	instance->uart.bus_id = create.bus_id;
+	mutex_init(&instance->transaction_lock);
+	spin_lock_init(&instance->uart.tx_lock);
+	spin_lock_init(&instance->uart.config_lock);
+	tty_port_init(&instance->uart.port);
+	instance->uart.port.ops = &rpe_uart_port_ops;
+	INIT_DELAYED_WORK(&instance->uart.work, rpe_uart_work);
+	ret = kfifo_alloc(&instance->uart.tx_fifo, RPE_UART_TX_FIFO_SIZE, GFP_KERNEL);
+	if (ret)
+		goto destroy_port;
+	instance->id = ida_alloc_min(&session->instance_ids, 1, GFP_KERNEL);
+	if ((int)instance->id < 0) {
+		ret = (int)instance->id;
+		goto free_fifo;
+	}
+	instance->uart.index = ida_alloc_max(&rpe_tty_ids, RPE_MAX_TTYS - 1, GFP_KERNEL);
+	if (instance->uart.index < 0) {
+		ret = instance->uart.index;
+		goto free_id;
+	}
+	device = tty_port_register_device(&instance->uart.port, rpe_tty_driver,
+					  instance->uart.index, rpe_misc.this_device);
+	if (IS_ERR(device)) {
+		ret = PTR_ERR(device);
+		goto free_tty_id;
+	}
+	list_add_tail(&instance->node, &session->instances);
+	create.instance_id = instance->id;
+	create.tty_index = instance->uart.index;
+	if (copy_to_user(argument, &create, sizeof(create))) {
+		rpe_destroy_instance(instance);
+		return -EFAULT;
+	}
+	return 0;
+free_tty_id:
+	ida_free(&rpe_tty_ids, instance->uart.index);
+free_id:
+	ida_free(&session->instance_ids, instance->id);
+free_fifo:
+	kfifo_free(&instance->uart.tx_fifo);
+destroy_port:
+	tty_port_destroy(&instance->uart.port);
+	kfree(instance);
+	return ret;
+}
+
 static int rpe_create_i2c(struct rpe_session *session, void __user *argument)
 {
 	struct rpe_ioc_create_i2c create;
@@ -1374,6 +1731,9 @@ static long rpe_ioctl(struct file *file, unsigned int command, unsigned long arg
 	case RPE_IOC_CREATE_PWM:
 		ret = rpe_create_pwm(session, argument);
 		break;
+	case RPE_IOC_CREATE_UART:
+		ret = rpe_create_uart(session, argument);
+		break;
 	case RPE_IOC_DESTROY:
 		if (copy_from_user(&destroy, argument, sizeof(destroy))) {
 			ret = -EFAULT;
@@ -1476,17 +1836,46 @@ static struct miscdevice rpe_misc = {
 
 static int __init rpe_init(void)
 {
-	return misc_register(&rpe_misc);
+	int ret;
+
+	rpe_tty_driver = tty_alloc_driver(RPE_MAX_TTYS,
+				TTY_DRIVER_REAL_RAW | TTY_DRIVER_DYNAMIC_DEV);
+	if (IS_ERR(rpe_tty_driver))
+		return PTR_ERR(rpe_tty_driver);
+	rpe_tty_driver->driver_name = "rp-extio-uart";
+	rpe_tty_driver->name = "ttyRPE";
+	rpe_tty_driver->major = 0;
+	rpe_tty_driver->minor_start = 0;
+	rpe_tty_driver->type = TTY_DRIVER_TYPE_SERIAL;
+	rpe_tty_driver->subtype = SERIAL_TYPE_NORMAL;
+	rpe_tty_driver->init_termios = tty_std_termios;
+	rpe_tty_driver->init_termios.c_cflag = B115200 | CS8 | CREAD | CLOCAL;
+	tty_set_operations(rpe_tty_driver, &rpe_tty_ops);
+	ret = tty_register_driver(rpe_tty_driver);
+	if (ret)
+		goto put_tty_driver;
+	ret = misc_register(&rpe_misc);
+	if (ret)
+		goto unregister_tty_driver;
+	return 0;
+unregister_tty_driver:
+	tty_unregister_driver(rpe_tty_driver);
+put_tty_driver:
+	tty_driver_kref_put(rpe_tty_driver);
+	return ret;
 }
 
 static void __exit rpe_exit(void)
 {
 	misc_deregister(&rpe_misc);
+	tty_unregister_driver(rpe_tty_driver);
+	tty_driver_kref_put(rpe_tty_driver);
+	ida_destroy(&rpe_tty_ids);
 }
 
 module_init(rpe_init);
 module_exit(rpe_exit);
 
 MODULE_AUTHOR("rp-extio contributors");
-MODULE_DESCRIPTION("Userspace-backed I2C, SPI, and GPIO controllers");
+MODULE_DESCRIPTION("Userspace-backed I2C, SPI, GPIO, ADC, PWM, and UART controllers");
 MODULE_LICENSE("GPL");

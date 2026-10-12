@@ -35,6 +35,15 @@ pub enum Transaction {
 		mode: u16,
 		segments: Vec<SpiSegment>,
 	},
+	Uart {
+		bus_id: u8,
+		baud: u32,
+		data_bits: u8,
+		stop_bits: u8,
+		parity: u8,
+		rx_len: u16,
+		tx: Vec<u8>,
+	},
 	Gpio {
 		command: u8,
 		line: u8,

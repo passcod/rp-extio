@@ -20,6 +20,12 @@ pub const CAP_GENERAL: u16 = 1;
 pub const CAP_I2C: u16 = 2;
 pub const CAP_SPI: u16 = 3;
 pub const CAP_UART: u16 = 4;
+pub const UART_CAP_DAEMON_BACKED: u8 = 1 << 0;
+pub const UART_REQUEST_HEADER_LEN: usize = 12;
+pub const UART_REPLY_HEADER_LEN: usize = 4;
+pub const UART_PARITY_NONE: u8 = 0;
+pub const UART_PARITY_EVEN: u8 = 1;
+pub const UART_PARITY_ODD: u8 = 2;
 pub const CAP_GPIO: u16 = 5;
 pub const CAP_PIN_CONFIG: u16 = 6;
 pub const CAP_ADC: u16 = 7;
@@ -358,6 +364,7 @@ pub enum Operation {
 	AdcRead = 6,
 	Pwm = 7,
 	OnboardLed = 8,
+	UartTransfer = 9,
 }
 
 impl TryFrom<u8> for Operation {
@@ -372,6 +379,7 @@ impl TryFrom<u8> for Operation {
 			6 => Ok(Self::AdcRead),
 			7 => Ok(Self::Pwm),
 			8 => Ok(Self::OnboardLed),
+			9 => Ok(Self::UartTransfer),
 			_ => Err(WireError::Unsupported),
 		}
 	}

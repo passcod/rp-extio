@@ -5,6 +5,7 @@ use rp_extio_wire::{
 	CAP_I2C, CAP_ONBOARD_LED, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity,
 	I2cRequest, LED_GET, LED_SET, LedState, MAX_PAYLOAD, Operation, PWM_APPLY, PWM_GET, Peripheral,
 	PinMap, PinValidationError, PinValidationKind, PwmState, SPI_CS_CHANGE, SpiRequest, Status,
+	UART_CAP_DAEMON_BACKED, UART_PARITY_ODD, UART_REPLY_HEADER_LEN, UART_REQUEST_HEADER_LEN,
 	UsbHeader, WireError, Writer,
 };
 
@@ -83,6 +84,14 @@ pub trait Board {
 		rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT
 	}
 
+	fn uart_daemon_backed(&self, _bus: u8) -> bool {
+		false
+	}
+
+	fn uart_max_baud(&self, _bus: u8) -> u32 {
+		0
+	}
+
 	fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError>;
 
 	fn i2c_transfer(
@@ -96,6 +105,20 @@ pub trait Board {
 		request: &SpiRequest<'_>,
 		receive: &mut [u8],
 	) -> Result<SpiOutcome, BusFailure>;
+
+	#[allow(clippy::too_many_arguments)]
+	fn uart_transfer(
+		&mut self,
+		_bus: u8,
+		_baud: u32,
+		_data_bits: u8,
+		_stop_bits: u8,
+		_parity: u8,
+		_tx: &[u8],
+		_rx: &mut [u8],
+	) -> Result<(usize, usize), BusFailure> {
+		Err(BusFailure::new(Status::Unsupported, 0))
+	}
 
 	fn disconnect(&mut self) {}
 
@@ -152,6 +175,7 @@ pub fn dispatch<B: Board>(
 		Operation::AdcRead => adc(payload, board, response),
 		Operation::Pwm => pwm(payload, board, response),
 		Operation::OnboardLed => onboard_led(payload, board, response),
+		Operation::UartTransfer => uart(payload, board, response),
 		Operation::ConfigurePins => unreachable!(),
 	};
 
@@ -248,9 +272,13 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
 				out.push(bus as u8)?;
 				out.push(pins.uart_tx[bus])?;
 				out.push(pins.uart_rx[bus])?;
-				out.push(0)?;
+				out.push(if board.uart_daemon_backed(bus as u8) {
+					UART_CAP_DAEMON_BACKED
+				} else {
+					0
+				})?;
 				out.u32(UART_BAUD)?;
-				out.u32(0)
+				out.u32(board.uart_max_baud(bus as u8))
 			})?;
 		}
 	}
@@ -333,6 +361,52 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
 	response[4] = value;
 	response[5..8].fill(0);
 	Ok(8)
+}
+
+fn uart<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
+	if payload.len() < UART_REQUEST_HEADER_LEN {
+		return Err(BusFailure::new(Status::BadFrame, 0));
+	}
+	let bus = payload[0];
+	let data_bits = payload[1];
+	let stop_bits = payload[2];
+	let parity = payload[3];
+	let baud = u32::from_le_bytes(payload[4..8].try_into().unwrap());
+	let rx_len = u16::from_le_bytes(payload[8..10].try_into().unwrap()) as usize;
+	let tx_len = u16::from_le_bytes(payload[10..12].try_into().unwrap()) as usize;
+	let peripheral = match bus {
+		0 => Peripheral::Uart0,
+		1 => Peripheral::Uart1,
+		_ => return Err(BusFailure::new(Status::Unsupported, 0)),
+	};
+	if payload.len() != UART_REQUEST_HEADER_LEN + tx_len
+		|| rx_len > response.len().saturating_sub(UART_REPLY_HEADER_LEN)
+		|| baud == 0
+		|| !(5..=8).contains(&data_bits)
+		|| !matches!(stop_bits, 1 | 2)
+		|| parity > UART_PARITY_ODD
+	{
+		return Err(BusFailure::new(Status::BadFrame, 0));
+	}
+	if !board.pin_map().is_enabled(peripheral) || !board.uart_daemon_backed(bus) {
+		return Err(BusFailure::new(Status::Unsupported, 0));
+	}
+	let (written, read) = board.uart_transfer(
+		bus,
+		baud,
+		data_bits,
+		stop_bits,
+		parity,
+		&payload[UART_REQUEST_HEADER_LEN..],
+		&mut response[UART_REPLY_HEADER_LEN..UART_REPLY_HEADER_LEN + rx_len],
+	)?;
+	if written > tx_len || read > rx_len || written > u16::MAX as usize || read > u16::MAX as usize
+	{
+		return Err(BusFailure::new(Status::IoError, written as u32));
+	}
+	response[..2].copy_from_slice(&(written as u16).to_le_bytes());
+	response[2..4].copy_from_slice(&(read as u16).to_le_bytes());
+	Ok(UART_REPLY_HEADER_LEN + read)
 }
 
 fn adc<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
@@ -567,6 +641,32 @@ mod tests {
 			Ok(outcome)
 		}
 
+		fn uart_daemon_backed(&self, bus: u8) -> bool {
+			bus == 1
+		}
+
+		fn uart_max_baud(&self, bus: u8) -> u32 {
+			if bus == 1 { 5_000_000 } else { 0 }
+		}
+
+		fn uart_transfer(
+			&mut self,
+			bus: u8,
+			_baud: u32,
+			_data_bits: u8,
+			_stop_bits: u8,
+			_parity: u8,
+			tx: &[u8],
+			rx: &mut [u8],
+		) -> Result<(usize, usize), BusFailure> {
+			if bus != 1 {
+				return Err(BusFailure::new(Status::Unsupported, 0));
+			}
+			let read = tx.len().min(rx.len());
+			rx[..read].copy_from_slice(&tx[..read]);
+			Ok((tx.len(), read))
+		}
+
 		fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {
 			if line as usize >= self.pin_map.gpio_pins().unwrap().len() {
 				return Err(BusFailure::new(Status::Unsupported, 0));
@@ -657,12 +757,9 @@ mod tests {
 	#[test]
 	fn hello_reports_bus_uart_and_gpio_capabilities() {
 		let mut response = [0; MAX_PAYLOAD];
-		let reply = dispatch(
-			header(Operation::Hello, 0),
-			&[],
-			&mut Stub::default(),
-			&mut response,
-		);
+		let mut board = Stub::default();
+		board.pin_map.set_enabled(Peripheral::Uart1, true);
+		let reply = dispatch(header(Operation::Hello, 0), &[], &mut board, &mut response);
 		assert_eq!(reply.header.status, Status::Ok);
 		assert_eq!(&response[..2], &CAP_GENERAL.to_le_bytes());
 		assert!(
@@ -692,6 +789,23 @@ mod tests {
 					.any(|window| window == capability.to_le_bytes())
 			);
 		}
+		let mut offset = 0;
+		let mut uart1 = None;
+		while offset < reply.payload_len {
+			let kind = u16::from_le_bytes(response[offset..offset + 2].try_into().unwrap());
+			let len =
+				u16::from_le_bytes(response[offset + 2..offset + 4].try_into().unwrap()) as usize;
+			if kind == CAP_UART && response[offset + 4] == 1 {
+				uart1 = Some(&response[offset + 4..offset + 4 + len]);
+			}
+			offset += 4 + len;
+		}
+		let uart1 = uart1.expect("UART1 capability");
+		assert_eq!(uart1[3], UART_CAP_DAEMON_BACKED);
+		assert_eq!(
+			u32::from_le_bytes(uart1[8..12].try_into().unwrap()),
+			5_000_000
+		);
 	}
 
 	#[test]
@@ -804,6 +918,28 @@ mod tests {
 		assert_eq!(&response[4..8], &(1_u32 << 3).to_le_bytes());
 		assert_eq!(&response[8..12], &(1_u32 << 3).to_le_bytes());
 		assert_eq!(reply.payload_len, 20);
+	}
+
+	#[test]
+	fn uart_dispatches_writes_and_available_reads() {
+		let mut board = Stub::default();
+		board.pin_map.set_enabled(Peripheral::Uart1, true);
+		let mut request = [0; UART_REQUEST_HEADER_LEN + 3];
+		request[..4].copy_from_slice(&[1, 8, 1, rp_extio_wire::UART_PARITY_NONE]);
+		request[4..8].copy_from_slice(&115_200_u32.to_le_bytes());
+		request[8..10].copy_from_slice(&2_u16.to_le_bytes());
+		request[10..12].copy_from_slice(&3_u16.to_le_bytes());
+		request[12..].copy_from_slice(b"abc");
+		let mut response = [0; MAX_PAYLOAD];
+
+		let reply = dispatch(
+			header(Operation::UartTransfer, request.len()),
+			&request,
+			&mut board,
+			&mut response,
+		);
+		assert_eq!(reply.header.status, Status::Ok);
+		assert_eq!(&response[..reply.payload_len], &[3, 0, 2, 0, b'a', b'b']);
 	}
 
 	#[test]

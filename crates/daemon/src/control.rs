@@ -469,6 +469,8 @@ pub struct BoardInfo {
 	pub generation: Option<u64>,
 	pub i2c_buses: [Option<i32>; 2],
 	pub spi_buses: [Option<i32>; 2],
+	#[serde(default)]
+	pub uart_ttys: [Option<i32>; 2],
 	pub gpio_instance: Option<u32>,
 	pub iio_device: Option<i32>,
 	pub pwm_chip: Option<i32>,
@@ -1533,6 +1535,7 @@ mod tests {
 				generation: Some(7),
 				i2c_buses: [Some(12), None],
 				spi_buses: [Some(4), None],
+				uart_ttys: [None; 2],
 				gpio_instance: Some(99),
 				iio_device: Some(2),
 				pwm_chip: Some(1),

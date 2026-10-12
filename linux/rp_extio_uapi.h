@@ -5,7 +5,7 @@
 #include <linux/ioctl.h>
 #include <linux/types.h>
 
-#define RPE_ABI_MAJOR 3
+#define RPE_ABI_MAJOR 4
 #define RPE_ABI_MINOR 0
 #define RPE_MAX_PAYLOAD 4096
 #define RPE_MAX_DATA 3584
@@ -71,6 +71,15 @@ struct rpe_ioc_create_pwm {
 	__s32 chip_num;
 };
 
+struct rpe_ioc_create_uart {
+	__u32 default_baud;
+	__u32 max_baud;
+	__u8 bus_id;
+	__u8 reserved[3];
+	__u32 instance_id;
+	__s32 tty_index;
+};
+
 #define RPE_IOC_MAGIC 'R'
 #define RPE_IOC_GET_VERSION _IOR(RPE_IOC_MAGIC, 0x00, struct rpe_ioc_version)
 #define RPE_IOC_CREATE_I2C _IOWR(RPE_IOC_MAGIC, 0x01, struct rpe_ioc_create_i2c)
@@ -79,5 +88,6 @@ struct rpe_ioc_create_pwm {
 #define RPE_IOC_CREATE_GPIO _IOWR(RPE_IOC_MAGIC, 0x04, struct rpe_ioc_create_gpio)
 #define RPE_IOC_CREATE_ADC _IOWR(RPE_IOC_MAGIC, 0x05, struct rpe_ioc_create_adc)
 #define RPE_IOC_CREATE_PWM _IOWR(RPE_IOC_MAGIC, 0x06, struct rpe_ioc_create_pwm)
+#define RPE_IOC_CREATE_UART _IOWR(RPE_IOC_MAGIC, 0x07, struct rpe_ioc_create_uart)
 
 #endif

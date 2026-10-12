@@ -14,7 +14,7 @@ use std::{
 	sync::{Arc, RwLock},
 };
 
-const ABI_MAJOR: u16 = 3;
+const ABI_MAJOR: u16 = 4;
 const IOC_MAGIC: u32 = b'R' as u32;
 const I2C_FUNCTIONALITY: u32 = 0x0eff_000b;
 
@@ -22,6 +22,7 @@ const I2C_FUNCTIONALITY: u32 = 0x0eff_000b;
 pub struct RegistrationConfig {
 	pub i2c: [Option<I2cRegistration>; 2],
 	pub spi: [Option<SpiRegistration>; 2],
+	pub uart: [Option<UartRegistration>; 2],
 	pub gpio_lines: u16,
 	pub gpio_pins: [u8; 26],
 	pub adc: Option<AdcRegistration>,
@@ -40,6 +41,12 @@ pub struct SpiRegistration {
 	pub spi_min_speed_hz: u32,
 	pub spi_max_speed_hz: u32,
 	pub spi_chip_selects: u16,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UartRegistration {
+	pub default_baud: u32,
+	pub max_baud: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -74,6 +81,7 @@ impl RegistrationConfig {
 			}),
 			None,
 		],
+		uart: [None, None],
 		gpio_lines: 17,
 		gpio_pins: [
 			2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 20, 22, 26, 27, 28, 0, 0, 0, 0, 0, 0, 0, 0, 0,
@@ -158,6 +166,16 @@ struct IocCreatePwm {
 	chip_num: i32,
 }
 
+#[repr(C)]
+struct IocCreateUart {
+	default_baud: u32,
+	max_baud: u32,
+	bus_id: u8,
+	reserved: [u8; 3],
+	instance_id: u32,
+	tty_index: i32,
+}
+
 const _: () = assert!(size_of::<IocVersion>() == 16);
 const _: () = assert!(size_of::<IocCreateI2c>() == 20);
 const _: () = assert!(size_of::<IocCreateSpi>() == 24);
@@ -165,6 +183,7 @@ const _: () = assert!(size_of::<IocDestroy>() == 8);
 const _: () = assert!(size_of::<IocCreateGpio>() == 48);
 const _: () = assert!(size_of::<IocCreateAdc>() == 16);
 const _: () = assert!(size_of::<IocCreatePwm>() == 16);
+const _: () = assert!(size_of::<IocCreateUart>() == 20);
 
 const IOC_GET_VERSION: libc::Ioctl = libc::_IOR::<IocVersion>(IOC_MAGIC, 0x00);
 const IOC_CREATE_I2C: libc::Ioctl = libc::_IOWR::<IocCreateI2c>(IOC_MAGIC, 0x01);
@@ -173,11 +192,13 @@ const IOC_DESTROY: libc::Ioctl = libc::_IOW::<IocDestroy>(IOC_MAGIC, 0x03);
 const IOC_CREATE_GPIO: libc::Ioctl = libc::_IOWR::<IocCreateGpio>(IOC_MAGIC, 0x04);
 const IOC_CREATE_ADC: libc::Ioctl = libc::_IOWR::<IocCreateAdc>(IOC_MAGIC, 0x05);
 const IOC_CREATE_PWM: libc::Ioctl = libc::_IOWR::<IocCreatePwm>(IOC_MAGIC, 0x06);
+const IOC_CREATE_UART: libc::Ioctl = libc::_IOWR::<IocCreateUart>(IOC_MAGIC, 0x07);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BusNumbers {
 	pub i2c: [Option<i32>; 2],
 	pub spi: [Option<i32>; 2],
+	pub uart: [Option<i32>; 2],
 }
 
 pub struct DeviceRegistration {
@@ -246,6 +267,7 @@ impl Kernel {
 		let mut buses = BusNumbers {
 			i2c: [None; 2],
 			spi: [None; 2],
+			uart: [None; 2],
 		};
 		for (bus_id, registration) in config.i2c.into_iter().enumerate() {
 			let Some(registration) = registration else {
@@ -361,7 +383,34 @@ impl Kernel {
 			self.backends
 				.write()
 				.unwrap()
-				.insert(create.instance_id, backend);
+				.insert(create.instance_id, backend.clone());
+		}
+		for (bus_id, registration) in config.uart.into_iter().enumerate() {
+			let Some(registration) = registration else {
+				continue;
+			};
+			let mut create = IocCreateUart {
+				default_baud: registration.default_baud,
+				max_baud: registration.max_baud,
+				bus_id: bus_id as u8,
+				reserved: [0; 3],
+				instance_id: 0,
+				tty_index: -1,
+			};
+			if let Err(error) = ioctl(
+				self.file.get_ref().as_raw_fd(),
+				IOC_CREATE_UART,
+				&mut create,
+			) {
+				self.destroy_instances(&instance_ids);
+				return Err(error);
+			}
+			instance_ids.push(create.instance_id);
+			buses.uart[bus_id] = Some(create.tty_index);
+			self.backends
+				.write()
+				.unwrap()
+				.insert(create.instance_id, backend.clone());
 		}
 		Ok(DeviceRegistration {
 			kernel: self.clone(),
@@ -509,6 +558,7 @@ impl Request {
 			4 => Operation::GpioCommand,
 			6 => Operation::AdcRead,
 			7 => Operation::Pwm,
+			9 => Operation::UartTransfer,
 			_ => return invalid("unsupported kernel operation"),
 		};
 		let payload = &frame[KERNEL_HEADER_LEN..];
@@ -603,6 +653,24 @@ impl Request {
 					duty_ns: state.duty_ns,
 				}
 			}
+			Operation::UartTransfer => {
+				if payload.len() < rp_extio_wire::UART_REQUEST_HEADER_LEN {
+					return invalid("truncated UART transaction");
+				}
+				let tx_len = u16::from_le_bytes(payload[10..12].try_into().unwrap()) as usize;
+				if payload.len() != rp_extio_wire::UART_REQUEST_HEADER_LEN + tx_len {
+					return invalid("invalid UART transaction length");
+				}
+				Transaction::Uart {
+					bus_id: payload[0],
+					data_bits: payload[1],
+					stop_bits: payload[2],
+					parity: payload[3],
+					baud: u32::from_le_bytes(payload[4..8].try_into().unwrap()),
+					rx_len: u16::from_le_bytes(payload[8..10].try_into().unwrap()),
+					tx: payload[rp_extio_wire::UART_REQUEST_HEADER_LEN..].to_vec(),
+				}
+			}
 			Operation::Hello | Operation::ConfigurePins | Operation::OnboardLed => unreachable!(),
 		};
 		Ok(Self {
@@ -670,6 +738,21 @@ impl Request {
 				for speed in &reply.effective_speeds {
 					payload.extend_from_slice(&speed.to_le_bytes());
 				}
+				payload.extend_from_slice(&reply.data);
+				Some(payload)
+			}
+			Transaction::Uart { rx_len, tx, .. } => {
+				if reply.completed > tx.len() as u32
+					|| reply.data.len() > *rx_len as usize
+					|| reply.completed > u16::MAX as u32
+					|| reply.data.len() > u16::MAX as usize
+					|| !reply.effective_speeds.is_empty()
+				{
+					return None;
+				}
+				let mut payload = Vec::with_capacity(4 + reply.data.len());
+				payload.extend_from_slice(&(reply.completed as u16).to_le_bytes());
+				payload.extend_from_slice(&(reply.data.len() as u16).to_le_bytes());
 				payload.extend_from_slice(&reply.data);
 				Some(payload)
 			}
@@ -816,6 +899,35 @@ mod tests {
 		});
 		assert_eq!(&reply[24..28], &0_i32.to_le_bytes());
 		assert_eq!(&reply[KERNEL_HEADER_LEN..], &[1, 0, 0, 0, 0, 0, 0, 0]);
+	}
+
+	#[test]
+	fn decodes_uart_request_and_encodes_reply() {
+		let mut payload = vec![1, 8, 1, rp_extio_wire::UART_PARITY_EVEN];
+		payload.extend_from_slice(&230_400_u32.to_le_bytes());
+		payload.extend_from_slice(&4_u16.to_le_bytes());
+		payload.extend_from_slice(&3_u16.to_le_bytes());
+		payload.extend_from_slice(b"abc");
+		let request = Request::decode(&frame(Operation::UartTransfer as u16, &payload)).unwrap();
+		assert_eq!(
+			request.transaction,
+			Transaction::Uart {
+				bus_id: 1,
+				baud: 230_400,
+				data_bits: 8,
+				stop_bits: 1,
+				parity: rp_extio_wire::UART_PARITY_EVEN,
+				rx_len: 4,
+				tx: b"abc".to_vec(),
+			}
+		);
+		let reply = request.encode_reply(BackendReply {
+			status: Status::Ok as i32,
+			completed: 3,
+			data: b"xy".to_vec(),
+			effective_speeds: vec![],
+		});
+		assert_eq!(&reply[KERNEL_HEADER_LEN..], &[3, 0, 2, 0, b'x', b'y']);
 	}
 
 	#[test]
