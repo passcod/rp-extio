@@ -35,6 +35,12 @@ use rp_extio_wire::{
 
 const SPI_CLOCK_HZ: u32 = 80_000_000;
 const ESP32_C3_SPI_MIN_SPEED_HZ: u32 = SPI_CLOCK_HZ / (16 * 64);
+const LED_T0_HIGH_TICKS: u16 = 28;
+const LED_T0_LOW_TICKS: u16 = 80;
+const LED_T1_HIGH_TICKS: u16 = 80;
+const LED_T1_LOW_TICKS: u16 = 28;
+const LED_RESET_TICKS: u16 = 22_400;
+const LED_RESET_US: u32 = 280;
 
 pub struct Esp32C3Board<'d> {
 	pins: [Flex<'d>; ESP32_C3_GPIO_PINS.len()],
@@ -229,17 +235,20 @@ impl<'d> Esp32C3Board<'d> {
 			.enumerate()
 		{
 			pulses[index] = if bit {
-				PulseCode::new(Level::High, 64, Level::Low, 36)
+				PulseCode::new(Level::High, LED_T1_HIGH_TICKS, Level::Low, LED_T1_LOW_TICKS)
 			} else {
-				PulseCode::new(Level::High, 32, Level::Low, 68)
+				PulseCode::new(Level::High, LED_T0_HIGH_TICKS, Level::Low, LED_T0_LOW_TICKS)
 			};
 		}
-		pulses[24] = PulseCode::new(Level::Low, 5_000, Level::Low, 0);
+		pulses[24] = PulseCode::new(Level::Low, LED_RESET_TICKS, Level::Low, 0);
 		let channel = self
 			.led_channel
 			.take()
 			.unwrap()
 			.with_pin(self.route_flex(8));
+		// GPIO8 may have floated while the RMT output was detached. Hold it low
+		// long enough to reset the pixel before beginning a new 24-bit frame.
+		Delay::new().delay_micros(LED_RESET_US);
 		let transaction = channel.transmit(&pulses).map_err(|(_, channel)| {
 			self.led_channel = Some(channel.with_pin(NoPin));
 			BusFailure::new(Status::IoError, 0)
