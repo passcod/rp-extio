@@ -140,8 +140,6 @@ Notes:
 - Rust target: `riscv32imc-unknown-none-elf`
 - Flasher: [`espflash`](https://github.com/esp-rs/espflash)
 
-With one supported board attached:
-
 ```sh
 just flash esp32c3
 ```
