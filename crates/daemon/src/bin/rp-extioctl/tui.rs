@@ -1749,7 +1749,7 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let bottom_end = if app.board_kind() == BoardKind::Pico2 {
 		"SWD DEBUG"
 	} else {
-		"USB CONNECTOR"
+		"ANTENNA"
 	};
 	let top = if visible == header_rows {
 		top_end.into()

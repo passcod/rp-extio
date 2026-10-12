@@ -64,7 +64,7 @@ The TUI provides a "live" pinout layout so you don't even need to refer to the d
 │○ ADC4       GP4             ││13 5V                    ●│      │●  GPIO      IO18/USB D− 1│
 │○ PWM0 A     GP0             ││14 5V                    ●│      │●  GPIO      IO19/USB D+ 1│
 │○ PWM0 B     GP1             ││15 GND                   ●│      │●                   GND 15│
-│○ PWM1 A     GP2             ││                       USB CONNECTOR                        │
+│○ PWM1 A     GP2             ││                          ANTENNA                           │
 │○ PWM1 B     GP3             ││                                                            │
 │○ PWM2 A     GP4             ││                                                            │
 │○ PWM2 B     GP5             ││                                                            │
