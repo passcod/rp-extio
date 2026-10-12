@@ -22,9 +22,9 @@ use rp_extio_wire::{
 	TransportKind, USB_HEADER_LEN, UsbHeader,
 };
 use std::{
-	collections::HashMap,
-	io,
-	path::PathBuf,
+	collections::{HashMap, HashSet},
+	fs, io,
+	path::{Path, PathBuf},
 	sync::{
 		Arc,
 		atomic::{AtomicBool, AtomicU64, Ordering},
@@ -35,6 +35,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub const DEVELOPMENT_VID: u16 = 0xcafe;
 pub const DEVELOPMENT_PID: u16 = 0x4010;
+const ESP32_C3_BRIDGES: &[(u16, u16)] = &[(0x10c4, 0xea60)];
 const USB_DEADLINE: Duration = Duration::from_secs(6);
 const USB_DRAIN_QUIET: Duration = Duration::from_millis(50);
 
@@ -158,7 +159,7 @@ pub async fn run(
 	for info in initial {
 		try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
 	}
-	for path in &serial_paths {
+	for path in serial_candidates(&serial_paths) {
 		try_connect_serial(&kernel, &failed_tx, &config, &mut devices, path).await;
 	}
 	let mut serial_retry = tokio::time::interval(Duration::from_secs(1));
@@ -178,8 +179,8 @@ pub async fn run(
 				Some(id) => remove_device(&mut devices, &id).await,
 				None => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "USB failure channel closed")),
 			},
-			_ = serial_retry.tick(), if !serial_paths.is_empty() => {
-				for path in &serial_paths {
+			_ = serial_retry.tick() => {
+				for path in serial_candidates(&serial_paths) {
 					if !devices.contains_key(&DeviceKey::Serial(path.clone())) {
 						try_connect_serial(&kernel, &failed_tx, &config, &mut devices, path).await;
 					}
@@ -194,6 +195,48 @@ pub async fn run(
 			},
 		}
 	}
+}
+
+fn serial_candidates(explicit: &[PathBuf]) -> HashSet<PathBuf> {
+	let mut paths: HashSet<_> = explicit.iter().cloned().collect();
+	let Ok(entries) = fs::read_dir("/dev/serial/by-id") else {
+		return paths;
+	};
+	for entry in entries.flatten() {
+		let path = entry.path();
+		if is_supported_serial_bridge(&path) {
+			paths.insert(path);
+		}
+	}
+	paths
+}
+
+fn is_supported_serial_bridge(path: &Path) -> bool {
+	let Ok(device) = fs::canonicalize(path) else {
+		return false;
+	};
+	let Some(tty) = device.file_name() else {
+		return false;
+	};
+	let Ok(mut sysfs) = fs::canonicalize(Path::new("/sys/class/tty").join(tty).join("device"))
+	else {
+		return false;
+	};
+	loop {
+		if let (Some(vendor), Some(product)) = (
+			read_hex_u16(&sysfs.join("idVendor")),
+			read_hex_u16(&sysfs.join("idProduct")),
+		) {
+			return ESP32_C3_BRIDGES.contains(&(vendor, product));
+		}
+		if !sysfs.pop() {
+			return false;
+		}
+	}
+}
+
+fn read_hex_u16(path: &Path) -> Option<u16> {
+	u16::from_str_radix(fs::read_to_string(path).ok()?.trim(), 16).ok()
 }
 
 fn matches_bridge(info: &DeviceInfo) -> bool {
@@ -301,24 +344,24 @@ async fn try_connect_serial(
 	failed: &mpsc::UnboundedSender<DeviceKey>,
 	desired: &ConfigStore,
 	devices: &mut HashMap<DeviceKey, ConnectedDevice>,
-	path: &PathBuf,
+	path: PathBuf,
 ) {
 	let id = DeviceKey::Serial(path.clone());
 	if devices.contains_key(&id) {
 		return;
 	}
-	let (backend, mut config) = match SerialBackend::connect(path, id.clone(), failed.clone()).await
-	{
-		Ok(connected) => connected,
-		Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-		Err(error) => {
-			eprintln!(
-				"failed to connect rp-extio serial device {}: {error}",
-				path.display()
-			);
-			return;
-		}
-	};
+	let (backend, mut config) =
+		match SerialBackend::connect(&path, id.clone(), failed.clone()).await {
+			Ok(connected) => connected,
+			Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+			Err(error) => {
+				eprintln!(
+					"failed to connect rp-extio serial device {}: {error}",
+					path.display()
+				);
+				return;
+			}
+		};
 	let serial = match core::str::from_utf8(config.identity.as_bytes()) {
 		Ok(serial) => serial.to_owned(),
 		Err(_) => {

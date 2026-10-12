@@ -27,6 +27,7 @@ use tokio::{
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 const SERIAL_DEADLINE: Duration = Duration::from_secs(6);
+const SERIAL_CONNECT_DEADLINE: Duration = Duration::from_millis(500);
 
 pub struct SerialBackend {
 	port: Mutex<SerialStream>,
@@ -54,7 +55,12 @@ impl SerialBackend {
 			device_key,
 			failed,
 		});
-		let hello = backend.exchange(Operation::Hello, 1, &[]).await?;
+		let hello = tokio::time::timeout(
+			SERIAL_CONNECT_DEADLINE,
+			backend.exchange(Operation::Hello, 1, &[]),
+		)
+		.await
+		.map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "serial HELLO timed out"))??;
 		if hello.header.status != Status::Ok {
 			return Err(io::Error::other(format!(
 				"HELLO failed with {:?}",

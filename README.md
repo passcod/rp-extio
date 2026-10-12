@@ -134,10 +134,10 @@ Use the stable path for the board's USB-to-UART bridge:
 
 ```sh
 just flash esp32c3 /dev/serial/by-id/...
-rp-extiod --serial /dev/serial/by-id/...
 ```
 
-The daemon never probes serial devices automatically.
+The daemon discovers attached boards using supported USB-to-UART bridges.
+Use `rp-extiod --serial PATH` for other bridges.
 
 ## Simulator
 
