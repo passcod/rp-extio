@@ -11,8 +11,8 @@ Introduce a stable board kind in the wire crate, initially covering Pico 2 and
 ESP32-C3-DevKitM-1. Define a board profile for each kind containing its exposed
 GPIOs, physical header rows, supported signals, legal routes, default map,
 reserved transport pins, warning flags, ADC properties, PWM topology, and clock
-output support. Keep descriptions bounded and allocation-free so firmware can
-use the same validation logic as the daemon and control tools.
+output and onboard LED support. Keep descriptions bounded and allocation-free
+so firmware can use the same validation logic as the daemon and control tools.
 
 Extend HELLO with a versioned board-description capability. It must identify
 the board kind and transport, carry the stable device identifier, and provide
@@ -45,6 +45,14 @@ clock signals in a persisted map must remain disabled and produce an explicit
 unsupported-signal error if enabled. Keep this a profile capability rather than
 a firmware conditional so a later implementation can add a board-specific
 clock source without another protocol redesign.
+
+Describe the Pico 2's active-high monochrome LED on GP25 and the C3 board's
+addressable RGB LED on GPIO8 as named onboard devices. Negotiate LED kind and
+colour capabilities explicitly and add a get/set operation whose state uses
+RGB components, with monochrome boards accepting only off or white. Keep GP25
+outside the Pico header GPIO map. GPIO8 remains a legal C3 route with its
+existing warning; an active route on GPIO8 makes the onboard LED operation
+return busy rather than disturbing that peripheral.
 
 ## Transport and device management
 
@@ -103,8 +111,9 @@ Implement I2C transfers at the protocol's advertised speed and supported
 address modes, SPI messages including modes, chip-select polarity and optional
 second chip select, GPIO direction/read/write/bias/snapshot, ADC1 conversions
 on GPIO0 through GPIO4 with the reported resolution/reference, and LEDC PWM
-state for six channels. Unsupported operations and parameter combinations must
-return protocol status rather than panic.
+state for six channels. Drive the GPIO8 addressable RGB LED with the requested
+colour when the pin is not routed to another signal. Unsupported operations and
+parameter combinations must return protocol status rather than panic.
 
 Add an external UART transaction capability to the common protocol for RX,
 TX, line configuration, and modem-free status. Implement it over ESP UART1.
@@ -127,6 +136,10 @@ must reject unavailable instances and routes before mutation, display reserved
 transport pins, and emit warnings when selecting strapping or onboard-device
 pins. `default` selects the connected board's profile default rather than the
 Pico map.
+
+Add CLI and TUI controls for reading and setting the negotiated onboard LED.
+The CLI accepts on/off for either board and RGB colours where supported; the
+TUI shows the live LED state and offers the same board-appropriate controls.
 
 Render the TUI from profile-provided header rows. Add a two-column
 ESP32-C3-DevKitM-1 v1.6 diagram matching J1/J3, including power, ground, reset,
