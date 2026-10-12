@@ -49,8 +49,18 @@ _flash-esp32c3 port:
     #!/usr/bin/env bash
     set -euo pipefail
     command -v espflash >/dev/null || { echo "espflash is required" >&2; exit 1; }
+    restart_daemon=false
+    if systemctl is-active --quiet rp-extiod.service; then
+        systemctl stop rp-extiod.service
+        restart_daemon=true
+        trap 'systemctl start rp-extiod.service' EXIT
+    fi
     cargo firmware-esp32c3
     espflash flash --chip esp32c3 --port {{ quote(port) }} --non-interactive {{ root }}/target/riscv32imc-unknown-none-elf/release/rp-extio-firmware-esp32c3
+    if $restart_daemon; then
+        systemctl start rp-extiod.service
+        trap - EXIT
+    fi
 
 # Build optimized daemon and control binaries.
 release:
