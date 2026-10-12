@@ -113,7 +113,6 @@ Subsequent flashes don't need BOOTSEL mode.
 - Peripherals: I²C, SPI, UART, GPIO, ADC inputs, PWM outputs.
 - Core: ESP32-C3.
 - Signal voltage: 3.3V only.
-- Host transport: the onboard USB-to-UART bridge on GPIO20/GPIO21.
 
 GPIO20 and GPIO21 are reserved for rp-extio. GPIO2 and GPIO9 are strapping pins;
 GPIO8 is a strapping pin connected to the onboard RGB LED.
