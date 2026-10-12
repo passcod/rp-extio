@@ -31,6 +31,7 @@ pub struct RegistrationConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct I2cRegistration {
 	pub speed_hz: u32,
+	pub ten_bit_addresses: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -57,7 +58,13 @@ pub struct PwmRegistration {
 
 impl RegistrationConfig {
 	pub const PICO2: Self = Self {
-		i2c: [Some(I2cRegistration { speed_hz: 100_000 }), None],
+		i2c: [
+			Some(I2cRegistration {
+				speed_hz: 100_000,
+				ten_bit_addresses: true,
+			}),
+			None,
+		],
 		spi: [
 			Some(SpiRegistration {
 				spi_mode_bits: 0x4f,
@@ -245,7 +252,12 @@ impl Kernel {
 				continue;
 			};
 			let mut create = IocCreateI2c {
-				functionality: I2C_FUNCTIONALITY,
+				functionality: I2C_FUNCTIONALITY
+					& if registration.ten_bit_addresses {
+						u32::MAX
+					} else {
+						!2
+					},
 				speed_hz: registration.speed_hz,
 				bus_id: bus_id as u8,
 				reserved: [0; 3],

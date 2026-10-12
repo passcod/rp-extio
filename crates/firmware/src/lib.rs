@@ -79,6 +79,10 @@ pub trait Board {
 		embassy_clock_hz()
 	}
 
+	fn i2c_flags(&self) -> u16 {
+		rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT
+	}
+
 	fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError>;
 
 	fn i2c_transfer(
@@ -217,7 +221,7 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
 			record(&mut out, CAP_I2C, 16, |out| {
 				out.push(bus as u8)?;
 				out.push(0)?;
-				out.u16(rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)?;
+				out.u16(board.i2c_flags())?;
 				out.u32(I2C_SPEED_HZ)?;
 				out.u32(I2C_SPEED_HZ)?;
 				out.push(pins.i2c_sda[bus])?;

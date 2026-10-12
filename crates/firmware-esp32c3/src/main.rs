@@ -7,7 +7,7 @@ use board::Esp32C3Board;
 use esp_backtrace as _;
 use esp_hal::{
 	efuse,
-	gpio::Flex,
+	gpio::Pin,
 	uart::{Config as UartConfig, Uart},
 };
 use rp_extio_firmware::dispatch;
@@ -40,20 +40,22 @@ fn main() -> ! {
 	let identity = device_identity();
 	let mut board = Esp32C3Board::new(
 		[
-			Flex::new(peripherals.GPIO0),
-			Flex::new(peripherals.GPIO1),
-			Flex::new(peripherals.GPIO2),
-			Flex::new(peripherals.GPIO3),
-			Flex::new(peripherals.GPIO4),
-			Flex::new(peripherals.GPIO5),
-			Flex::new(peripherals.GPIO6),
-			Flex::new(peripherals.GPIO7),
-			Flex::new(peripherals.GPIO8),
-			Flex::new(peripherals.GPIO9),
-			Flex::new(peripherals.GPIO10),
-			Flex::new(peripherals.GPIO18),
-			Flex::new(peripherals.GPIO19),
+			peripherals.GPIO0.degrade(),
+			peripherals.GPIO1.degrade(),
+			peripherals.GPIO2.degrade(),
+			peripherals.GPIO3.degrade(),
+			peripherals.GPIO4.degrade(),
+			peripherals.GPIO5.degrade(),
+			peripherals.GPIO6.degrade(),
+			peripherals.GPIO7.degrade(),
+			peripherals.GPIO8.degrade(),
+			peripherals.GPIO9.degrade(),
+			peripherals.GPIO10.degrade(),
+			peripherals.GPIO18.degrade(),
+			peripherals.GPIO19.degrade(),
 		],
+		peripherals.I2C0,
+		peripherals.SPI2,
 		identity,
 	);
 	let buffers = BUFFERS.init(Buffers {

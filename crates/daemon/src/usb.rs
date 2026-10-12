@@ -2081,7 +2081,7 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 	let mut offset = 0;
 	let mut generation = None;
 	let mut board = None;
-	let mut i2c: [Option<(u32, [u8; 2])>; 2] = [None; 2];
+	let mut i2c: [Option<(u32, u16, [u8; 2])>; 2] = [None; 2];
 	let mut spi: [Option<(u32, u32, u32, u16, Vec<u8>)>; 2] = [None, None];
 	let mut uart: [Option<[u8; 2]>; 2] = [None; 2];
 	let mut pin_map = None;
@@ -2138,13 +2138,16 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 			}
 			CAP_I2C => {
 				let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
+				let flags = value
+					.get(2..4)
+					.map(|bytes| u16::from_le_bytes(bytes.try_into().unwrap()))
+					.unwrap_or(0);
 				if value.len() != 16
 					|| bus >= i2c.len()
 					|| i2c[bus].is_some()
 					|| value[1] != 0
-					|| u16::from_le_bytes(value[2..4].try_into().unwrap())
-						& (rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)
-						!= (rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT)
+					|| flags & rp_extio_wire::I2C_READ == 0
+					|| flags & !(rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT) != 0
 					|| value[14..16] != [0; 2]
 				{
 					return Err(invalid("invalid I2C capability"));
@@ -2154,7 +2157,7 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 				if minimum == 0 || minimum > maximum {
 					return Err(invalid("invalid I2C speed range"));
 				}
-				i2c[bus] = Some((maximum, [value[12], value[13]]));
+				i2c[bus] = Some((maximum, flags, [value[12], value[13]]));
 			}
 			CAP_SPI => {
 				let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
@@ -2296,7 +2299,7 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 		{
 			return Err(invalid("capabilities do not match enabled peripherals"));
 		}
-		if i2c[bus].is_some_and(|(_, pins)| pins != [pin_map.i2c_sda[bus], pin_map.i2c_scl[bus]])
+		if i2c[bus].is_some_and(|(_, _, pins)| pins != [pin_map.i2c_sda[bus], pin_map.i2c_scl[bus]])
 			|| spi[bus].as_ref().is_some_and(|(_, _, _, count, pins)| {
 				let mut expected = vec![
 					pin_map.spi_sck[bus],
@@ -2347,7 +2350,12 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 		identity,
 		onboard_led,
 		registration: RegistrationConfig {
-			i2c: i2c.map(|capability| capability.map(|(speed_hz, _)| I2cRegistration { speed_hz })),
+			i2c: i2c.map(|capability| {
+				capability.map(|(speed_hz, flags, _)| I2cRegistration {
+					speed_hz,
+					ten_bit_addresses: flags & rp_extio_wire::I2C_TEN_BIT != 0,
+				})
+			}),
 			spi: spi.map(|capability| {
 				capability.map(
 					|(spi_mode_bits, spi_min_speed_hz, spi_max_speed_hz, spi_chip_selects, _)| {
