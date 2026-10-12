@@ -1,7 +1,7 @@
 mod tui;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use rp_extio_wire::{ClockSource, Peripheral, PinMap, PinSignal};
+use rp_extio_wire::{BoardKind, BoardProfile, ClockSource, Peripheral, PinMap, PinSignal};
 use rp_extiod::control::{
 	BoardInfo, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup, PinMapConfig,
 	PwmInfo, signal_name,
@@ -18,7 +18,7 @@ const CONTROL_DEVICE: &str = "/dev/rp-extio-control";
 const CONTROL_SYSFS_DEVICE: &str = "/sys/class/misc/rp-extio-control";
 
 #[derive(Parser)]
-#[command(version, about = "Configure rp-extio Pico 2 pin routing")]
+#[command(version, about = "Configure rp-extio board pin routing")]
 struct Cli {
 	#[arg(long, default_value = "/run/rp-extiod.sock", global = true)]
 	socket: PathBuf,
@@ -966,13 +966,29 @@ fn board_summary(board: &BoardInfo) -> String {
 
 fn print_board(board: &BoardInfo) {
 	println!("{}", board_summary(board));
+	let profile = match board.board_kind.as_str() {
+		"pico2" => BoardKind::Pico2.profile(),
+		"esp32_c3_devkitm_1" => BoardKind::Esp32C3DevKitM1.profile(),
+		_ => return,
+	};
 	if let Some(map) = board.active {
-		print_map("active", map);
+		print_map("active", map, profile);
 	}
 	if let Some(map) = board.desired
 		&& Some(map) != board.active
 	{
-		print_map("desired", map);
+		print_map("desired", map, profile);
+	}
+	if !profile.reserved_pins().is_empty() {
+		println!(
+			"reserved: {}",
+			profile
+				.reserved_pins()
+				.iter()
+				.map(|pin| format!("GP{pin}"))
+				.collect::<Vec<_>>()
+				.join(",")
+		);
 	}
 	if !board.gpio_startup.is_empty() {
 		println!("GPIO startup:");
@@ -1021,10 +1037,15 @@ fn gpio_bias_name(bias: GpioBias) -> &'static str {
 	}
 }
 
-fn print_map(label: &str, config: PinMapConfig) {
+fn print_map(label: &str, config: PinMapConfig, profile: BoardProfile) {
 	let map = PinMap::from(config);
 	println!("{label}:");
-	for peripheral in Peripheral::ALL {
+	for peripheral in Peripheral::ALL.into_iter().filter(|peripheral| {
+		peripheral
+			.signals()
+			.iter()
+			.any(|&signal| profile.supports(signal))
+	}) {
 		println!(
 			"  {:5} {}",
 			peripheral_name(peripheral),
@@ -1063,6 +1084,7 @@ fn print_map(label: &str, config: PinMapConfig) {
 	for signal in PinSignal::ALL
 		.into_iter()
 		.filter(|signal| signal.serial_peripheral().is_none())
+		.filter(|&signal| profile.supports(signal))
 	{
 		let details = signal.clock_output().map_or_else(String::new, |output| {
 			format!(
@@ -1082,7 +1104,10 @@ fn print_map(label: &str, config: PinMapConfig) {
 			details
 		);
 	}
-	let gpio = map.gpio_pins().unwrap();
+	let Ok(gpio) = map.gpio_pins_for(profile) else {
+		println!("  gpio      invalid pin map");
+		return;
+	};
 	print!("  gpio      ");
 	for (index, pin) in gpio.as_slice().iter().enumerate() {
 		if index != 0 {

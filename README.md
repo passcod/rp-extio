@@ -122,6 +122,7 @@ Subsequent flashes don't need BOOTSEL mode.
 
 GPIO20 and GPIO21 are reserved for rp-extio. GPIO2 and GPIO9 are strapping pins;
 GPIO8 is a strapping pin connected to the onboard RGB LED.
+The onboard bridge carries the rp-extio control protocol at 115200 baud.
 
 | Peripheral | Startup state | Default GPIOs / notes |
 | --- | --- | --- |

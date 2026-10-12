@@ -21,7 +21,7 @@ embedded-hal = "1.0.0"
 esp-backtrace = { version = "0.20.0", features = ["esp32c3", "panic-handler", "println"] }
 esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c3"] }
 esp-hal = { version = "1.2.2", features = ["esp32c3", "unstable"] }
-esp-println = { version = "0.18.0", default-features = false, features = ["esp32c3", "no-op"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32c3", "uart"] }
 nb = "1.1.0"
 rp-extio-firmware = { path = "../firmware" }
 rp-extio-wire = { path = "../wire" }

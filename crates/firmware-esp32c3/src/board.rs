@@ -2,7 +2,7 @@ use embedded_hal::pwm::SetDutyCycle;
 use esp_hal::{
 	analog::adc::{Adc, AdcConfig, AdcPin, Attenuation},
 	delay::Delay,
-	gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, OutputConfig, Pull},
+	gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, NoPin, OutputConfig, Pull},
 	i2c::master::{Config as I2cConfig, Error as I2cError, I2c},
 	ledc::{
 		Ledc, LowSpeed,
@@ -19,8 +19,8 @@ use esp_hal::{
 	uart::{Config as UartConfig, DataBits, Parity, StopBits, Uart},
 };
 use rp_extio_firmware::{
-	Board, BusFailure, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ,
-	SPI_MIN_SPEED_HZ, SPI_NO_CS, SpiOutcome, cumulative_spi_delay_ns,
+	Board, BusFailure, SPI_CPHA, SPI_CPOL, SPI_CS_HIGH, SPI_LSB_FIRST, SPI_MAX_SPEED_HZ, SPI_NO_CS,
+	SpiOutcome, cumulative_spi_delay_ns,
 };
 use rp_extio_wire::{
 	BoardKind, DeviceIdentity, ESP32_C3_GPIO_PINS, GPIO_BIAS_NONE, GPIO_BIAS_PULL_DOWN,
@@ -29,6 +29,9 @@ use rp_extio_wire::{
 	PinValidationError, PwmState, SPI_CS_CHANGE, SpiRequest, Status, UART_PARITY_EVEN,
 	UART_PARITY_NONE, UART_PARITY_ODD,
 };
+
+const SPI_CLOCK_HZ: u32 = 80_000_000;
+const ESP32_C3_SPI_MIN_SPEED_HZ: u32 = SPI_CLOCK_HZ / (16 * 64);
 
 pub struct Esp32C3Board<'d> {
 	pins: [Flex<'d>; ESP32_C3_GPIO_PINS.len()],
@@ -103,7 +106,11 @@ impl<'d> Esp32C3Board<'d> {
 				.unwrap(),
 			),
 			spi: Some(
-				Spi::new(spi, SpiConfig::default().with_frequency(Rate::from_khz(50))).unwrap(),
+				Spi::new(
+					spi,
+					SpiConfig::default().with_frequency(Rate::from_hz(ESP32_C3_SPI_MIN_SPEED_HZ)),
+				)
+				.unwrap(),
 			),
 			uart: Some(Uart::new(uart, UartConfig::default()).unwrap()),
 			adc: Adc::new(adc, adc_config),
@@ -142,6 +149,16 @@ impl<'d> Esp32C3Board<'d> {
 	}
 
 	fn apply_peripheral_routes(&mut self) {
+		self.i2c = Some(self.i2c.take().unwrap().with_sda(NoPin).with_scl(NoPin));
+		self.spi = Some(
+			self.spi
+				.take()
+				.unwrap()
+				.with_sck(NoPin)
+				.with_mosi(NoPin)
+				.with_miso(NoPin),
+		);
+		self.uart = Some(self.uart.take().unwrap().with_tx(NoPin).with_rx(NoPin));
 		if self.pin_map.is_enabled(rp_extio_wire::Peripheral::I2c0) {
 			let mut sda = self.route_flex(self.pin_map.i2c_sda[0]);
 			let mut scl = self.route_flex(self.pin_map.i2c_scl[0]);
@@ -253,6 +270,26 @@ impl<'d> Esp32C3Board<'d> {
 			.copied()
 			.ok_or_else(|| BusFailure::new(Status::Unsupported, 0))
 	}
+
+	fn spi_effective_speed_hz(requested: u32) -> u32 {
+		let minimum_divider = SPI_CLOCK_HZ.div_ceil(requested).max(2);
+		if minimum_divider <= 64 {
+			return SPI_CLOCK_HZ / minimum_divider;
+		}
+		let mut best_divider = 16 * 64;
+		let mut pre = minimum_divider.div_ceil(64);
+		while pre <= 16 {
+			let divider = pre * minimum_divider.div_ceil(pre);
+			if divider < best_divider {
+				best_divider = divider;
+				if divider == minimum_divider {
+					break;
+				}
+			}
+			pre += 1;
+		}
+		SPI_CLOCK_HZ / best_divider
+	}
 }
 
 impl Board for Esp32C3Board<'_> {
@@ -274,6 +311,14 @@ impl Board for Esp32C3Board<'_> {
 
 	fn i2c_flags(&self) -> u16 {
 		I2C_READ
+	}
+
+	fn spi_min_speed_hz(&self) -> u32 {
+		ESP32_C3_SPI_MIN_SPEED_HZ
+	}
+
+	fn spi_max_speed_hz(&self) -> u32 {
+		SPI_MAX_SPEED_HZ
 	}
 
 	fn adc_reference_mv(&self) -> u16 {
@@ -462,7 +507,7 @@ impl Board for Esp32C3Board<'_> {
 			for (index, segment) in request.segments().enumerate() {
 				let segment =
 					segment.map_err(|_| BusFailure::new(Status::BadFrame, offset as u32))?;
-				if !(SPI_MIN_SPEED_HZ..=SPI_MAX_SPEED_HZ).contains(&segment.speed_hz) {
+				if !(ESP32_C3_SPI_MIN_SPEED_HZ..=SPI_MAX_SPEED_HZ).contains(&segment.speed_hz) {
 					return Err(BusFailure::new(Status::Unsupported, offset as u32));
 				}
 				let config = SpiConfig::default()
@@ -487,7 +532,7 @@ impl Board for Esp32C3Board<'_> {
 				}
 				offset = end;
 				outcome.completed_bytes = offset as u32;
-				outcome.effective_speeds[index] = segment.speed_hz;
+				outcome.effective_speeds[index] = Self::spi_effective_speed_hz(segment.speed_hz);
 				delay.delay_nanos(segment.delay_ns);
 				if let Some(cs_pin) = cs_pin.filter(|_| segment.flags & SPI_CS_CHANGE != 0) {
 					self.pin_mut(cs_pin)

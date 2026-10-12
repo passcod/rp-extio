@@ -12,10 +12,10 @@ pub const MAX_I2C_MESSAGES: usize = 16;
 pub const MAX_SPI_SEGMENTS: usize = 16;
 pub const USB_REPLY: u8 = 1;
 pub const SERIAL_FRAME_VERSION: u8 = 1;
-pub const CONTROL_SERIAL_BAUD: u32 = 921_600;
+pub const CONTROL_SERIAL_BAUD: u32 = 115_200;
 pub const MAX_SERIAL_BODY: usize = USB_HEADER_LEN + MAX_PAYLOAD;
 pub const MAX_SERIAL_RAW_FRAME: usize = 8 + MAX_SERIAL_BODY + 4;
-pub const MAX_SERIAL_FRAME: usize = MAX_SERIAL_RAW_FRAME + MAX_SERIAL_RAW_FRAME / 254 + 2;
+pub const MAX_SERIAL_FRAME: usize = MAX_SERIAL_RAW_FRAME + MAX_SERIAL_RAW_FRAME / 254 + 3;
 pub const CAP_GENERAL: u16 = 1;
 pub const CAP_I2C: u16 = 2;
 pub const CAP_SPI: u16 = 3;
@@ -440,15 +440,20 @@ pub fn encode_serial_frame(body: &[u8], output: &mut [u8]) -> Result<usize, Wire
 	raw[8..8 + body.len()].copy_from_slice(body);
 	let checksum = crc32(&raw[..raw_len - 4]);
 	raw[raw_len - 4..raw_len].copy_from_slice(&checksum.to_le_bytes());
-	let encoded = cobs_encode(&raw[..raw_len], output)?;
-	let Some(delimiter) = output.get_mut(encoded) else {
+	let Some(prefix) = output.first_mut() else {
+		return Err(WireError::TooLarge);
+	};
+	*prefix = 0;
+	let encoded = cobs_encode(&raw[..raw_len], &mut output[1..])?;
+	let Some(delimiter) = output.get_mut(encoded + 1) else {
 		return Err(WireError::TooLarge);
 	};
 	*delimiter = 0;
-	Ok(encoded + 1)
+	Ok(encoded + 2)
 }
 
 pub fn decode_serial_frame(encoded: &[u8], body: &mut [u8]) -> Result<usize, WireError> {
+	let encoded = encoded.strip_prefix(&[0]).unwrap_or(encoded);
 	let encoded = encoded.strip_suffix(&[0]).unwrap_or(encoded);
 	let mut raw = [0; MAX_SERIAL_RAW_FRAME];
 	let raw_len = cobs_decode(encoded, &mut raw)?;
@@ -1751,8 +1756,9 @@ mod tests {
 		}
 		let mut encoded = [0; MAX_SERIAL_FRAME];
 		let encoded_len = encode_serial_frame(&body, &mut encoded).unwrap();
+		assert_eq!(encoded[0], 0);
 		assert_eq!(encoded[encoded_len - 1], 0);
-		assert!(!encoded[..encoded_len - 1].contains(&0));
+		assert!(!encoded[1..encoded_len - 1].contains(&0));
 
 		let mut decoded = [0; MAX_SERIAL_BODY];
 		let decoded_len = decode_serial_frame(&encoded[..encoded_len], &mut decoded).unwrap();

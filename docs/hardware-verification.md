@@ -89,6 +89,7 @@ These routes are runtime configurable. GPIO20 and GPIO21 belong to the control
 transport and cannot be reassigned. GPIO2 and GPIO9 are boot-strapping pins;
 GPIO8 is also a strapping pin and drives the onboard RGB LED. Avoid external
 pulls on those pins until ordinary routes have been verified.
+The onboard CP2102N bridge carries the control protocol at 115200 baud.
 
 | Interface | State | GPIO and header |
 | --- | --- | --- |

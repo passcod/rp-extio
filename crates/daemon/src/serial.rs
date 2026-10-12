@@ -24,10 +24,11 @@ use tokio::{
 	io::{AsyncReadExt, AsyncWriteExt},
 	sync::{Mutex, mpsc},
 };
-use tokio_serial::{SerialPortBuilderExt, SerialStream};
+use tokio_serial::{SerialPort, SerialPortBuilderExt, SerialStream};
 
 const SERIAL_DEADLINE: Duration = Duration::from_secs(6);
-const SERIAL_CONNECT_DEADLINE: Duration = Duration::from_millis(500);
+const SERIAL_CONNECT_DEADLINE: Duration = Duration::from_secs(2);
+const SERIAL_BOOT_SETTLE: Duration = Duration::from_millis(300);
 
 pub struct SerialBackend {
 	port: Mutex<SerialStream>,
@@ -47,6 +48,14 @@ impl SerialBackend {
 		let mut port =
 			tokio_serial::new(path.to_string_lossy(), CONTROL_SERIAL_BAUD).open_native_async()?;
 		port.set_exclusive(true)?;
+		// Linux asserts DTR while opening a TTY. On ESP development boards DTR and
+		// RTS feed the automatic boot/reset circuit, so leave both inactive while
+		// the daemon owns the control transport.
+		port.write_data_terminal_ready(false)?;
+		port.write_request_to_send(false)?;
+		// Opening common ESP development-board bridges can pulse the automatic-reset
+		// circuit. Let the application regain UART0 before sending the one-shot HELLO.
+		tokio::time::sleep(SERIAL_BOOT_SETTLE).await;
 		let backend = Arc::new(Self {
 			port: Mutex::new(port),
 			next_request_id: AtomicU64::new(2),
@@ -256,4 +265,24 @@ async fn serial_transfer(
 
 fn invalid(message: &'static str) -> io::Error {
 	io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	#[ignore = "requires RP_EXTIO_SERIAL_TEST pointing to a connected rp-extio serial board"]
+	async fn negotiates_connected_serial_firmware() {
+		let path = std::env::var_os("RP_EXTIO_SERIAL_TEST")
+			.map(std::path::PathBuf::from)
+			.expect("set RP_EXTIO_SERIAL_TEST");
+		let (failed, _failures) = mpsc::unbounded_channel();
+		let (_backend, config) =
+			SerialBackend::connect(&path, DeviceKey::Serial(path.clone()), failed)
+				.await
+				.unwrap();
+		assert_eq!(config.transport, TransportKind::Serial);
+		assert_eq!(config.board_kind, rp_extio_wire::BoardKind::Esp32C3DevKitM1);
+	}
 }

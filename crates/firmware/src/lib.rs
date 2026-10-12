@@ -84,6 +84,14 @@ pub trait Board {
 		rp_extio_wire::I2C_READ | rp_extio_wire::I2C_TEN_BIT
 	}
 
+	fn spi_min_speed_hz(&self) -> u32 {
+		SPI_MIN_SPEED_HZ
+	}
+
+	fn spi_max_speed_hz(&self) -> u32 {
+		SPI_MAX_SPEED_HZ
+	}
+
 	fn uart_daemon_backed(&self, _bus: u8) -> bool {
 		false
 	}
@@ -259,8 +267,8 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
 				out.push(bus as u8)?;
 				out.push(chip_selects)?;
 				out.u16(SPI_SUPPORTED_MODES)?;
-				out.u32(SPI_MIN_SPEED_HZ)?;
-				out.u32(SPI_MAX_SPEED_HZ)?;
+				out.u32(board.spi_min_speed_hz())?;
+				out.u32(board.spi_max_speed_hz())?;
 				out.push(pins.spi_sck[bus])?;
 				out.push(pins.spi_mosi[bus])?;
 				out.push(pins.spi_miso[bus])?;
