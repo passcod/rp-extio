@@ -592,6 +592,7 @@ mod tests {
 		gpio_outputs: u32,
 		gpio_pull_ups: u32,
 		gpio_pull_downs: u32,
+		led_state: LedState,
 		pin_map: PinMap,
 		generation: u64,
 	}
@@ -748,6 +749,15 @@ mod tests {
 
 		fn pwm_apply(&mut self, state: PwmState) -> Result<PwmState, BusFailure> {
 			self.pwm_state(state.channel)?;
+			Ok(state)
+		}
+
+		fn onboard_led_state(&self) -> Result<LedState, BusFailure> {
+			Ok(self.led_state)
+		}
+
+		fn onboard_led_apply(&mut self, state: LedState) -> Result<LedState, BusFailure> {
+			self.led_state = state;
 			Ok(state)
 		}
 	}
@@ -948,6 +958,38 @@ mod tests {
 		);
 		assert_eq!(reply.header.status, Status::Ok);
 		assert_eq!(&response[..reply.payload_len], &[3, 0, 2, 0, b'a', b'b']);
+	}
+
+	#[test]
+	fn onboard_led_dispatches_state_updates_and_reads() {
+		let mut board = Stub::default();
+		let mut response = [0; MAX_PAYLOAD];
+		let state = LedState {
+			index: 0,
+			red: 12,
+			green: 34,
+			blue: 56,
+		};
+		let set = state.encode(LED_SET);
+		let reply = dispatch(
+			header(Operation::OnboardLed, set.len()),
+			&set,
+			&mut board,
+			&mut response,
+		);
+		assert_eq!(reply.header.status, Status::Ok);
+		assert_eq!(&response[..reply.payload_len], &set);
+		assert_eq!(board.led_state, state);
+
+		let get = LedState::OFF.encode(LED_GET);
+		let reply = dispatch(
+			header(Operation::OnboardLed, get.len()),
+			&get,
+			&mut board,
+			&mut response,
+		);
+		assert_eq!(reply.header.status, Status::Ok);
+		assert_eq!(&response[..reply.payload_len], &state.encode(LED_GET));
 	}
 
 	#[test]

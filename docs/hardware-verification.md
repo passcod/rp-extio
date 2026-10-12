@@ -561,8 +561,8 @@ attached board, and the identity must remain the eFuse MAC across resets and
 host USB paths.
 
 With no external wiring attached, run `scripts/verify-esp32c3-smoke.sh SERIAL`
-for a reversible RGB, GPIO, ADC, PWM, and UART tty smoke test. It restores the
-default map and turns the RGB LED off before exiting.
+for a reversible I²C NACK, SPI transfer, RGB, GPIO, ADC, PWM, and UART tty smoke
+test. It restores the default map and turns the RGB LED off before exiting.
 
 ### GPIO and onboard RGB LED
 

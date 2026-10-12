@@ -24,6 +24,40 @@ for _ in {1..25}; do
 done
 "$ctl" show "$identity" >/dev/null
 
+board=$("$ctl" --json show "$identity")
+i2c_bus=$(jq -er '.board.i2c_buses[0]' <<<"$board")
+spi_bus=$(jq -er '.board.spi_buses[0]' <<<"$board")
+if i2c_output=$(i2ctransfer -y "$i2c_bus" w1@0x55 0x00 2>&1); then
+	echo "unexpected I2C acknowledgement from unused address 0x55" >&2
+	exit 1
+else
+	printf 'I2C negative-path transaction: %s\n' "$i2c_output"
+fi
+python3 - "/dev/spidev$spi_bus.0" "/dev/spidev$spi_bus.1" <<'PY'
+import ctypes
+import fcntl
+import os
+import struct
+import sys
+
+SPI_IOC_MESSAGE_1 = 0x40206B00
+for path in sys.argv[1:]:
+    tx = (ctypes.c_ubyte * 4)(0x9f, 0x55, 0xaa, 0x00)
+    rx = (ctypes.c_ubyte * 4)()
+    transfer = bytearray(struct.pack(
+        "=QQIIHBBBBBB",
+        ctypes.addressof(tx), ctypes.addressof(rx), len(tx), 500_000,
+        0, 8, 0, 0, 0, 0, 0,
+    ))
+    fd = os.open(path, os.O_RDWR)
+    try:
+        fcntl.ioctl(fd, SPI_IOC_MESSAGE_1, transfer, True)
+    finally:
+        os.close(fd)
+    print(f"SPI transaction {path}: {bytes(rx).hex()}")
+PY
+"$ctl" show "$identity" >/dev/null
+
 for rgb in "255 0 0" "0 255 0" "0 0 255"; do
 	read -r red green blue <<<"$rgb"
 	"$ctl" onboard-led rgb "$identity" "$red" "$green" "$blue"
