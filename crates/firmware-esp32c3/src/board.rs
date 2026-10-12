@@ -1,8 +1,16 @@
+use embedded_hal::pwm::SetDutyCycle;
 use esp_hal::{
+	analog::adc::{Adc, AdcConfig, AdcPin, Attenuation},
 	delay::Delay,
 	gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, OutputConfig, Pull},
 	i2c::master::{Config as I2cConfig, Error as I2cError, I2c},
-	peripherals::{I2C0, SPI2},
+	ledc::{
+		Ledc, LowSpeed,
+		channel::{self, ChannelIFace},
+		timer::{self, TimerIFace},
+	},
+	peripherals::{ADC1, GPIO0, GPIO1, GPIO2, GPIO3, GPIO4, I2C0, LEDC, RMT, SPI2},
+	rmt::{Channel, PulseCode, Rmt, Tx, TxChannelConfig, TxChannelCreator},
 	spi::{
 		BitOrder, Mode,
 		master::{Config as SpiConfig, Spi},
@@ -25,6 +33,16 @@ pub struct Esp32C3Board<'d> {
 	route_pins: [AnyPin<'d>; ESP32_C3_GPIO_PINS.len()],
 	i2c: Option<I2c<'d, esp_hal::Blocking>>,
 	spi: Option<Spi<'d, esp_hal::Blocking>>,
+	adc: Adc<'d, ADC1<'d>, esp_hal::Blocking>,
+	adc0: AdcPin<GPIO0<'d>, ADC1<'d>>,
+	adc1: AdcPin<GPIO1<'d>, ADC1<'d>>,
+	adc2: AdcPin<GPIO2<'d>, ADC1<'d>>,
+	adc3: AdcPin<GPIO3<'d>, ADC1<'d>>,
+	adc4: AdcPin<GPIO4<'d>, ADC1<'d>>,
+	ledc: Ledc<'d>,
+	pwm_states: [PwmState; rp_extio_wire::ESP32_C3_PWM_CHANNEL_COUNT],
+	led_channel: Option<Channel<'d, esp_hal::Blocking, Tx>>,
+	led_state: LedState,
 	pin_map: PinMap,
 	generation: u64,
 	identity: DeviceIdentity,
@@ -38,6 +56,10 @@ impl<'d> Esp32C3Board<'d> {
 		route_pins: [AnyPin<'d>; ESP32_C3_GPIO_PINS.len()],
 		i2c: I2C0<'d>,
 		spi: SPI2<'d>,
+		adc: ADC1<'d>,
+		adc_pins: (GPIO0<'d>, GPIO1<'d>, GPIO2<'d>, GPIO3<'d>, GPIO4<'d>),
+		ledc: LEDC<'d>,
+		rmt: RMT<'d>,
 		identity: DeviceIdentity,
 	) -> Self {
 		let mut pins = core::array::from_fn(|index| {
@@ -50,6 +72,22 @@ impl<'d> Esp32C3Board<'d> {
 			pin.set_input_enable(true);
 			pin.apply_input_config(&InputConfig::default());
 		}
+		let mut adc_config = AdcConfig::new();
+		let adc0 = adc_config.enable_pin(adc_pins.0, Attenuation::_11dB);
+		let adc1 = adc_config.enable_pin(adc_pins.1, Attenuation::_11dB);
+		let adc2 = adc_config.enable_pin(adc_pins.2, Attenuation::_11dB);
+		let adc3 = adc_config.enable_pin(adc_pins.3, Attenuation::_11dB);
+		let adc4 = adc_config.enable_pin(adc_pins.4, Attenuation::_11dB);
+		let rmt = Rmt::new(rmt, Rate::from_mhz(80)).unwrap();
+		let led_channel = rmt
+			.channel0
+			.configure_tx(
+				&TxChannelConfig::default()
+					.with_clk_divider(1)
+					.with_idle_output(true)
+					.with_idle_output_level(Level::Low),
+			)
+			.unwrap();
 		let mut board = Self {
 			pins,
 			route_pins,
@@ -63,6 +101,22 @@ impl<'d> Esp32C3Board<'d> {
 			spi: Some(
 				Spi::new(spi, SpiConfig::default().with_frequency(Rate::from_khz(50))).unwrap(),
 			),
+			adc: Adc::new(adc, adc_config),
+			adc0,
+			adc1,
+			adc2,
+			adc3,
+			adc4,
+			ledc: Ledc::new(ledc),
+			pwm_states: core::array::from_fn(|channel| PwmState {
+				channel: channel as u8,
+				enabled: false,
+				inverted: false,
+				period_ns: 0,
+				duty_ns: 0,
+			}),
+			led_channel: Some(led_channel),
+			led_state: LedState::OFF,
 			pin_map: rp_extio_wire::ESP32_C3_DEFAULT_PIN_MAP,
 			generation: 0,
 			identity,
@@ -124,6 +178,44 @@ impl<'d> Esp32C3Board<'d> {
 		BusFailure::new(status, completed)
 	}
 
+	fn onboard_led_busy(&self) -> bool {
+		rp_extio_wire::PinSignal::ALL
+			.iter()
+			.copied()
+			.any(|signal| self.pin_map.is_signal_enabled(signal) && self.pin_map.pin(signal) == 8)
+	}
+
+	fn transmit_led(&mut self, state: LedState) -> Result<(), BusFailure> {
+		let mut pulses = [PulseCode::end_marker(); 25];
+		let bytes = [state.green, state.red, state.blue];
+		for (index, bit) in bytes
+			.iter()
+			.flat_map(|byte| (0..8).rev().map(move |shift| byte & (1 << shift) != 0))
+			.enumerate()
+		{
+			pulses[index] = if bit {
+				PulseCode::new(Level::High, 64, Level::Low, 36)
+			} else {
+				PulseCode::new(Level::High, 32, Level::Low, 68)
+			};
+		}
+		pulses[24] = PulseCode::new(Level::Low, 5_000, Level::Low, 0);
+		let channel = self
+			.led_channel
+			.take()
+			.unwrap()
+			.with_pin(self.route_flex(8));
+		let transaction = channel.transmit(&pulses).map_err(|(_, channel)| {
+			self.led_channel = Some(channel);
+			BusFailure::new(Status::IoError, 0)
+		})?;
+		self.led_channel = Some(transaction.wait().map_err(|(_, channel)| {
+			self.led_channel = Some(channel);
+			BusFailure::new(Status::IoError, 0)
+		})?);
+		Ok(())
+	}
+
 	fn pin(&self, number: u8) -> &Flex<'d> {
 		&self.pins[ESP32_C3_GPIO_PINS
 			.iter()
@@ -170,19 +262,40 @@ impl Board for Esp32C3Board<'_> {
 		I2C_READ
 	}
 
+	fn adc_reference_mv(&self) -> u16 {
+		2_500
+	}
+
+	fn pwm_clock_hz(&self) -> u32 {
+		80_000_000
+	}
+
 	fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError> {
 		map.validate_for(BoardKind::Esp32C3DevKitM1.profile())?;
-		for pin in &mut self.pins {
+		for &number in &ESP32_C3_GPIO_PINS {
+			let mut pin = self.route_flex(number);
 			pin.set_low();
 			pin.set_output_enable(false);
 			pin.set_input_enable(true);
 			pin.apply_input_config(&InputConfig::default());
+		}
+		for channel in 0..rp_extio_wire::ESP32_C3_ADC_CHANNEL_COUNT {
+			if map.adc_enabled & (1 << channel) != 0 {
+				self.pin_mut(map.adc_pins[channel]).set_input_enable(false);
+			}
 		}
 		self.pin_map = map;
 		self.generation = generation;
 		self.gpio_outputs = 0;
 		self.gpio_pull_ups = 0;
 		self.gpio_pull_downs = 0;
+		self.pwm_states = core::array::from_fn(|channel| PwmState {
+			channel: channel as u8,
+			enabled: false,
+			inverted: false,
+			period_ns: 0,
+			duty_ns: 0,
+		});
 		self.apply_peripheral_routes();
 		Ok(())
 	}
@@ -382,19 +495,137 @@ impl Board for Esp32C3Board<'_> {
 		self.gpio_pull_downs
 	}
 
-	fn adc_read(&mut self, _channel: u8) -> Result<u16, BusFailure> {
-		Err(BusFailure::new(Status::Unsupported, 0))
+	fn adc_read(&mut self, channel: u8) -> Result<u16, BusFailure> {
+		if channel as usize >= rp_extio_wire::ESP32_C3_ADC_CHANNEL_COUNT
+			|| self.pin_map.adc_enabled & (1 << channel) == 0
+		{
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		}
+		let value = match channel {
+			0 => nb::block!(self.adc.read_oneshot(&mut self.adc0)),
+			1 => nb::block!(self.adc.read_oneshot(&mut self.adc1)),
+			2 => nb::block!(self.adc.read_oneshot(&mut self.adc2)),
+			3 => nb::block!(self.adc.read_oneshot(&mut self.adc3)),
+			4 => nb::block!(self.adc.read_oneshot(&mut self.adc4)),
+			_ => unreachable!(),
+		};
+		value.map_err(|_| BusFailure::new(Status::IoError, 0))
 	}
 
-	fn pwm_state(&self, _channel: u8) -> Result<PwmState, BusFailure> {
-		Err(BusFailure::new(Status::Unsupported, 0))
+	fn pwm_state(&self, channel: u8) -> Result<PwmState, BusFailure> {
+		if channel as usize >= rp_extio_wire::ESP32_C3_PWM_CHANNEL_COUNT
+			|| self.pin_map.pwm_enabled & (1 << channel) == 0
+		{
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		}
+		Ok(self.pwm_states[channel as usize])
 	}
 
-	fn pwm_apply(&mut self, _state: PwmState) -> Result<PwmState, BusFailure> {
-		Err(BusFailure::new(Status::Unsupported, 0))
+	fn pwm_apply(&mut self, requested: PwmState) -> Result<PwmState, BusFailure> {
+		const CHANNELS: [channel::Number; 6] = [
+			channel::Number::Channel0,
+			channel::Number::Channel1,
+			channel::Number::Channel2,
+			channel::Number::Channel3,
+			channel::Number::Channel4,
+			channel::Number::Channel5,
+		];
+		const TIMERS: [timer::Number; 4] = [
+			timer::Number::Timer0,
+			timer::Number::Timer1,
+			timer::Number::Timer2,
+			timer::Number::Timer3,
+		];
+		let channel = requested.channel as usize;
+		if channel >= rp_extio_wire::ESP32_C3_PWM_CHANNEL_COUNT
+			|| self.pin_map.pwm_enabled & (1 << channel) == 0
+		{
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		}
+		let timer_index = channel % 4;
+		if let Some(sibling) = (0..rp_extio_wire::ESP32_C3_PWM_CHANNEL_COUNT).find(|&other| {
+			other != channel
+				&& other % 4 == timer_index
+				&& self.pwm_states[other].enabled
+				&& self.pwm_states[other].period_ns != requested.period_ns
+		}) {
+			return Err(BusFailure::new(Status::Busy, sibling as u32));
+		}
+		let pin_number = self.pin_map.pwm_pins[channel];
+		if !requested.enabled {
+			let mut pin = self.route_flex(pin_number);
+			pin.set_level(if requested.inverted {
+				Level::High
+			} else {
+				Level::Low
+			});
+			pin.set_output_enable(true);
+			self.pwm_states[channel] = requested;
+			return Ok(requested);
+		}
+		let frequency = (1_000_000_000_u64 / requested.period_ns) as u32;
+		if frequency == 0 {
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		}
+		let mut selected = None;
+		for bits in (1..=14).rev() {
+			let divisor = ((80_000_000_u64 << 8) / u64::from(frequency)) >> bits;
+			if (256..=0x3ffff).contains(&divisor) {
+				selected = Some((bits, timer::config::Duty::try_from(bits).unwrap()));
+				break;
+			}
+		}
+		let Some((bits, duty_resolution)) = selected else {
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		};
+		let mut timer = self.ledc.timer::<LowSpeed>(TIMERS[timer_index]);
+		timer
+			.configure(timer::config::Config {
+				duty: duty_resolution,
+				clock_source: timer::LSClockSource::APBClk,
+				frequency: Rate::from_hz(frequency),
+			})
+			.map_err(|_| BusFailure::new(Status::Unsupported, 0))?;
+		let output = self
+			.route_flex(pin_number)
+			.into_peripheral_output()
+			.with_output_inverter(requested.inverted);
+		let mut output = self.ledc.channel::<LowSpeed>(CHANNELS[channel], output);
+		output
+			.configure(channel::config::Config {
+				timer: &timer,
+				duty_pct: 0,
+				drive_mode: DriveMode::PushPull,
+			})
+			.map_err(|_| BusFailure::new(Status::IoError, 0))?;
+		let maximum = (1_u64 << bits) - 1;
+		let duty = requested.duty_ns.saturating_mul(maximum) / requested.period_ns;
+		output
+			.set_duty_cycle(duty as u16)
+			.map_err(|_| BusFailure::new(Status::IoError, 0))?;
+		let effective_period = 1_000_000_000_u64 / u64::from(frequency);
+		let state = PwmState {
+			period_ns: effective_period,
+			duty_ns: duty * effective_period / maximum,
+			..requested
+		};
+		self.pwm_states[channel] = state;
+		Ok(state)
 	}
 
 	fn onboard_led_state(&self) -> Result<LedState, BusFailure> {
-		Err(BusFailure::new(Status::Unsupported, 0))
+		if self.onboard_led_busy() {
+			return Err(BusFailure::new(Status::Busy, 0));
+		}
+		Ok(self.led_state)
+	}
+
+	fn onboard_led_apply(&mut self, state: LedState) -> Result<LedState, BusFailure> {
+		if self.onboard_led_busy() {
+			return Err(BusFailure::new(Status::Busy, 0));
+		}
+		self.transmit_led(state)?;
+		self.led_state = state;
+		Ok(state)
 	}
 }

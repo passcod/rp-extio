@@ -2447,10 +2447,12 @@ dependencies = [
 name = "rp-extio-firmware-esp32c3"
 version = "0.1.0"
 dependencies = [
+ "embedded-hal 1.0.0",
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
  "esp-println",
+ "nb 1.1.0",
  "rp-extio-firmware",
  "rp-extio-wire",
  "static_cell",

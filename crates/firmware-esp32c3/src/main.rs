@@ -38,6 +38,11 @@ fn main() -> ! {
 	.with_rx(peripherals.GPIO20)
 	.with_tx(peripherals.GPIO21);
 	let identity = device_identity();
+	let adc0 = unsafe { peripherals.GPIO0.clone_unchecked() };
+	let adc1 = unsafe { peripherals.GPIO1.clone_unchecked() };
+	let adc2 = unsafe { peripherals.GPIO2.clone_unchecked() };
+	let adc3 = unsafe { peripherals.GPIO3.clone_unchecked() };
+	let adc4 = unsafe { peripherals.GPIO4.clone_unchecked() };
 	let mut board = Esp32C3Board::new(
 		[
 			peripherals.GPIO0.degrade(),
@@ -56,6 +61,10 @@ fn main() -> ! {
 		],
 		peripherals.I2C0,
 		peripherals.SPI2,
+		peripherals.ADC1,
+		(adc0, adc1, adc2, adc3, adc4),
+		peripherals.LEDC,
+		peripherals.RMT,
 		identity,
 	);
 	let buffers = BUFFERS.init(Buffers {
