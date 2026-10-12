@@ -8,10 +8,10 @@ use rp_extio_firmware::{
     SPI_MIN_SPEED_HZ, SPI_NO_CS, SpiOutcome, UART_BAUD, cumulative_spi_delay_ns,
 };
 use rp_extio_wire::{
-    ClockSource, GPIO_BIAS_NONE, GPIO_BIAS_PULL_DOWN, GPIO_BIAS_PULL_UP, GPIO_DIRECTION_INPUT,
-    GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET, GPIO_SET_BIAS, HEADER_PINS,
-    I2C_READ, I2C_TEN_BIT, I2cRequest, Peripheral, PinMap, PinSignal, PinValidationError,
-    PinValidationKind, PwmState, SpiRequest, Status, clock_divider,
+    BoardKind, ClockSource, DeviceIdentity, GPIO_BIAS_NONE, GPIO_BIAS_PULL_DOWN, GPIO_BIAS_PULL_UP,
+    GPIO_DIRECTION_INPUT, GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET,
+    GPIO_SET_BIAS, HEADER_PINS, I2C_READ, I2C_TEN_BIT, I2cRequest, Peripheral, PinMap, PinSignal,
+    PinValidationError, PinValidationKind, PwmState, SpiRequest, Status, clock_divider,
 };
 
 const TRANSACTION_DEADLINE_US: u64 = 5_000_000;
@@ -33,6 +33,7 @@ pub struct Pico2Board<'d> {
     pwm_states: [PwmState; rp_extio_wire::PWM_CHANNEL_COUNT],
     pin_map: PinMap,
     generation: u64,
+    identity: DeviceIdentity,
 }
 
 impl<'d> Pico2Board<'d> {
@@ -44,6 +45,7 @@ impl<'d> Pico2Board<'d> {
         uart1: Peri<'d, UART1>,
         adc: Peri<'d, ADC>,
         pin_map: PinMap,
+        identity: DeviceIdentity,
     ) -> Self {
         for pin in &mut pins {
             pin.set_as_input();
@@ -69,6 +71,7 @@ impl<'d> Pico2Board<'d> {
             }),
             pin_map,
             generation: 0,
+            identity,
         };
         board.apply_pin_map(pin_map);
         board
@@ -556,6 +559,14 @@ impl<'d> Pico2Board<'d> {
 }
 
 impl Board for Pico2Board<'_> {
+    fn board_kind(&self) -> BoardKind {
+        BoardKind::Pico2
+    }
+
+    fn identity(&self) -> DeviceIdentity {
+        self.identity
+    }
+
     fn pin_map(&self) -> &PinMap {
         &self.pin_map
     }

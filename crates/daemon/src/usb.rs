@@ -14,9 +14,10 @@ use nusb::{
     transfer::{Buffer, Bulk, Direction, In, Out},
 };
 use rp_extio_wire::{
-    CAP_ADC, CAP_CLOCK, CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART,
-    MAX_GPIO_LINES, MAX_PAYLOAD, Operation, PIN_MAP_LEN, Peripheral, PinMap, PinValidationError,
-    PwmState, Status, USB_HEADER_LEN, UsbHeader,
+    BOARD_CAPABILITY_VERSION, BoardKind, CAP_ADC, CAP_BOARD, CAP_CLOCK, CAP_GENERAL, CAP_GPIO,
+    CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity, MAX_GPIO_LINES,
+    MAX_PAYLOAD, Operation, PIN_MAP_LEN, Peripheral, PinMap, PinValidationError, PwmState, Status,
+    TransportKind, USB_HEADER_LEN, UsbHeader,
 };
 use std::{
     collections::HashMap,
@@ -37,6 +38,9 @@ const USB_DRAIN_QUIET: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct NegotiatedConfig {
+    pub board_kind: BoardKind,
+    pub transport: TransportKind,
+    pub identity: DeviceIdentity,
     pub registration: RegistrationConfig,
     pub pin_map: PinMap,
     pub generation: u64,
@@ -163,6 +167,12 @@ async fn try_connect(
             return;
         }
     };
+    if config.transport != TransportKind::UsbBulk || config.identity.as_bytes() != serial.as_bytes()
+    {
+        eprintln!("refusing rp-extio USB device {serial}: firmware identity or transport mismatch");
+        backend.disconnect().await;
+        return;
+    }
     if let Some(map) = desired.get(&serial)
         && map != config.pin_map
     {
@@ -1733,6 +1743,7 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
 fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut offset = 0;
     let mut generation = None;
+    let mut board = None;
     let mut i2c: [Option<(u32, [u8; 2])>; 2] = [None; 2];
     let mut spi: [Option<(u32, u32, u32, u16, Vec<u8>)>; 2] = [None, None];
     let mut uart: [Option<[u8; 2]>; 2] = [None; 2];
@@ -1765,6 +1776,27 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
                     return Err(invalid("incompatible general capability"));
                 }
                 generation = Some(u64::from_le_bytes(value[8..16].try_into().unwrap()));
+            }
+            CAP_BOARD => {
+                let identity_len = value.get(3).copied().unwrap_or(0) as usize;
+                if board.is_some()
+                    || value.len() != 12 + identity_len
+                    || value.first().copied() != Some(BOARD_CAPABILITY_VERSION)
+                {
+                    return Err(invalid("invalid board capability"));
+                }
+                let kind =
+                    BoardKind::try_from(value[1]).map_err(|_| invalid("unsupported board kind"))?;
+                let transport = TransportKind::try_from(value[2])
+                    .map_err(|_| invalid("unsupported transport kind"))?;
+                let profile = kind.profile();
+                let supported = u64::from_le_bytes(value[4..12].try_into().unwrap());
+                if transport != profile.transport() || supported != profile.supported_signals() {
+                    return Err(invalid("board capability does not match known profile"));
+                }
+                let identity = DeviceIdentity::new(&value[12..])
+                    .map_err(|_| invalid("invalid board identity"))?;
+                board = Some((kind, transport, identity));
             }
             CAP_I2C => {
                 let bus = value.first().copied().unwrap_or(u8::MAX) as usize;
@@ -1885,6 +1917,9 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     }
     let gpio_pins = gpio_pins.ok_or_else(|| invalid("GPIO capability missing"))?;
     let generation = generation.ok_or_else(|| invalid("general capability missing"))?;
+    let (board_kind, transport, identity) =
+        board.ok_or_else(|| invalid("board capability missing"))?;
+    let profile = board_kind.profile();
     let pin_map = pin_map.ok_or_else(|| invalid("pin configuration capability missing"))?;
     let (adc_bits, adc_reference_mv, adc_pins) =
         adc.ok_or_else(|| invalid("ADC capability missing"))?;
@@ -1892,7 +1927,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
         pwm.ok_or_else(|| invalid("PWM capability missing"))?;
     let clocks = clocks.ok_or_else(|| invalid("clock capability missing"))?;
     pin_map
-        .validate()
+        .validate_for(profile)
         .map_err(|_| invalid("invalid peripheral pin map"))?;
     for bus in 0..2 {
         let expected_i2c = pin_map.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]);
@@ -1922,7 +1957,7 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
             return Err(invalid("capability pins do not match pin configuration"));
         }
     }
-    let expected_gpio = pin_map.gpio_pins().unwrap();
+    let expected_gpio = pin_map.gpio_pins_for(profile).unwrap();
     if expected_gpio.as_slice() != gpio_pins.as_slice() {
         return Err(invalid("GPIO capability does not match peripheral pins"));
     }
@@ -1949,6 +1984,9 @@ fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut gpio_array = [0; MAX_GPIO_LINES];
     gpio_array[..gpio_pins.len()].copy_from_slice(&gpio_pins);
     Ok(NegotiatedConfig {
+        board_kind,
+        transport,
+        identity,
         registration: RegistrationConfig {
             i2c: i2c.map(|capability| capability.map(|(speed_hz, _)| I2cRegistration { speed_hz })),
             spi: spi.map(|capability| {
@@ -2020,6 +2058,17 @@ mod tests {
         general.extend_from_slice(&(MAX_PAYLOAD as u32).to_le_bytes());
         general.extend_from_slice(&0_u64.to_le_bytes());
         capability_record(&mut payload, CAP_GENERAL, &general);
+        let profile = BoardKind::Pico2.profile();
+        let identity = b"TEST";
+        let mut board = vec![
+            BOARD_CAPABILITY_VERSION,
+            BoardKind::Pico2 as u8,
+            TransportKind::UsbBulk as u8,
+            identity.len() as u8,
+        ];
+        board.extend_from_slice(&profile.supported_signals().to_le_bytes());
+        board.extend_from_slice(identity);
+        capability_record(&mut payload, CAP_BOARD, &board);
         for bus in 0..2 {
             if map.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {
                 let mut value = vec![bus as u8, 0];
@@ -2082,6 +2131,9 @@ mod tests {
         assert_eq!(
             parse_capabilities(&capabilities(rp_extio_wire::DEFAULT_PIN_MAP)).unwrap(),
             NegotiatedConfig {
+                board_kind: BoardKind::Pico2,
+                transport: TransportKind::UsbBulk,
+                identity: DeviceIdentity::new(b"TEST").unwrap(),
                 registration: RegistrationConfig::PICO2,
                 pin_map: rp_extio_wire::DEFAULT_PIN_MAP,
                 generation: 0,

@@ -2,7 +2,7 @@
 
 pub const USB_MAGIC: [u8; 4] = *b"RPXB";
 pub const KERNEL_MAGIC: [u8; 4] = *b"RPKD";
-pub const VERSION_MAJOR: u8 = 3;
+pub const VERSION_MAJOR: u8 = 4;
 pub const VERSION_MINOR: u8 = 0;
 pub const USB_HEADER_LEN: usize = 24;
 pub const KERNEL_HEADER_LEN: usize = 32;
@@ -20,6 +20,9 @@ pub const CAP_PIN_CONFIG: u16 = 6;
 pub const CAP_ADC: u16 = 7;
 pub const CAP_PWM: u16 = 8;
 pub const CAP_CLOCK: u16 = 9;
+pub const CAP_BOARD: u16 = 10;
+pub const BOARD_CAPABILITY_VERSION: u8 = 1;
+pub const MAX_DEVICE_ID_LEN: usize = 16;
 pub const GPIO_GET: u8 = 1;
 pub const GPIO_SET: u8 = 2;
 pub const GPIO_DIRECTION_INPUT: u8 = 3;
@@ -171,6 +174,19 @@ impl BoardProfile {
         }
     }
 
+    pub const fn supported_signals(self) -> u64 {
+        let mut mask = 0;
+        let mut index = 0;
+        while index < PinSignal::ALL.len() {
+            let signal = PinSignal::ALL[index];
+            if self.supports(signal) {
+                mask |= 1 << signal as u8;
+            }
+            index += 1;
+        }
+        mask
+    }
+
     pub const fn valid_pins(self, signal: PinSignal) -> &'static [u8] {
         match self.kind {
             BoardKind::Pico2 => signal.valid_pins(),
@@ -194,6 +210,41 @@ impl BoardProfile {
 
     const fn requires_adjacent_i2c_pins(self) -> bool {
         matches!(self.kind, BoardKind::Pico2)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct DeviceIdentity {
+    bytes: [u8; MAX_DEVICE_ID_LEN],
+    len: u8,
+}
+
+impl DeviceIdentity {
+    pub const EMPTY: Self = Self {
+        bytes: [0; MAX_DEVICE_ID_LEN],
+        len: 0,
+    };
+
+    pub fn new(value: &[u8]) -> Result<Self, WireError> {
+        if value.is_empty() || value.len() > MAX_DEVICE_ID_LEN {
+            return Err(WireError::Invalid);
+        }
+        let mut identity = Self::EMPTY;
+        identity.bytes[..value.len()].copy_from_slice(value);
+        identity.len = value.len() as u8;
+        Ok(identity)
+    }
+
+    pub const fn len(self) -> usize {
+        self.len as usize
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.len == 0
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len()]
     }
 }
 

@@ -1,9 +1,10 @@
 #![no_std]
 
 use rp_extio_wire::{
-    CAP_ADC, CAP_CLOCK, CAP_GENERAL, CAP_GPIO, CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART,
-    I2cRequest, MAX_PAYLOAD, Operation, PWM_APPLY, PWM_GET, Peripheral, PinMap, PinValidationError,
-    PinValidationKind, PwmState, SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError, Writer,
+    BOARD_CAPABILITY_VERSION, BoardKind, CAP_ADC, CAP_BOARD, CAP_CLOCK, CAP_GENERAL, CAP_GPIO,
+    CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity, I2cRequest, MAX_PAYLOAD,
+    Operation, PWM_APPLY, PWM_GET, Peripheral, PinMap, PinValidationError, PinValidationKind,
+    PwmState, SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError, Writer,
 };
 
 pub use rp_extio_wire::DEFAULT_PIN_MAP;
@@ -53,6 +54,14 @@ impl Default for SpiOutcome {
 }
 
 pub trait Board {
+    fn board_kind(&self) -> BoardKind {
+        BoardKind::Pico2
+    }
+
+    fn identity(&self) -> DeviceIdentity {
+        DeviceIdentity::EMPTY
+    }
+
     fn pin_map(&self) -> &PinMap;
 
     fn generation(&self) -> u64;
@@ -151,9 +160,11 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
         return Err(BusFailure::new(Status::BadFrame, 0));
     }
 
+    let profile = board.board_kind().profile();
+    let identity = board.identity();
     let pins = board.pin_map();
     let gpio_pins = pins
-        .gpio_pins()
+        .gpio_pins_for(profile)
         .map_err(|_| BusFailure::new(Status::IoError, 0))?;
     let mut out = Writer::new(response);
     record(&mut out, CAP_GENERAL, 16, |out| {
@@ -163,6 +174,14 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
         out.push(0)?;
         out.u32(MAX_PAYLOAD as u32)?;
         out.extend(&board.generation().to_le_bytes())
+    })?;
+    record(&mut out, CAP_BOARD, 12 + identity.len() as u16, |out| {
+        out.push(BOARD_CAPABILITY_VERSION)?;
+        out.push(board.board_kind() as u8)?;
+        out.push(profile.transport() as u8)?;
+        out.push(identity.len() as u8)?;
+        out.extend(&profile.supported_signals().to_le_bytes())?;
+        out.extend(identity.as_bytes())
     })?;
     for bus in 0..2 {
         if pins.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {

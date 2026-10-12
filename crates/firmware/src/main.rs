@@ -15,7 +15,9 @@ use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Config, Handler};
 use pico2::Pico2Board;
 use rp_extio_firmware::{Board, dispatch};
-use rp_extio_wire::{MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader, WireError};
+use rp_extio_wire::{
+    DeviceIdentity, MAX_PAYLOAD, Operation, Status, USB_HEADER_LEN, UsbHeader, WireError,
+};
 use static_cell::StaticCell;
 
 include!(concat!(env!("OUT_DIR"), "/pin_config.rs"));
@@ -128,6 +130,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
     let peripherals = embassy_rp::init(Default::default());
     let serial_bytes = SERIAL_BYTES.init([0; 16]);
     encode_serial(embassy_rp::otp::get_chipid().unwrap_or(0), serial_bytes);
+    let identity = DeviceIdentity::new(serial_bytes).unwrap();
     let serial = unsafe { core::str::from_utf8_unchecked(serial_bytes) };
 
     let driver = usb::Driver::new(peripherals.USB, Irqs);
@@ -217,6 +220,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
         peripherals.UART1,
         peripherals.ADC,
         PIN_MAP,
+        identity,
     );
     let bridge_buffers = BRIDGE_BUFFERS.init(BridgeBuffers::new());
     join(
