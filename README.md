@@ -41,6 +41,43 @@ and set the duty cycle of PWMs and frequency of clock outputs, if available.
 Peripheral configurations are remembered on the host device (your computer) per device
 serial, and are not saved to the devboard itself.
 
+The TUI provides a "live" pinout layout so you don't even need to refer to the datasheet:
+
+```
+┌rp-extio───────────────────────────────────────────────────────────────────────────────────┐
+│ROUTE  ● 58CF79E3A184 · ESP32-C3-DevKitM-1 v1.6  gen 0  I²C 0:27,1:-  SPI 0:0,1:-  UART 0:-│
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+┌Signals · Tab selects────────┐┌ESP32-C3-DevKitM-1 v1.6 · front (components up) · USB end ▲─┐
+│○ UART1 TX   GP6             ││                       USB CONNECTOR                        │
+│○ UART1 RX   GP7             ││ 1 GND                   ●│      │●                   GND  1│
+│● I²C0 SDA   GP4             ││ 2 3V3                   ●│      │●  GPIO      TX/IO21/TRANS│
+│● I²C0 SCL   GP5             ││ 3 3V3                   ●│      │●  GPIO      RX/IO20/TRANS│
+│● SPI0 MISO  GP3             ││ 4 IO2/ADC2/STRAP  GPIO   │      │●                   GND  4│
+│● SPI0 SCK   GP6             ││ 5 IO3/ADC3    S0-MI     ●│      │●  GPIO       IO9/STRAP  5│
+│● SPI0 MOSI  GP7             ││ 6 GND                   ●│      │●  GPIO         IO8/RGB  6│
+│● SPI0 CS0   GP10            ││ 7 RST                   ●│ ESP  │●                   GND  7│
+│● SPI0 CS1   GP1             ││ 8 GND                   ●│ C3   │●  S0-MO            IO7  8│
+│○ ADC0       GP0             ││ 9 IO0/ADC0    GPIO      ●│      │●  S0-CK            IO6  9│
+│○ ADC1       GP1             ││10 IO1/ADC1    S0-C1     ●│      │●  I0-SCL           IO5 10│
+│○ ADC2       GP2             ││11 IO10        S0-C0     ●│      │●  I0-SDA      IO4/ADC4 11│
+│○ ADC3       GP3             ││12 GND                   ●│      │●                   GND 12│
+│○ ADC4       GP4             ││13 5V                    ●│      │●  GPIO      IO18/USB D− 1│
+│○ PWM0 A     GP0             ││14 5V                    ●│      │●  GPIO      IO19/USB D+ 1│
+│○ PWM0 B     GP1             ││15 GND                   ●│      │●                   GND 15│
+│○ PWM1 A     GP2             ││                       USB CONNECTOR                        │
+│○ PWM1 B     GP3             ││                                                            │
+│○ PWM2 A     GP4             ││                                                            │
+│○ PWM2 B     GP5             ││                                                            │
+│                             ││                                                            │
+└─────────────────────────────┘└────────────────────────────────────────────────────────────┘
+┌Status─────────────────────────────────────────────────────────────────────────────────────┐
+│Route: UART1 TX → GP6 · disabled · grouped assignment                                      │
+│active map; move to a valid highlighted GPIO and press Enter to assign                     │
+└───────────────────────────────────────────────────────────────────────────────────────────┘
+arrows pin  Tab signal  Enter assign  e enable  g grouped  a apply
+v operate mode  f flip  s clock source  +/- clock Hz  d defaults  u undo  r refresh  q quit
+```
+
 ## Setup
 
 Right now only building and setting up from source is supported. Pre-builds may come later.
