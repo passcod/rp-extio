@@ -3,7 +3,7 @@ use crate::{
 	control::{
 		BoardInfo, ButtonConfig, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo,
 		GpioStartup, LedInfo, PwmInfo, validate_buttons_for, validate_gpio_startup_for,
-		validate_pwm_startup,
+		validate_pwm_startup_for,
 	},
 	kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
 	serial::SerialBackend,
@@ -315,6 +315,7 @@ async fn try_connect(
 	if let Err(error) = apply_pwm_startup(
 		backend.as_ref(),
 		&config.pin_map,
+		config.board_kind.profile(),
 		desired.pwm_startup(&serial),
 	)
 	.await
@@ -406,6 +407,7 @@ async fn try_connect_serial(
 		|| apply_pwm_startup(
 			backend.as_ref(),
 			&config.pin_map,
+			config.board_kind.profile(),
 			desired.pwm_startup(&serial),
 		)
 		.await
@@ -471,6 +473,25 @@ fn board_info(
 	BoardInfo {
 		serial: device.serial.clone(),
 		connected: true,
+		board_kind: match device.config.board_kind {
+			BoardKind::Pico2 => "pico2",
+			BoardKind::Esp32C3DevKitM1 => "esp32_c3_devkitm_1",
+		}
+		.into(),
+		board_name: device.config.board_kind.profile().name().into(),
+		transport: match device.config.transport {
+			TransportKind::UsbBulk => "usb_bulk",
+			TransportKind::Serial => "serial",
+		}
+		.into(),
+		supported_signals: device.config.board_kind.profile().supported_signals(),
+		adc_channels: device.config.registration.adc.map_or(0, |adc| adc.channels),
+		pwm_channels: device.config.registration.pwm.map_or(0, |pwm| pwm.channels),
+		adc_reference_mv: device
+			.config
+			.registration
+			.adc
+			.map_or(0, |adc| adc.reference_mv),
 		active: Some(device.config.pin_map.into()),
 		desired: desired.map(Into::into),
 		generation: Some(device.config.generation),
@@ -488,14 +509,34 @@ fn board_info(
 
 fn disconnected_info(
 	serial: String,
+	board_kind: BoardKind,
 	desired: PinMap,
 	gpio_startup: &[GpioStartup],
 	pwm_startup: &[PwmInfo],
 	buttons: &[ButtonConfig],
 ) -> BoardInfo {
+	let profile = board_kind.profile();
 	BoardInfo {
 		serial,
 		connected: false,
+		board_kind: match board_kind {
+			BoardKind::Pico2 => "pico2",
+			BoardKind::Esp32C3DevKitM1 => "esp32_c3_devkitm_1",
+		}
+		.into(),
+		board_name: profile.name().into(),
+		transport: match profile.transport() {
+			TransportKind::UsbBulk => "usb_bulk",
+			TransportKind::Serial => "serial",
+		}
+		.into(),
+		supported_signals: profile.supported_signals(),
+		adc_channels: profile.adc_channel_count() as u8,
+		pwm_channels: profile.pwm_channel_count() as u8,
+		adc_reference_mv: match board_kind {
+			BoardKind::Pico2 => 3_300,
+			BoardKind::Esp32C3DevKitM1 => 2_500,
+		},
 		active: None,
 		desired: Some(desired.into()),
 		generation: None,
@@ -541,6 +582,7 @@ async fn handle_control(
 				if !devices.values().any(|device| device.serial == *serial) {
 					boards.push(disconnected_info(
 						serial.clone(),
+						store.board_kind(serial),
 						*map,
 						store.gpio_startup(serial),
 						store.pwm_startup(serial),
@@ -566,6 +608,7 @@ async fn handle_control(
 				ControlResponse::Board {
 					board: disconnected_info(
 						serial.clone(),
+						store.board_kind(&serial),
 						map,
 						store.gpio_startup(&serial),
 						store.pwm_startup(&serial),
@@ -584,7 +627,7 @@ async fn handle_control(
 			let map = PinMap::from(map);
 			let profile = find_device(devices, &serial)
 				.map(|id| devices[&id].config.board_kind.profile())
-				.unwrap_or_else(|| BoardKind::Pico2.profile());
+				.unwrap_or_else(|| store.board_kind(&serial).profile());
 			if let Err(error) = map.validate_for(profile) {
 				return ControlResponse::validation(error);
 			}
@@ -593,7 +636,9 @@ async fn handle_control(
 			{
 				return ControlResponse::error("gpio_startup_conflict", message);
 			}
-			if let Err(message) = validate_pwm_startup(&map, store.pwm_startup(&serial)) {
+			if let Err(message) =
+				validate_pwm_startup_for(&map, profile, store.pwm_startup(&serial))
+			{
 				return ControlResponse::error("pwm_startup_conflict", message);
 			}
 			if let Err(message) = validate_buttons_for(&map, profile, store.buttons(&serial)) {
@@ -604,7 +649,7 @@ async fn handle_control(
 		ControlRequest::Default { serial, generation } => {
 			let default = find_device(devices, &serial)
 				.map(|id| devices[&id].config.board_kind.profile().default_pin_map())
-				.unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
+				.unwrap_or_else(|| store.board_kind(&serial).profile().default_pin_map());
 			change_map(kernel, store, devices, serial, generation, default, true).await
 		}
 		ControlRequest::Reload => {
@@ -616,7 +661,7 @@ async fn handle_control(
 				.filter_map(|(id, device)| {
 					let desired = store
 						.get(&device.serial)
-						.unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
+						.unwrap_or_else(|| device.config.board_kind.profile().default_pin_map());
 					(desired != device.config.pin_map).then_some((id.clone(), desired))
 				})
 				.collect();
@@ -648,6 +693,7 @@ async fn handle_control(
 				if let Err(response) = apply_pwm_startup(
 					device.backend.as_ref(),
 					&device.config.pin_map,
+					device.config.board_kind.profile(),
 					store.pwm_startup(&device.serial),
 				)
 				.await
@@ -708,7 +754,11 @@ async fn handle_control(
 				return disconnected(&serial);
 			};
 			let device = &devices[&id];
-			if let Err(message) = validate_pwm_startup(&device.config.pin_map, &[pwm]) {
+			if let Err(message) = validate_pwm_startup_for(
+				&device.config.pin_map,
+				device.config.board_kind.profile(),
+				&[pwm],
+			) {
 				return ControlResponse::error("invalid_pwm", message);
 			}
 			let previous = store
@@ -717,14 +767,25 @@ async fn handle_control(
 				.copied()
 				.find(|entry| entry.channel == pwm.channel);
 			let had_board = store.contains_board(&serial);
-			if let Err(error) = store.set_pwm_startup(serial.clone(), pwm) {
+			if let Err(error) =
+				store.set_pwm_startup_for(serial.clone(), device.config.board_kind, pwm)
+			{
 				return ControlResponse::error("configuration", error.to_string());
 			}
-			if let Err(response) =
-				apply_one_pwm_startup(device.backend.as_ref(), &device.config.pin_map, pwm).await
+			if let Err(response) = apply_one_pwm_startup(
+				device.backend.as_ref(),
+				&device.config.pin_map,
+				device.config.board_kind.profile(),
+				pwm,
+			)
+			.await
 			{
 				let rollback = match previous {
-					Some(previous) => store.set_pwm_startup(serial.clone(), previous),
+					Some(previous) => store.set_pwm_startup_for(
+						serial.clone(),
+						device.config.board_kind,
+						previous,
+					),
 					None if had_board => store.clear_pwm_startup(&serial, pwm.channel),
 					None => store.remove(&serial),
 				};
@@ -772,6 +833,7 @@ async fn handle_control(
 				ControlResponse::Board {
 					board: disconnected_info(
 						serial.clone(),
+						store.board_kind(&serial),
 						store.get(&serial).unwrap(),
 						store.gpio_startup(&serial),
 						store.pwm_startup(&serial),
@@ -878,7 +940,9 @@ async fn handle_control(
 				.copied()
 				.find(|entry| entry.pin() == startup.pin());
 			let had_board = store.contains_board(&serial);
-			if let Err(error) = store.set_gpio_startup(serial.clone(), startup) {
+			if let Err(error) =
+				store.set_gpio_startup_for(serial.clone(), device.config.board_kind, startup)
+			{
 				return ControlResponse::error("configuration", error.to_string());
 			}
 			if let Err(response) = apply_one_gpio_startup(
@@ -890,7 +954,11 @@ async fn handle_control(
 			.await
 			{
 				let rollback = match previous {
-					Some(previous) => store.set_gpio_startup(serial.clone(), previous),
+					Some(previous) => store.set_gpio_startup_for(
+						serial.clone(),
+						device.config.board_kind,
+						previous,
+					),
 					None if had_board => store.clear_gpio_startup(&serial, startup.pin()),
 					None => store.remove(&serial),
 				};
@@ -938,6 +1006,7 @@ async fn handle_control(
 				ControlResponse::Board {
 					board: disconnected_info(
 						serial.clone(),
+						store.board_kind(&serial),
 						store.get(&serial).unwrap(),
 						store.gpio_startup(&serial),
 						store.pwm_startup(&serial),
@@ -953,7 +1022,10 @@ async fn handle_control(
 					format!("unknown rp-extio board {serial}"),
 				);
 			}
-			if let Err(error) = store.set_button(serial.clone(), button) {
+			let kind = find_device(devices, &serial)
+				.map(|id| devices[&id].config.board_kind)
+				.unwrap_or_else(|| store.board_kind(&serial));
+			if let Err(error) = store.set_button_for(serial.clone(), kind, button) {
 				return ControlResponse::error("configuration", error.to_string());
 			}
 			button_board_response(store, devices, serial)
@@ -989,6 +1061,7 @@ fn button_board_response(
 	} else {
 		disconnected_info(
 			serial.clone(),
+			store.board_kind(&serial),
 			store.get(&serial).unwrap(),
 			store.gpio_startup(&serial),
 			store.pwm_startup(&serial),
@@ -1205,9 +1278,10 @@ async fn apply_gpio_startup(
 async fn apply_one_pwm_startup(
 	backend: &dyn Backend,
 	map: &PinMap,
+	profile: rp_extio_wire::BoardProfile,
 	pwm: PwmInfo,
 ) -> Result<(), ControlResponse> {
-	validate_pwm_startup(map, &[pwm])
+	validate_pwm_startup_for(map, profile, &[pwm])
 		.map_err(|message| ControlResponse::error("pwm_startup_conflict", message))?;
 	let reply = backend
 		.transact(Transaction::Pwm {
@@ -1240,19 +1314,23 @@ async fn apply_one_pwm_startup(
 async fn apply_pwm_startup(
 	backend: &dyn Backend,
 	map: &PinMap,
+	profile: rp_extio_wire::BoardProfile,
 	entries: &[PwmInfo],
 ) -> Result<(), ControlResponse> {
-	validate_pwm_startup(map, entries)
+	validate_pwm_startup_for(map, profile, entries)
 		.map_err(|message| ControlResponse::error("pwm_startup_conflict", message))?;
-	let mut affected_slices = 0_u8;
+	let mut affected_timers = 0_u16;
 	for entry in entries {
-		affected_slices |= 1 << (entry.channel / 2);
+		affected_timers |= 1 << profile.pwm_timer(entry.channel as usize).unwrap();
 	}
-	for channel in 0..rp_extio_wire::PWM_CHANNEL_COUNT as u8 {
-		if affected_slices & (1 << (channel / 2)) != 0 && map.pwm_enabled & (1 << channel) != 0 {
+	for channel in 0..profile.pwm_channel_count() as u8 {
+		if affected_timers & (1 << profile.pwm_timer(channel as usize).unwrap()) != 0
+			&& map.pwm_enabled & (1 << channel) != 0
+		{
 			apply_one_pwm_startup(
 				backend,
 				map,
+				profile,
 				PwmInfo {
 					channel,
 					enabled: false,
@@ -1265,7 +1343,7 @@ async fn apply_pwm_startup(
 		}
 	}
 	for &entry in entries {
-		apply_one_pwm_startup(backend, map, entry).await?;
+		apply_one_pwm_startup(backend, map, profile, entry).await?;
 	}
 	Ok(())
 }
@@ -1377,7 +1455,7 @@ async fn change_map(
 	let persisted = if remove_persistent {
 		store.remove(&serial)
 	} else {
-		store.set(serial.clone(), map)
+		store.set_for(serial.clone(), active.board_kind, map)
 	};
 	if let Err(error) = persisted {
 		if needs_reconfigure && let Some(id) = find_device(devices, &serial) {
@@ -1453,8 +1531,13 @@ async fn reconfigure(
 		backend.disconnect().await;
 		return Err(response);
 	}
-	if let Err(response) =
-		apply_pwm_startup(backend.as_ref(), &new_config.pin_map, pwm_startup).await
+	if let Err(response) = apply_pwm_startup(
+		backend.as_ref(),
+		&new_config.pin_map,
+		new_config.board_kind.profile(),
+		pwm_startup,
+	)
+	.await
 	{
 		backend.disconnect().await;
 		return Err(response);
@@ -2732,6 +2815,7 @@ mod tests {
 		apply_pwm_startup(
 			&backend,
 			&map,
+			BoardKind::Pico2.profile(),
 			&[
 				PwmInfo {
 					channel: 6,

@@ -12,9 +12,9 @@ use ratatui::{
 	text::{Line, Span},
 	widgets::{Block, Borders, Clear, List, ListItem, Paragraph},
 };
-use rp_extio_wire::{
-	ClockSource, DEFAULT_PIN_MAP, Peripheral, PinMap, PinSignal, PinValidationError,
-};
+#[cfg(test)]
+use rp_extio_wire::DEFAULT_PIN_MAP;
+use rp_extio_wire::{BoardKind, ClockSource, Peripheral, PinMap, PinSignal, PinValidationError};
 use rp_extiod::control::{
 	BoardInfo, ButtonConfig, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup,
 	PwmInfo, signal_name,
@@ -26,6 +26,7 @@ use std::{
 };
 
 const HEADER_ROWS: usize = 20;
+const ESP32_C3_HEADER_ROWS: usize = 15;
 const MIN_WIDTH: u16 = 54;
 const MIN_HEIGHT: u16 = 14;
 const WIDE_WIDTH: u16 = 92;
@@ -100,6 +101,42 @@ const RIGHT_HEADER: [HeaderPin; HEADER_ROWS] = [
 	HeaderPin::fixed(23, "GND"),
 	HeaderPin::gpio(22, 17, "GP17"),
 	HeaderPin::gpio(21, 16, "GP16"),
+];
+
+const ESP32_C3_LEFT_HEADER: [HeaderPin; ESP32_C3_HEADER_ROWS] = [
+	HeaderPin::fixed(1, "GND"),
+	HeaderPin::fixed(2, "3V3"),
+	HeaderPin::fixed(3, "3V3"),
+	HeaderPin::gpio(4, 2, "IO2/ADC2/STRAP"),
+	HeaderPin::gpio(5, 3, "IO3/ADC3"),
+	HeaderPin::fixed(6, "GND"),
+	HeaderPin::fixed(7, "RST"),
+	HeaderPin::fixed(8, "GND"),
+	HeaderPin::gpio(9, 0, "IO0/ADC0"),
+	HeaderPin::gpio(10, 1, "IO1/ADC1"),
+	HeaderPin::gpio(11, 10, "IO10"),
+	HeaderPin::fixed(12, "GND"),
+	HeaderPin::fixed(13, "5V"),
+	HeaderPin::fixed(14, "5V"),
+	HeaderPin::fixed(15, "GND"),
+];
+
+const ESP32_C3_RIGHT_HEADER: [HeaderPin; ESP32_C3_HEADER_ROWS] = [
+	HeaderPin::fixed(1, "GND"),
+	HeaderPin::gpio(2, 21, "TX/IO21/TRANSPORT"),
+	HeaderPin::gpio(3, 20, "RX/IO20/TRANSPORT"),
+	HeaderPin::fixed(4, "GND"),
+	HeaderPin::gpio(5, 9, "IO9/STRAP"),
+	HeaderPin::gpio(6, 8, "IO8/RGB"),
+	HeaderPin::fixed(7, "GND"),
+	HeaderPin::gpio(8, 7, "IO7"),
+	HeaderPin::gpio(9, 6, "IO6"),
+	HeaderPin::gpio(10, 5, "IO5"),
+	HeaderPin::gpio(11, 4, "IO4/ADC4"),
+	HeaderPin::fixed(12, "GND"),
+	HeaderPin::gpio(13, 18, "IO18/USB D−"),
+	HeaderPin::gpio(14, 19, "IO19/USB D+"),
+	HeaderPin::fixed(15, "GND"),
 ];
 
 struct TerminalGuard;
@@ -178,6 +215,29 @@ struct App {
 }
 
 impl App {
+	fn board_kind(&self) -> BoardKind {
+		if self
+			.current()
+			.is_some_and(|board| board.board_kind == "esp32_c3_devkitm_1")
+		{
+			BoardKind::Esp32C3DevKitM1
+		} else {
+			BoardKind::Pico2
+		}
+	}
+
+	fn headers(&self) -> (&'static [HeaderPin], &'static [HeaderPin]) {
+		match self.board_kind() {
+			BoardKind::Pico2 => (&LEFT_HEADER, &RIGHT_HEADER),
+			BoardKind::Esp32C3DevKitM1 => (&ESP32_C3_LEFT_HEADER, &ESP32_C3_RIGHT_HEADER),
+		}
+	}
+
+	fn signal_supported(&self, signal: PinSignal) -> bool {
+		self.current().map_or(true, |board| {
+			board.supported_signals & (1 << signal as u8) != 0
+		})
+	}
 	fn current(&self) -> Option<&BoardInfo> {
 		self.boards.get(self.board)
 	}
@@ -192,10 +252,11 @@ impl App {
 	}
 
 	fn selected_pin(&self) -> HeaderPin {
+		let (left, right) = self.headers();
 		if self.cursor_side == 0 {
-			LEFT_HEADER[self.cursor_row]
+			left[self.cursor_row]
 		} else {
-			RIGHT_HEADER[self.cursor_row]
+			right[self.cursor_row]
 		}
 	}
 
@@ -271,6 +332,9 @@ impl App {
 	fn load_current(&mut self) {
 		self.edited = self.active_map();
 		self.default_pending = false;
+		if !self.signal_supported(self.selected_signal()) {
+			self.cycle_signal(1);
+		}
 		self.move_to_signal_pin();
 		self.clear_message();
 	}
@@ -285,8 +349,13 @@ impl App {
 	}
 
 	fn cycle_signal(&mut self, delta: isize) {
-		self.signal =
-			(self.signal as isize + delta).rem_euclid(PinSignal::ALL.len() as isize) as usize;
+		loop {
+			self.signal =
+				(self.signal as isize + delta).rem_euclid(PinSignal::ALL.len() as isize) as usize;
+			if self.signal_supported(self.selected_signal()) {
+				break;
+			}
+		}
 		if self.mode == UiMode::Operate {
 			self.operate_selection = OperateSelection::Signal;
 		}
@@ -301,7 +370,8 @@ impl App {
 			return;
 		};
 		let gpio = map.pin(self.selected_signal());
-		if let Some((row, side)) = find_gpio(gpio) {
+		let (left, right) = self.headers();
+		if let Some((row, side)) = find_gpio_in(gpio, left, right) {
 			self.cursor_row = row;
 			self.cursor_side = side;
 		}
@@ -313,8 +383,9 @@ impl App {
 		} else {
 			side_delta
 		};
+		let rows = self.headers().0.len();
 		self.cursor_row =
-			(self.cursor_row as isize + row_delta).clamp(0, HEADER_ROWS as isize - 1) as usize;
+			(self.cursor_row as isize + row_delta).clamp(0, rows as isize - 1) as usize;
 		self.cursor_side = (self.cursor_side as isize + side_delta).clamp(0, 1) as usize;
 		if self.mode == UiMode::Operate {
 			self.operate_selection = OperateSelection::Pin;
@@ -343,7 +414,8 @@ impl App {
 			self.message_error = true;
 			return;
 		};
-		if !signal.valid_pins().contains(&gpio) {
+		let profile = self.board_kind().profile();
+		if !profile.valid_pins(signal).contains(&gpio) {
 			self.message = format!("GP{gpio} is not a valid route for {}", signal_name(signal));
 			self.message_error = true;
 			return;
@@ -357,31 +429,32 @@ impl App {
 		if auto_enabled {
 			map.set_signal_enabled(signal, true);
 		}
-		let (candidate, moved_group) = match preferred_routed_map(map, signal, gpio, self.grouped) {
-			Ok(candidate) => candidate,
-			Err(RouteError::Incomplete(message)) => {
-				self.message = message.into();
-				self.message_error = true;
-				return;
-			}
-			Err(RouteError::Invalid(error)) => {
-				self.message = if auto_enabled {
-					format!(
-						"cannot assign and enable {}: {}",
-						enable_target(signal),
-						rp_extiod::control::format_validation(error)
-					)
-				} else {
-					format!(
-						"grouped move rejected: {}",
-						rp_extiod::control::format_validation(error)
-					)
-				};
-				self.message_error = true;
-				return;
-			}
-		};
-		if auto_enabled && let Err(error) = candidate.validate() {
+		let (candidate, moved_group) =
+			match preferred_routed_map_for(map, signal, gpio, self.grouped, profile) {
+				Ok(candidate) => candidate,
+				Err(RouteError::Incomplete(message)) => {
+					self.message = message.into();
+					self.message_error = true;
+					return;
+				}
+				Err(RouteError::Invalid(error)) => {
+					self.message = if auto_enabled {
+						format!(
+							"cannot assign and enable {}: {}",
+							enable_target(signal),
+							rp_extiod::control::format_validation(error)
+						)
+					} else {
+						format!(
+							"grouped move rejected: {}",
+							rp_extiod::control::format_validation(error)
+						)
+					};
+					self.message_error = true;
+					return;
+				}
+			};
+		if auto_enabled && let Err(error) = candidate.validate_for(profile) {
 			self.message = format!(
 				"cannot assign and enable {}: {}",
 				enable_target(signal),
@@ -392,7 +465,7 @@ impl App {
 		}
 		self.edited = Some(candidate);
 		self.default_pending = false;
-		if let Err(error) = candidate.validate() {
+		if let Err(error) = candidate.validate_for(profile) {
 			self.message = rp_extiod::control::format_validation(error);
 			self.message_error = true;
 		} else {
@@ -409,6 +482,14 @@ impl App {
 			} else {
 				"draft route updated; press a to apply".into()
 			};
+			if let Some(warning) = profile.pin_warning(gpio) {
+				let warning = match warning {
+					rp_extio_wire::PinWarning::BootStrap => "boot-strapping pin",
+					rp_extio_wire::PinWarning::OnboardRgbLed => "onboard RGB LED pin",
+				};
+				self.message
+					.push_str(&format!("; warning: GP{gpio} is a {warning}"));
+			}
 			self.message_error = false;
 		}
 	}
@@ -433,7 +514,7 @@ impl App {
 		};
 		let enabled = signal_toggle_enabled(candidate, signal);
 		candidate.set_signal_enabled(signal, !enabled);
-		if !enabled && let Err(error) = candidate.validate() {
+		if !enabled && let Err(error) = candidate.validate_for(self.board_kind().profile()) {
 			self.message = format!(
 				"cannot enable {}: {}",
 				enable_target(signal),
@@ -563,7 +644,7 @@ impl App {
 			self.message_error = true;
 			return;
 		}
-		self.edited = Some(DEFAULT_PIN_MAP);
+		self.edited = Some(self.board_kind().profile().default_pin_map());
 		self.default_pending = true;
 		self.move_to_signal_pin();
 		self.message = "firmware defaults loaded into draft; press a to apply".into();
@@ -788,7 +869,7 @@ fn apply(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
 		app.message_error = false;
 		return Ok(());
 	}
-	if let Err(error) = map.validate() {
+	if let Err(error) = map.validate_for(app.board_kind().profile()) {
 		app.message = rp_extiod::control::format_validation(error);
 		app.message_error = true;
 		return Ok(());
@@ -1368,9 +1449,10 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		|| "no boards".into(),
 		|board| {
 			format!(
-				"{} {}  gen {}  I²C {}  SPI {}",
+				"{} {} · {}  gen {}  I²C {}  SPI {}",
 				if board.connected { "●" } else { "○" },
 				board.serial,
+				board.board_name,
 				option(board.generation),
 				bus_numbers(board.i2c_buses),
 				bus_numbers(board.spi_buses),
@@ -1383,28 +1465,33 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		UiMode::Operate => "OPERATE",
 	};
 	frame.render_widget(
-		Paragraph::new(format!("{mode}  {summary}  │  {selection}{dirty}",)).block(
-			Block::default()
-				.title("rp-extio · Pico 2")
-				.borders(Borders::ALL),
-		),
+		Paragraph::new(format!("{mode}  {summary}  │  {selection}{dirty}",))
+			.block(Block::default().title("rp-extio").borders(Borders::ALL)),
 		area,
 	);
 }
 
 fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let active = app.active_map();
-	let visible = usize::from(area.height.saturating_sub(2)).max(1);
-	let start = app
-		.signal
-		.saturating_sub(visible / 2)
-		.min(PinSignal::ALL.len().saturating_sub(visible));
-	let items = PinSignal::ALL
+	let supported = PinSignal::ALL
 		.iter()
+		.copied()
 		.enumerate()
+		.filter(|(_, signal)| app.signal_supported(*signal))
+		.collect::<Vec<_>>();
+	let selected = supported
+		.iter()
+		.position(|(index, _)| *index == app.signal)
+		.unwrap_or(0);
+	let visible = usize::from(area.height.saturating_sub(2)).max(1);
+	let start = selected
+		.saturating_sub(visible / 2)
+		.min(supported.len().saturating_sub(visible));
+	let items = supported
+		.into_iter()
 		.skip(start)
 		.take(visible)
-		.map(|(index, &signal)| {
+		.map(|(index, signal)| {
 			let draft = app.edited.map(|map| map.pin(signal));
 			let active = active.map(|map| map.pin(signal));
 			let enabled = app
@@ -1439,11 +1526,14 @@ fn draw_legend(frame: &mut Frame<'_>, area: Rect, app: &App) {
 }
 
 fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
+	let board_name = app
+		.current()
+		.map_or("Board", |board| board.board_name.as_str());
 	let block = Block::default()
 		.title(if app.flipped {
-			"Pico 2 · back (belly up) · USB end ▲"
+			format!("{board_name} · back (belly up) · USB end ▲")
 		} else {
-			"Pico 2 · front (components up) · USB end ▲"
+			format!("{board_name} · front (components up) · USB end ▲")
 		})
 		.borders(Borders::ALL);
 	let inner = block.inner(area);
@@ -1453,21 +1543,26 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
 		return;
 	}
 
-	let visible = usize::from(inner.height.saturating_sub(2)).min(HEADER_ROWS);
+	let header_rows = app.headers().0.len();
+	let visible = usize::from(inner.height.saturating_sub(2)).min(header_rows);
 	let start = app
 		.screen_cursor_row()
 		.saturating_sub(visible / 2)
-		.min(HEADER_ROWS - visible);
+		.min(header_rows - visible);
 	let end = start + visible;
 	let mut lines = Vec::with_capacity(visible + 2);
 	let top_end = "USB CONNECTOR";
-	let bottom_end = "SWD DEBUG";
-	let top = if visible == HEADER_ROWS {
+	let bottom_end = if app.board_kind() == BoardKind::Pico2 {
+		"SWD DEBUG"
+	} else {
+		"USB CONNECTOR"
+	};
+	let top = if visible == header_rows {
 		top_end.into()
 	} else if start == 0 {
-		format!("{top_end} · rows 1–{end} of {HEADER_ROWS}")
+		format!("{top_end} · rows 1–{end} of {header_rows}")
 	} else {
-		format!("▲ more · header rows {}–{end} of {HEADER_ROWS}", start + 1)
+		format!("▲ more · header rows {}–{end} of {header_rows}", start + 1)
 	};
 	lines.push(centered_line(
 		inner.width,
@@ -1479,7 +1574,7 @@ fn draw_pinout(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	}
 	lines.push(centered_line(
 		inner.width,
-		if end == HEADER_ROWS {
+		if end == header_rows {
 			bottom_end.into()
 		} else {
 			"▼ more header rows".into()
@@ -1495,15 +1590,18 @@ fn pin_row(width: u16, screen_row: usize, app: &App) -> Line<'static> {
 	let left_width = cell_width;
 	let right_width = cell_width + remainder;
 	let center = match screen_row {
-		8 => "│ PICO │",
-		9 => "│  2   │",
+		8 if app.board_kind() == BoardKind::Pico2 => "│ PICO │",
+		9 if app.board_kind() == BoardKind::Pico2 => "│  2   │",
+		6 if app.board_kind() == BoardKind::Esp32C3DevKitM1 => "│ ESP  │",
+		7 if app.board_kind() == BoardKind::Esp32C3DevKitM1 => "│ C3   │",
 		_ => "│      │",
 	};
 	let logical_row = screen_row;
+	let (left_header, right_header) = app.headers();
 	let (left, left_side, right, right_side) = if app.flipped {
-		(RIGHT_HEADER[logical_row], 1, LEFT_HEADER[logical_row], 0)
+		(right_header[logical_row], 1, left_header[logical_row], 0)
 	} else {
-		(LEFT_HEADER[logical_row], 0, RIGHT_HEADER[logical_row], 1)
+		(left_header[logical_row], 0, right_header[logical_row], 1)
 	};
 	Line::from(vec![
 		pin_cell(left, left_width, logical_row, left_side, app, false),
@@ -1620,11 +1718,11 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
 	if app.edited.is_some_and(|map| map.pin(signal) == gpio) {
 		return signal_style(signal).add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
 	}
-	if signal.valid_pins().contains(&gpio)
-		&& app
-			.edited
-			.is_some_and(|map| preferred_routed_map(map, signal, gpio, app.grouped).is_ok())
-	{
+	let profile = app.board_kind().profile();
+	if profile.valid_pins(signal).contains(&gpio)
+		&& app.edited.is_some_and(|map| {
+			preferred_routed_map_for(map, signal, gpio, app.grouped, profile).is_ok()
+		}) {
 		return Style::default().fg(Color::Green);
 	}
 	if let Some(map) = app.edited
@@ -1638,7 +1736,9 @@ fn pin_style(pin: HeaderPin, app: &App, conflict: bool) -> Style {
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
-	let validation = app.edited.and_then(|map| map.validate().err());
+	let validation = app
+		.edited
+		.and_then(|map| map.validate_for(app.board_kind().profile()).err());
 	let message = if !app.message.is_empty() {
 		app.message.clone()
 	} else if let Some(error) = &app.telemetry_error {
@@ -1881,17 +1981,26 @@ fn fit(text: &str, width: usize) -> String {
 	text
 }
 
-fn find_gpio(gpio: u8) -> Option<(usize, usize)> {
-	LEFT_HEADER
+fn find_gpio_in(
+	gpio: u8,
+	left_header: &[HeaderPin],
+	right_header: &[HeaderPin],
+) -> Option<(usize, usize)> {
+	left_header
 		.iter()
 		.position(|pin| pin.gpio == Some(gpio))
 		.map(|row| (row, 0))
 		.or_else(|| {
-			RIGHT_HEADER
+			right_header
 				.iter()
 				.position(|pin| pin.gpio == Some(gpio))
 				.map(|row| (row, 1))
 		})
+}
+
+#[cfg(test)]
+fn find_gpio(gpio: u8) -> Option<(usize, usize)> {
+	find_gpio_in(gpio, &LEFT_HEADER, &RIGHT_HEADER)
 }
 
 fn coupled_signal(signal: PinSignal) -> bool {
@@ -1932,6 +2041,7 @@ fn routed_map(
 	signal: PinSignal,
 	pin: u8,
 	grouped: bool,
+	profile: rp_extio_wire::BoardProfile,
 ) -> Result<PinMap, &'static str> {
 	if !grouped || !coupled_signal(signal) {
 		map.set_pin(signal, pin);
@@ -2033,21 +2143,21 @@ fn routed_map(
 	};
 	if routes
 		.iter()
-		.any(|(signal, pin)| !signal.valid_pins().contains(pin))
+		.any(|(signal, pin)| !profile.valid_pins(*signal).contains(pin))
 	{
 		return Err(match signal {
 			PinSignal::Uart0Tx | PinSignal::Uart0Rx | PinSignal::Uart1Tx | PinSignal::Uart1Rx => {
-				"selected pin has no complete UART pair on the Pico 2 header"
+				"selected pin has no complete UART pair on this board"
 			}
 			PinSignal::I2c0Sda | PinSignal::I2c0Scl | PinSignal::I2c1Sda | PinSignal::I2c1Scl => {
-				"selected pin has no complete I²C pair on the Pico 2 header"
+				"selected pin has no complete I²C pair on this board"
 			}
 			PinSignal::Spi0Miso
 			| PinSignal::Spi0Sck
 			| PinSignal::Spi0Mosi
 			| PinSignal::Spi1Miso
 			| PinSignal::Spi1Sck
-			| PinSignal::Spi1Mosi => "selected pin has no complete SPI group on the Pico 2 header",
+			| PinSignal::Spi1Mosi => "selected pin has no complete SPI group on this board",
 			PinSignal::Spi0Cs0 | PinSignal::Spi0Cs1 | PinSignal::Spi1Cs0 | PinSignal::Spi1Cs1 => {
 				unreachable!()
 			}
@@ -2065,13 +2175,14 @@ enum RouteError {
 	Invalid(PinValidationError),
 }
 
-fn preferred_routed_map(
+fn preferred_routed_map_for(
 	map: PinMap,
 	signal: PinSignal,
 	pin: u8,
 	grouped: bool,
+	profile: rp_extio_wire::BoardProfile,
 ) -> Result<(PinMap, bool), RouteError> {
-	let grouped_candidate = routed_map(map, signal, pin, grouped);
+	let grouped_candidate = routed_map(map, signal, pin, grouped, profile);
 	if !grouped {
 		return grouped_candidate
 			.map(|candidate| (candidate, false))
@@ -2079,7 +2190,7 @@ fn preferred_routed_map(
 	}
 
 	match grouped_candidate {
-		Ok(candidate) if candidate.validate().is_ok() => {
+		Ok(candidate) if candidate.validate_for(profile).is_ok() => {
 			return Ok((candidate, coupled_signal(signal)));
 		}
 		_ => {}
@@ -2087,12 +2198,14 @@ fn preferred_routed_map(
 
 	let mut single = map;
 	single.set_pin(signal, pin);
-	if single.validate().is_ok() {
+	if single.validate_for(profile).is_ok() {
 		return Ok((single, false));
 	}
 
 	match grouped_candidate {
-		Ok(candidate) => Err(RouteError::Invalid(candidate.validate().unwrap_err())),
+		Ok(candidate) => Err(RouteError::Invalid(
+			candidate.validate_for(profile).unwrap_err(),
+		)),
 		Err(message) => Err(RouteError::Incomplete(message)),
 	}
 }
@@ -2265,6 +2378,13 @@ mod tests {
 			boards: vec![BoardInfo {
 				serial: "PICO2".into(),
 				connected: true,
+				board_kind: "pico2".into(),
+				board_name: "Raspberry Pi Pico 2".into(),
+				transport: "usb_bulk".into(),
+				supported_signals: BoardKind::Pico2.profile().supported_signals(),
+				adc_channels: 3,
+				pwm_channels: 16,
+				adc_reference_mv: 3_300,
 				active: Some(DEFAULT_PIN_MAP.into()),
 				desired: Some(DEFAULT_PIN_MAP.into()),
 				generation: Some(4),
@@ -2299,6 +2419,24 @@ mod tests {
 		}
 	}
 
+	fn c3_app() -> App {
+		let mut app = app();
+		let profile = BoardKind::Esp32C3DevKitM1.profile();
+		let map = profile.default_pin_map();
+		app.boards[0].serial = "C3".into();
+		app.boards[0].board_kind = "esp32_c3_devkitm_1".into();
+		app.boards[0].board_name = profile.name().into();
+		app.boards[0].transport = "serial".into();
+		app.boards[0].supported_signals = profile.supported_signals();
+		app.boards[0].adc_channels = 5;
+		app.boards[0].pwm_channels = 6;
+		app.boards[0].adc_reference_mv = 2_500;
+		app.boards[0].active = Some(map.into());
+		app.boards[0].desired = Some(map.into());
+		app.edited = Some(map);
+		app
+	}
+
 	fn rendered(width: u16, height: u16, app: &App) -> String {
 		let backend = TestBackend::new(width, height);
 		let mut terminal = Terminal::new(backend).unwrap();
@@ -2319,6 +2457,39 @@ mod tests {
 		assert_eq!(RIGHT_HEADER[0].physical, 40);
 		assert_eq!(LEFT_HEADER[19].physical, 20);
 		assert_eq!(RIGHT_HEADER[19].physical, 21);
+	}
+
+	#[test]
+	fn c3_diagram_filters_signals_and_routes_matrix_pins() {
+		let mut app = c3_app();
+		assert_eq!(app.headers().0.len(), ESP32_C3_HEADER_ROWS);
+		assert!(!app.signal_supported(PinSignal::Uart0Tx));
+		assert!(app.signal_supported(PinSignal::Uart1Tx));
+		assert!(!app.signal_supported(PinSignal::Pwm3A));
+
+		app.signal = PinSignal::Spi0Sck as usize;
+		(app.cursor_row, app.cursor_side) =
+			find_gpio_in(2, &ESP32_C3_LEFT_HEADER, &ESP32_C3_RIGHT_HEADER).unwrap();
+		app.assign_selected();
+		let map = app.edited.unwrap();
+		assert_eq!(map.spi_sck[0], 2);
+		assert!(
+			map.validate_for(BoardKind::Esp32C3DevKitM1.profile())
+				.is_ok()
+		);
+
+		(app.cursor_row, app.cursor_side) =
+			find_gpio_in(20, &ESP32_C3_LEFT_HEADER, &ESP32_C3_RIGHT_HEADER).unwrap();
+		app.assign_selected();
+		assert!(app.message_error);
+		assert!(app.message.contains("not a valid route"));
+
+		let front = rendered(120, 36, &app);
+		assert!(front.contains("ESP32-C3-DevKitM-1 v1.6"));
+		assert!(front.contains("TX/IO21"));
+		app.flip();
+		let back = rendered(120, 36, &app);
+		assert!(back.contains("back (belly up)"));
 	}
 
 	#[test]

@@ -252,6 +252,18 @@ impl BoardProfile {
 		}
 	}
 
+	/// Hardware timer shared by a PWM channel. Channels on the same timer must
+	/// use the same period while both are enabled.
+	pub const fn pwm_timer(self, channel: usize) -> Option<usize> {
+		if channel >= self.pwm_channel_count() {
+			return None;
+		}
+		Some(match self.kind {
+			BoardKind::Pico2 => channel / 2,
+			BoardKind::Esp32C3DevKitM1 => channel % 4,
+		})
+	}
+
 	pub const fn pin_warning(self, pin: u8) -> Option<PinWarning> {
 		match (self.kind, pin) {
 			(BoardKind::Esp32C3DevKitM1, 2 | 9) => Some(PinWarning::BootStrap),

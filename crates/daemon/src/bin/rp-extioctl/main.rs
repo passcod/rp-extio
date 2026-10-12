@@ -371,6 +371,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 		}
 		Command::Set(arguments) => {
 			let board = client.board(&arguments.serial)?;
+			let profile = match board.board_kind.as_str() {
+				"pico2" => rp_extio_wire::BoardKind::Pico2.profile(),
+				"esp32_c3_devkitm_1" => rp_extio_wire::BoardKind::Esp32C3DevKitM1.profile(),
+				kind => return Err(format!("unsupported board kind {kind}").into()),
+			};
 			let generation = board.generation.ok_or("board is disconnected")?;
 			let active = board.active.ok_or("board has no active pin map")?;
 			let mut map = PinMap::from(active);
@@ -482,7 +487,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 			for (output, frequency) in arguments.clock_hz {
 				map.clock_hz[output] = frequency;
 			}
-			map.validate()
+			map.validate_for(profile)
 				.map_err(rp_extiod::control::format_validation)?;
 			output(
 				client.request(&ControlRequest::Set {
@@ -1388,6 +1393,15 @@ mod tests {
 		let summary = board_summary(&BoardInfo {
 			serial: "ABC".into(),
 			connected: true,
+			board_kind: "pico2".into(),
+			board_name: "Raspberry Pi Pico 2".into(),
+			transport: "usb_bulk".into(),
+			supported_signals: rp_extio_wire::BoardKind::Pico2
+				.profile()
+				.supported_signals(),
+			adc_channels: 3,
+			pwm_channels: 16,
+			adc_reference_mv: 3_300,
 			active: Some(rp_extio_wire::DEFAULT_PIN_MAP.into()),
 			desired: None,
 			generation: Some(3),
