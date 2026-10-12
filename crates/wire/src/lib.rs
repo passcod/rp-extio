@@ -38,6 +38,8 @@ pub const PWM_STATE_LEN: usize = 20;
 pub const HEADER_PINS: [u8; 26] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28,
 ];
+pub const ESP32_C3_GPIO_PINS: [u8; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 18, 19];
+pub const ESP32_C3_TRANSPORT_PINS: [u8; 2] = [20, 21];
 pub const MAX_GPIO_LINES: usize = HEADER_PINS.len();
 pub const ADC_CHANNEL_COUNT: usize = 3;
 pub const PWM_CHANNEL_COUNT: usize = 16;
@@ -46,6 +48,154 @@ pub const PIN_SIGNAL_COUNT: usize = 39;
 pub const PIN_MAP_LEN: usize = PIN_SIGNAL_COUNT + 15;
 const SPI0_CS1_DISABLE_MASK: u8 = 1 << 6;
 const SPI1_CS1_DISABLE_MASK: u8 = 1 << 7;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum BoardKind {
+    Pico2 = 1,
+    Esp32C3DevKitM1 = 2,
+}
+
+impl TryFrom<u8> for BoardKind {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::Pico2),
+            2 => Ok(Self::Esp32C3DevKitM1),
+            _ => Err(WireError::Unsupported),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TransportKind {
+    UsbBulk = 1,
+    Serial = 2,
+}
+
+impl TryFrom<u8> for TransportKind {
+    type Error = WireError;
+
+    fn try_from(value: u8) -> Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Self::UsbBulk),
+            2 => Ok(Self::Serial),
+            _ => Err(WireError::Unsupported),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PinWarning {
+    BootStrap,
+    OnboardRgbLed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct BoardProfile {
+    kind: BoardKind,
+}
+
+impl BoardKind {
+    pub const fn profile(self) -> BoardProfile {
+        BoardProfile { kind: self }
+    }
+}
+
+impl BoardProfile {
+    pub const fn kind(self) -> BoardKind {
+        self.kind
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self.kind {
+            BoardKind::Pico2 => "Raspberry Pi Pico 2",
+            BoardKind::Esp32C3DevKitM1 => "ESP32-C3-DevKitM-1 v1.6",
+        }
+    }
+
+    pub const fn transport(self) -> TransportKind {
+        match self.kind {
+            BoardKind::Pico2 => TransportKind::UsbBulk,
+            BoardKind::Esp32C3DevKitM1 => TransportKind::Serial,
+        }
+    }
+
+    pub const fn gpio_pins(self) -> &'static [u8] {
+        match self.kind {
+            BoardKind::Pico2 => &HEADER_PINS,
+            BoardKind::Esp32C3DevKitM1 => &ESP32_C3_GPIO_PINS,
+        }
+    }
+
+    pub const fn reserved_pins(self) -> &'static [u8] {
+        match self.kind {
+            BoardKind::Pico2 => &[],
+            BoardKind::Esp32C3DevKitM1 => &ESP32_C3_TRANSPORT_PINS,
+        }
+    }
+
+    pub const fn default_pin_map(self) -> PinMap {
+        match self.kind {
+            BoardKind::Pico2 => DEFAULT_PIN_MAP,
+            BoardKind::Esp32C3DevKitM1 => ESP32_C3_DEFAULT_PIN_MAP,
+        }
+    }
+
+    pub const fn supports(self, signal: PinSignal) -> bool {
+        match self.kind {
+            BoardKind::Pico2 => true,
+            BoardKind::Esp32C3DevKitM1 => matches!(
+                signal,
+                PinSignal::Uart1Tx
+                    | PinSignal::Uart1Rx
+                    | PinSignal::I2c0Sda
+                    | PinSignal::I2c0Scl
+                    | PinSignal::Spi0Miso
+                    | PinSignal::Spi0Sck
+                    | PinSignal::Spi0Mosi
+                    | PinSignal::Spi0Cs0
+                    | PinSignal::Spi0Cs1
+                    | PinSignal::Adc0
+                    | PinSignal::Adc1
+                    | PinSignal::Adc2
+                    | PinSignal::Pwm0A
+                    | PinSignal::Pwm0B
+                    | PinSignal::Pwm1A
+                    | PinSignal::Pwm1B
+                    | PinSignal::Pwm2A
+                    | PinSignal::Pwm2B
+            ),
+        }
+    }
+
+    pub const fn valid_pins(self, signal: PinSignal) -> &'static [u8] {
+        match self.kind {
+            BoardKind::Pico2 => signal.valid_pins(),
+            BoardKind::Esp32C3DevKitM1 => match signal {
+                PinSignal::Adc0 => &[0],
+                PinSignal::Adc1 => &[1],
+                PinSignal::Adc2 => &[2],
+                _ if self.supports(signal) => &ESP32_C3_GPIO_PINS,
+                _ => &[],
+            },
+        }
+    }
+
+    pub const fn pin_warning(self, pin: u8) -> Option<PinWarning> {
+        match (self.kind, pin) {
+            (BoardKind::Esp32C3DevKitM1, 2 | 9) => Some(PinWarning::BootStrap),
+            (BoardKind::Esp32C3DevKitM1, 8) => Some(PinWarning::OnboardRgbLed),
+            _ => None,
+        }
+    }
+
+    const fn requires_adjacent_i2c_pins(self) -> bool {
+        matches!(self.kind, BoardKind::Pico2)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ClockDivider {
@@ -462,6 +612,8 @@ pub enum PinValidationKind {
     MismatchedPair = 3,
     DuplicatePin = 4,
     InvalidEnableMask = 5,
+    UnsupportedSignal = 6,
+    ReservedPin = 7,
 }
 
 impl TryFrom<u8> for PinValidationKind {
@@ -474,6 +626,8 @@ impl TryFrom<u8> for PinValidationKind {
             3 => Ok(Self::MismatchedPair),
             4 => Ok(Self::DuplicatePin),
             5 => Ok(Self::InvalidEnableMask),
+            6 => Ok(Self::UnsupportedSignal),
+            7 => Ok(Self::ReservedPin),
             _ => Err(WireError::Invalid),
         }
     }
@@ -555,6 +709,26 @@ pub const DEFAULT_PIN_MAP: PinMap = PinMap {
     pwm_pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
     pwm_enabled: 0,
     clock_pins: [13, 15],
+    clock_enabled: 0,
+    clock_sources: [ClockSource::System, ClockSource::System],
+    clock_hz: [1_000_000, 1_000_000],
+};
+
+pub const ESP32_C3_DEFAULT_PIN_MAP: PinMap = PinMap {
+    uart_tx: [20, 6],
+    uart_rx: [21, 7],
+    i2c_sda: [4, 0],
+    i2c_scl: [5, 1],
+    spi_miso: [3, 0],
+    spi_sck: [6, 1],
+    spi_mosi: [7, 2],
+    spi_chip_selects: [[10, 1], [3, 4]],
+    enabled: Peripheral::I2c0.mask() | Peripheral::Spi0.mask(),
+    adc_pins: [0, 1, 2],
+    adc_enabled: 0,
+    pwm_pins: [0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+    pwm_enabled: 0,
+    clock_pins: [0, 0],
     clock_enabled: 0,
     clock_sources: [ClockSource::System, ClockSource::System],
     clock_hz: [1_000_000, 1_000_000],
@@ -762,6 +936,10 @@ impl PinMap {
     }
 
     pub fn validate(self) -> Result<(), PinValidationError> {
+        self.validate_for(BoardKind::Pico2.profile())
+    }
+
+    pub fn validate_for(self, profile: BoardProfile) -> Result<(), PinValidationError> {
         if self.adc_enabled & !0x07 != 0 || self.clock_enabled & !0x03 != 0 {
             return Err(PinValidationError {
                 kind: PinValidationKind::InvalidEnableMask,
@@ -782,7 +960,26 @@ impl PinMap {
         }
         for signal in PinSignal::ALL {
             let pin = self.pin(signal);
-            if !HEADER_PINS.contains(&pin) {
+            if !profile.supports(signal) {
+                if self.is_signal_enabled(signal) {
+                    return Err(PinValidationError {
+                        kind: PinValidationKind::UnsupportedSignal,
+                        signal,
+                        other: None,
+                        pin,
+                    });
+                }
+                continue;
+            }
+            if profile.reserved_pins().contains(&pin) {
+                return Err(PinValidationError {
+                    kind: PinValidationKind::ReservedPin,
+                    signal,
+                    other: None,
+                    pin,
+                });
+            }
+            if !profile.gpio_pins().contains(&pin) {
                 return Err(PinValidationError {
                     kind: PinValidationKind::UnavailablePin,
                     signal,
@@ -790,7 +987,7 @@ impl PinMap {
                     pin,
                 });
             }
-            if !signal.valid_pins().contains(&pin) {
+            if !profile.valid_pins(signal).contains(&pin) {
                 return Err(PinValidationError {
                     kind: PinValidationKind::InvalidRoute,
                     signal,
@@ -803,6 +1000,9 @@ impl PinMap {
             (PinSignal::I2c0Sda, PinSignal::I2c0Scl),
             (PinSignal::I2c1Sda, PinSignal::I2c1Scl),
         ] {
+            if !profile.requires_adjacent_i2c_pins() || !profile.supports(sda) {
+                continue;
+            }
             if self.pin(scl) != self.pin(sda) + 1 {
                 return Err(PinValidationError {
                     kind: PinValidationKind::MismatchedPair,
@@ -834,7 +1034,11 @@ impl PinMap {
     }
 
     pub fn gpio_pins(self) -> Result<GpioPins, PinValidationError> {
-        self.validate()?;
+        self.gpio_pins_for(BoardKind::Pico2.profile())
+    }
+
+    pub fn gpio_pins_for(self, profile: BoardProfile) -> Result<GpioPins, PinValidationError> {
+        self.validate_for(profile)?;
         let mut assigned = [u8::MAX; PIN_SIGNAL_COUNT];
         let mut assigned_len = 0;
         for signal in PinSignal::ALL {
@@ -845,7 +1049,7 @@ impl PinMap {
         }
         let mut gpio = [0; MAX_GPIO_LINES];
         let mut output = 0;
-        for pin in HEADER_PINS {
+        for &pin in profile.gpio_pins() {
             if !assigned[..assigned_len].contains(&pin) {
                 gpio[output] = pin;
                 output += 1;
@@ -1308,6 +1512,39 @@ mod tests {
             auxiliary.validate().unwrap_err().kind,
             PinValidationKind::InvalidRoute
         );
+    }
+
+    #[test]
+    fn esp32_c3_profile_accepts_matrix_routes_and_reserves_transport() {
+        let profile = BoardKind::Esp32C3DevKitM1.profile();
+        let map = profile.default_pin_map();
+        assert_eq!(profile.transport(), TransportKind::Serial);
+        assert_eq!(map.validate_for(profile), Ok(()));
+        assert_eq!(
+            map.gpio_pins_for(profile).unwrap().as_slice(),
+            &[0, 2, 8, 9, 18, 19]
+        );
+
+        let mut matrix_route = map;
+        matrix_route.i2c_sda[0] = 18;
+        matrix_route.i2c_scl[0] = 0;
+        assert_eq!(matrix_route.validate_for(profile), Ok(()));
+
+        let mut transport_conflict = map;
+        transport_conflict.i2c_sda[0] = 20;
+        assert_eq!(
+            transport_conflict.validate_for(profile).unwrap_err().kind,
+            PinValidationKind::ReservedPin
+        );
+
+        let mut unsupported = map;
+        unsupported.set_enabled(Peripheral::I2c1, true);
+        assert_eq!(
+            unsupported.validate_for(profile).unwrap_err().kind,
+            PinValidationKind::UnsupportedSignal
+        );
+        assert_eq!(profile.pin_warning(2), Some(PinWarning::BootStrap));
+        assert_eq!(profile.pin_warning(8), Some(PinWarning::OnboardRgbLed));
     }
 
     #[test]

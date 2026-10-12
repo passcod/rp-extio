@@ -1137,6 +1137,8 @@ fn validation_kind_name(kind: PinValidationKind) -> &'static str {
         PinValidationKind::MismatchedPair => "mismatched_pair",
         PinValidationKind::DuplicatePin => "duplicate_pin",
         PinValidationKind::InvalidEnableMask => "invalid_enable_mask",
+        PinValidationKind::UnsupportedSignal => "unsupported_signal",
+        PinValidationKind::ReservedPin => "reserved_pin",
     }
 }
 
@@ -1144,7 +1146,7 @@ pub fn format_validation(error: PinValidationError) -> String {
     let signal = signal_name(error.signal);
     match error.kind {
         PinValidationKind::UnavailablePin => {
-            format!("GP{} is not an exposed Pico 2 pin for {signal}", error.pin)
+            format!("GP{} is not an exposed pin for {signal}", error.pin)
         }
         PinValidationKind::InvalidRoute => {
             format!("GP{} is not a valid route for {signal}", error.pin)
@@ -1162,6 +1164,12 @@ pub fn format_validation(error: PinValidationError) -> String {
         ),
         PinValidationKind::InvalidEnableMask => {
             format!("invalid peripheral enable mask {:#04x}", error.pin)
+        }
+        PinValidationKind::UnsupportedSignal => {
+            format!("{signal} is not supported by this board")
+        }
+        PinValidationKind::ReservedPin => {
+            format!("GP{} is reserved by the board transport", error.pin)
         }
     }
 }
