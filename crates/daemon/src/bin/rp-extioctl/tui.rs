@@ -17,7 +17,7 @@ use rp_extio_wire::DEFAULT_PIN_MAP;
 use rp_extio_wire::{BoardKind, ClockSource, Peripheral, PinMap, PinSignal, PinValidationError};
 use rp_extiod::control::{
 	BoardInfo, ButtonConfig, ControlRequest, ControlResponse, GpioBias, GpioInfo, GpioStartup,
-	PwmInfo, signal_name,
+	LedInfo, PwmInfo, signal_name,
 };
 use std::{
 	error::Error,
@@ -185,6 +185,21 @@ struct PwmEditor {
 	field: PwmField,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LedField {
+	Red,
+	Green,
+	Blue,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LedEditor {
+	red: String,
+	green: String,
+	blue: String,
+	field: LedField,
+}
+
 impl Drop for TerminalGuard {
 	fn drop(&mut self) {
 		let _ = disable_raw_mode();
@@ -207,6 +222,8 @@ struct App {
 	adc: Option<AdcReading>,
 	pwm: Option<PwmInfo>,
 	pwm_editor: Option<PwmEditor>,
+	onboard_led_state: Option<LedInfo>,
+	led_editor: Option<LedEditor>,
 	telemetry_error: Option<String>,
 	last_refresh: Instant,
 	default_pending: bool,
@@ -399,6 +416,7 @@ impl App {
 		self.gpio.clear();
 		self.adc = None;
 		self.pwm = None;
+		self.onboard_led_state = None;
 		self.telemetry_error = None;
 		self.last_refresh = Instant::now() - Duration::from_secs(1);
 	}
@@ -638,6 +656,33 @@ impl App {
 		self.clear_message();
 	}
 
+	fn open_led_editor(&mut self) {
+		let Some(board) = self.current() else {
+			set_app_error(self, "no board selected");
+			return;
+		};
+		let Some(led) = board.onboard_led.as_ref() else {
+			set_app_error(self, "this board has no onboard LED");
+			return;
+		};
+		if led.kind != "rgb" {
+			set_app_error(self, "this board's onboard LED supports only on/off");
+			return;
+		}
+		let state = self.onboard_led_state.unwrap_or(LedInfo {
+			red: 0,
+			green: 0,
+			blue: 0,
+		});
+		self.led_editor = Some(LedEditor {
+			red: state.red.to_string(),
+			green: state.green.to_string(),
+			blue: state.blue.to_string(),
+			field: LedField::Red,
+		});
+		self.clear_message();
+	}
+
 	fn load_default(&mut self) {
 		if self.edited.is_none() {
 			self.message = "board is disconnected".into();
@@ -707,6 +752,8 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
 		adc: None,
 		pwm: None,
 		pwm_editor: None,
+		onboard_led_state: None,
+		led_editor: None,
 		telemetry_error: None,
 		last_refresh: Instant::now() - Duration::from_secs(1),
 		default_pending: false,
@@ -727,6 +774,7 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
 		if !event::poll(Duration::from_millis(200))? {
 			if app.mode == UiMode::Operate
 				&& app.pwm_editor.is_none()
+				&& app.led_editor.is_none()
 				&& app.last_refresh.elapsed() >= Duration::from_millis(250)
 			{
 				redraw = refresh_telemetry(client, &mut app);
@@ -737,6 +785,11 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
 			continue;
 		};
 		if key.kind != KeyEventKind::Press {
+			continue;
+		}
+		if app.led_editor.is_some() {
+			handle_led_editor_key(client, &mut app, key.code)?;
+			redraw = true;
 			continue;
 		}
 		if app.pwm_editor.is_some() {
@@ -827,6 +880,10 @@ pub fn run(client: &mut Client, selected: Option<&str>) -> Result<(), Box<dyn Er
 				cycle_button_config(client, &mut app)?
 			}
 			KeyCode::Char('p') if app.mode == UiMode::Operate => app.open_pwm_editor(),
+			KeyCode::Char('o') if app.mode == UiMode::Operate => {
+				toggle_onboard_led(client, &mut app)?
+			}
+			KeyCode::Char('c') if app.mode == UiMode::Operate => app.open_led_editor(),
 			KeyCode::Char('r') => {
 				let serial = app.current().map(|board| board.serial.clone());
 				app.refresh(client, serial.as_deref())?;
@@ -920,6 +977,7 @@ fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
 		app.gpio.clone(),
 		app.adc,
 		app.pwm,
+		app.onboard_led_state,
 		app.telemetry_error.clone(),
 	);
 	app.last_refresh = Instant::now();
@@ -928,11 +986,13 @@ fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
 		app.gpio.clear();
 		app.adc = None;
 		app.pwm = None;
+		app.onboard_led_state = None;
 		return previous
 			!= (
 				app.gpio.clone(),
 				app.adc,
 				app.pwm,
+				app.onboard_led_state,
 				app.telemetry_error.clone(),
 			);
 	};
@@ -944,12 +1004,31 @@ fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
 		Ok(_) => app.telemetry_error = Some("unexpected GPIO snapshot response".into()),
 		Err(error) => app.telemetry_error = Some(error.to_string()),
 	}
+	app.onboard_led_state = None;
+	if board.onboard_led.is_some() {
+		match client.request(&ControlRequest::OnboardLedGet {
+			serial: board.serial.clone(),
+		}) {
+			Ok(ControlResponse::OnboardLed { led }) => app.onboard_led_state = Some(led),
+			Ok(ControlResponse::Error { message, .. }) => {
+				app.telemetry_error.get_or_insert(message);
+			}
+			Ok(_) => {
+				app.telemetry_error
+					.get_or_insert_with(|| "unexpected onboard LED response".into());
+			}
+			Err(error) => {
+				app.telemetry_error.get_or_insert_with(|| error.to_string());
+			}
+		}
+	}
 	let Some(map) = board.active.map(PinMap::from) else {
 		return previous
 			!= (
 				app.gpio.clone(),
 				app.adc,
 				app.pwm,
+				app.onboard_led_state,
 				app.telemetry_error.clone(),
 			);
 	};
@@ -1000,6 +1079,7 @@ fn refresh_telemetry(client: &mut Client, app: &mut App) -> bool {
 			app.gpio.clone(),
 			app.adc,
 			app.pwm,
+			app.onboard_led_state,
 			app.telemetry_error.clone(),
 		)
 }
@@ -1250,6 +1330,112 @@ fn set_app_error(app: &mut App, message: impl Into<String>) {
 	app.message_error = true;
 }
 
+fn toggle_onboard_led(client: &mut Client, app: &mut App) -> Result<(), Box<dyn Error>> {
+	let Some(board) = app.current() else {
+		set_app_error(app, "no board selected");
+		return Ok(());
+	};
+	if board.onboard_led.is_none() {
+		set_app_error(app, "this board has no onboard LED");
+		return Ok(());
+	}
+	let enabled = app
+		.onboard_led_state
+		.is_some_and(|state| state.red != 0 || state.green != 0 || state.blue != 0);
+	let value = if enabled { 0 } else { 255 };
+	set_onboard_led(client, app, value, value, value)
+}
+
+fn set_onboard_led(
+	client: &mut Client,
+	app: &mut App,
+	red: u8,
+	green: u8,
+	blue: u8,
+) -> Result<(), Box<dyn Error>> {
+	let Some(serial) = app.current().map(|board| board.serial.clone()) else {
+		set_app_error(app, "no board selected");
+		return Ok(());
+	};
+	match client.request(&ControlRequest::OnboardLedSet {
+		serial,
+		red,
+		green,
+		blue,
+	})? {
+		ControlResponse::OnboardLed { led } => {
+			app.onboard_led_state = Some(led);
+			app.led_editor = None;
+			app.message = format!("onboard LED set to #{red:02x}{green:02x}{blue:02x}");
+			app.message_error = false;
+		}
+		ControlResponse::Error { message, .. } => set_app_error(app, message),
+		_ => set_app_error(app, "unexpected onboard LED response"),
+	}
+	Ok(())
+}
+
+fn handle_led_editor_key(
+	client: &mut Client,
+	app: &mut App,
+	key: KeyCode,
+) -> Result<(), Box<dyn Error>> {
+	match key {
+		KeyCode::Esc => {
+			app.led_editor = None;
+			app.message = "RGB edit cancelled".into();
+			app.message_error = false;
+		}
+		KeyCode::Tab => {
+			let editor = app.led_editor.as_mut().unwrap();
+			editor.field = match editor.field {
+				LedField::Red => LedField::Green,
+				LedField::Green => LedField::Blue,
+				LedField::Blue => LedField::Red,
+			};
+		}
+		KeyCode::BackTab => {
+			let editor = app.led_editor.as_mut().unwrap();
+			editor.field = match editor.field {
+				LedField::Red => LedField::Blue,
+				LedField::Green => LedField::Red,
+				LedField::Blue => LedField::Green,
+			};
+		}
+		KeyCode::Backspace => {
+			let editor = app.led_editor.as_mut().unwrap();
+			led_editor_field(editor).pop();
+		}
+		KeyCode::Char(character) if character.is_ascii_digit() => {
+			let editor = app.led_editor.as_mut().unwrap();
+			let field = led_editor_field(editor);
+			if field.len() < 3 {
+				field.push(character);
+			}
+		}
+		KeyCode::Enter => {
+			let editor = app.led_editor.as_ref().unwrap();
+			let values =
+				[&editor.red, &editor.green, &editor.blue].map(|value| value.parse::<u8>());
+			let [Ok(red), Ok(green), Ok(blue)] = values else {
+				set_app_error(app, "RGB components must be decimal values from 0 to 255");
+				return Ok(());
+			};
+			set_onboard_led(client, app, red, green, blue)?;
+		}
+		_ => {}
+	}
+	Ok(())
+}
+
+fn led_editor_field(editor: &mut LedEditor) -> &mut String {
+	match editor.field {
+		LedField::Red => &mut editor.red,
+		LedField::Green => &mut editor.green,
+		LedField::Blue => &mut editor.blue,
+	}
+}
+
 fn handle_pwm_editor_key(
 	client: &mut Client,
 	app: &mut App,
@@ -1354,7 +1540,7 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 	if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
 		frame.render_widget(
 			Paragraph::new(format!(
-				"Terminal too small for the Pico 2 pinout\nneed at least {MIN_WIDTH}×{MIN_HEIGHT}, have {}×{}",
+				"Terminal too small for the board pinout\nneed at least {MIN_WIDTH}×{MIN_HEIGHT}, have {}×{}",
 				area.width, area.height
 			))
 			.block(Block::default().title("rp-extio").borders(Borders::ALL)),
@@ -1387,9 +1573,9 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 	draw_status(frame, rows[2], app);
 	let assignment_mode = if app.grouped { "grouped" } else { "single" };
 	let help = if app.mode == UiMode::Operate && area.width >= 72 {
-		"arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\nw save startup  x forget startup  b button role  v route  f flip  r refresh  q quit".into()
+		"arrows pin  Tab signal  Enter/t act  0/1 output  i input/bias  p PWM\no LED on/off  c RGB  w save  x forget  b button  v route  f flip  r refresh  q quit".into()
 	} else if app.mode == UiMode::Operate {
-		"arrows/Tab select  Enter/t act  0/1 output  i input\nw save  x forget  p PWM  v route  r refresh  q quit".into()
+		"arrows/Tab select  Enter/t act  0/1 output  i input\no LED  c RGB  w save  x forget  p PWM  v route  r refresh  q quit".into()
 	} else if area.width >= 72 {
 		format!(
 			"arrows pin  Tab signal  Enter assign  e enable  g {assignment_mode}  a apply\nv operate mode  f flip  s clock source  +/- clock Hz  d defaults  u undo  r refresh  q quit"
@@ -1402,6 +1588,9 @@ fn draw(frame: &mut Frame<'_>, app: &App) {
 	frame.render_widget(Paragraph::new(help), rows[3]);
 	if app.pwm_editor.is_some() {
 		draw_pwm_editor(frame, app);
+	}
+	if app.led_editor.is_some() {
+		draw_led_editor(frame, app);
 	}
 }
 
@@ -1448,14 +1637,18 @@ fn draw_header(frame: &mut Frame<'_>, area: Rect, app: &App) {
 	let summary = board.map_or_else(
 		|| "no boards".into(),
 		|board| {
+			let led = app.onboard_led_state.map_or_else(String::new, |led| {
+				format!("  LED #{:02x}{:02x}{:02x}", led.red, led.green, led.blue)
+			});
 			format!(
-				"{} {} · {}  gen {}  I²C {}  SPI {}",
+				"{} {} · {}  gen {}  I²C {}  SPI {}{}",
 				if board.connected { "●" } else { "○" },
 				board.serial,
 				board.board_name,
 				option(board.generation),
 				bus_numbers(board.i2c_buses),
 				bus_numbers(board.spi_buses),
+				led,
 			)
 		},
 	);
@@ -1950,6 +2143,42 @@ fn draw_pwm_editor(frame: &mut Frame<'_>, app: &App) {
 	);
 }
 
+fn draw_led_editor(frame: &mut Frame<'_>, app: &App) {
+	let editor = app.led_editor.as_ref().unwrap();
+	let area = centered_rect(46, 8, frame.area());
+	frame.render_widget(Clear, area);
+	let style = |field| {
+		if editor.field == field {
+			Style::default().fg(Color::Black).bg(Color::White)
+		} else {
+			Style::default()
+		}
+	};
+	let lines = vec![
+		Line::from(vec![
+			Span::raw("Red:   "),
+			Span::styled(editor.red.clone(), style(LedField::Red)),
+		]),
+		Line::from(vec![
+			Span::raw("Green: "),
+			Span::styled(editor.green.clone(), style(LedField::Green)),
+		]),
+		Line::from(vec![
+			Span::raw("Blue:  "),
+			Span::styled(editor.blue.clone(), style(LedField::Blue)),
+		]),
+		Line::raw("Tab field · Enter apply · Esc cancel"),
+	];
+	frame.render_widget(
+		Paragraph::new(lines).block(
+			Block::default()
+				.title("Onboard RGB LED")
+				.borders(Borders::ALL),
+		),
+		area,
+	);
+}
+
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 	Rect {
 		x: area.x + area.width.saturating_sub(width) / 2,
@@ -2411,6 +2640,8 @@ mod tests {
 			adc: None,
 			pwm: None,
 			pwm_editor: None,
+			onboard_led_state: None,
+			led_editor: None,
 			telemetry_error: None,
 			last_refresh: Instant::now(),
 			default_pending: false,
@@ -2431,6 +2662,10 @@ mod tests {
 		app.boards[0].adc_channels = 5;
 		app.boards[0].pwm_channels = 6;
 		app.boards[0].adc_reference_mv = 2_500;
+		app.boards[0].onboard_led = Some(rp_extiod::control::OnboardLedInfo {
+			kind: "rgb".into(),
+			pin: 8,
+		});
 		app.boards[0].active = Some(map.into());
 		app.boards[0].desired = Some(map.into());
 		app.edited = Some(map);
@@ -2490,6 +2725,31 @@ mod tests {
 		app.flip();
 		let back = rendered(120, 36, &app);
 		assert!(back.contains("back (belly up)"));
+	}
+
+	#[test]
+	fn c3_operate_mode_shows_and_edits_rgb_led() {
+		let mut app = c3_app();
+		app.mode = UiMode::Operate;
+		app.onboard_led_state = Some(LedInfo {
+			red: 12,
+			green: 34,
+			blue: 56,
+		});
+		let display = rendered(140, 36, &app);
+		assert!(display.contains("LED #0c2238"));
+
+		app.open_led_editor();
+		assert_eq!(
+			app.led_editor,
+			Some(LedEditor {
+				red: "12".into(),
+				green: "34".into(),
+				blue: "56".into(),
+				field: LedField::Red,
+			})
+		);
+		assert!(rendered(140, 36, &app).contains("Onboard RGB LED"));
 	}
 
 	#[test]
