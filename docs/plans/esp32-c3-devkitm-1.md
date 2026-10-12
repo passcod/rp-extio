@@ -64,25 +64,21 @@ resume at the next delimiter so ESP ROM boot messages, partial writes, reset
 output, and reconnects cannot permanently desynchronise the link.
 
 Configure UART0 at a fixed documented baud rate through GPIO20/GPIO21 and the
-board's onboard USB-to-UART bridge. Do not scan or send probes to arbitrary
-TTYs. Add repeatable daemon options for explicit serial paths, accepting
-`/dev/serial/by-id/...` as the recommended stable host path. Each configured
-path is opened exclusively and negotiated with HELLO; the stable rp-extio
-identity comes from the ESP32-C3 eFuse base MAC returned by firmware, not from
-the CP210x USB descriptor or host device name.
+board's onboard USB-to-UART bridge. Discover supported USB-to-UART bridge
+identities through sysfs and watch for them throughout the daemon lifetime.
+Open each candidate exclusively and confirm rp-extio firmware with a framed
+HELLO before registering it; never probe unrelated TTYs. Keep repeatable
+`--serial` options as explicit additions for compatible bridges not yet known
+to the discovery table. The stable rp-extio identity comes from the ESP32-C3
+eFuse base MAC returned by firmware, not from the CP210x USB descriptor or host
+device name.
 
 Refactor device management around transport-independent connection keys and a
-common request backend. USB hotplug and explicitly configured serial workers
-feed the same negotiated-device lifecycle, startup-state restoration, kernel
-registration, control API, and disconnect cleanup. Serial workers reopen their
-configured path after removal, reset, or framing failure with bounded backoff.
-Only one live connection may claim a stable board identity.
-
-Persist configured serial paths in daemon configuration separately from the
-per-device pin map, GPIO, button, and PWM state. Add control commands and CLI
-forms to add, list, and remove serial transports so installation does not
-require hand-editing JSON. These mutations use the existing polkit-protected
-configuration action; listing stays available to unprivileged clients. Extend
+common request backend. USB and serial hotplug workers feed the same negotiated
+device lifecycle, startup-state restoration, kernel registration, control API,
+and disconnect cleanup. Serial workers reopen attached candidates after reset
+or framing failure with bounded backoff and stop when the sysfs device is
+removed. Only one live connection may claim a stable board identity. Extend
 the systemd unit and installation documentation with serial-device access
 requirements while retaining root service operation as the default.
 
@@ -159,13 +155,14 @@ by negotiated capabilities.
 Add target-specific build scripts and `just` recipes for building and flashing
 the ESP32-C3 image with a locally verified Espressif flashing tool. Keep
 `just flash` as the Pico command and add clearly named C3 recipes that require
-an explicit serial path when more than one candidate exists. Do not reset or
-probe unrelated serial devices.
+an explicit serial path when more than one candidate exists. Discovery must
+identify supported bridge hardware before performing the framed firmware
+handshake, so unrelated serial devices are not touched.
 
 Document the DevKitM-1 v1.6 header pinout, UART0 transport reservation,
 3.3-volt electrical limits, ADC limitations, strapping-pin boot hazards,
-GPIO8's onboard addressable RGB LED, serial-path configuration, build/flash
-flow, and differences from the Pico transport and peripheral set. Extend the
+GPIO8's onboard addressable RGB LED, automatic discovery, build/flash flow,
+and differences from the Pico transport and peripheral set. Extend the
 hardware-verification guide with C3 wiring for I2C, SPI, UART1 loopback or peer,
 GPIO input/output/bias, ADC, and LEDC PWM, while keeping the existing Pico
 instructions distinct.
