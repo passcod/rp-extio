@@ -23,3 +23,4 @@ esp-hal = { version = "1.2.2", features = ["esp32c3", "unstable"] }
 esp-println = { version = "0.18.0", default-features = false, features = ["esp32c3", "no-op"] }
 rp-extio-firmware = { path = "../firmware" }
 rp-extio-wire = { path = "../wire" }
+static_cell = "2.1.1"

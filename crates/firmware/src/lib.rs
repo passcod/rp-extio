@@ -305,7 +305,7 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
 		}
 		let lines = board
 			.pin_map()
-			.gpio_pins()
+			.gpio_pins_for(board.board_kind().profile())
 			.map_err(|_| BusFailure::new(Status::IoError, 0))?
 			.len();
 		response[..4].copy_from_slice(&(lines as u32).to_le_bytes());

@@ -2453,6 +2453,7 @@ dependencies = [
  "esp-println",
  "rp-extio-firmware",
  "rp-extio-wire",
+ "static_cell",
 ]
 
 [[package]]
