@@ -560,6 +560,10 @@ daemon without `--serial`. `rp-extioctl list` must discover every compatible
 attached board, and the identity must remain the eFuse MAC across resets and
 host USB paths.
 
+With no external wiring attached, run `scripts/verify-esp32c3-smoke.sh SERIAL`
+for a reversible RGB, GPIO, ADC, PWM, and UART tty smoke test. It restores the
+default map and turns the RGB LED off before exiting.
+
 ### GPIO and onboard RGB LED
 
 Wire GPIO0 through a 1 kΩ resistor to an LED and 330 Ω series resistor to

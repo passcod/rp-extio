@@ -2,7 +2,10 @@ use embedded_hal::pwm::SetDutyCycle;
 use esp_hal::{
 	analog::adc::{Adc, AdcConfig, AdcPin, Attenuation},
 	delay::Delay,
-	gpio::{AnyPin, DriveMode, Flex, InputConfig, Level, NoPin, OutputConfig, Pull},
+	gpio::{
+		AnyPin, DriveMode, Flex, InputConfig, Level, NoPin, OutputConfig, Pull,
+		interconnect::PeripheralOutput,
+	},
 	i2c::master::{Config as I2cConfig, Error as I2cError, I2c},
 	ledc::{
 		Ledc, LowSpeed,
@@ -75,6 +78,7 @@ impl<'d> Esp32C3Board<'d> {
 			Flex::new(unsafe { route_pins[index].clone_unchecked() })
 		});
 		for pin in &mut pins {
+			pin.disconnect_from_peripheral_output();
 			pin.set_output_enable(false);
 			pin.set_input_enable(true);
 			pin.apply_input_config(&InputConfig::default());
@@ -402,6 +406,7 @@ impl Board for Esp32C3Board<'_> {
 		map.validate_for(BoardKind::Esp32C3DevKitM1.profile())?;
 		for &number in &ESP32_C3_GPIO_PINS {
 			let mut pin = self.route_flex(number);
+			pin.disconnect_from_peripheral_output();
 			pin.set_low();
 			pin.set_output_enable(false);
 			pin.set_input_enable(true);
@@ -686,6 +691,7 @@ impl Board for Esp32C3Board<'_> {
 		let pin_number = self.pin_map.pwm_pins[channel];
 		if !requested.enabled {
 			let mut pin = self.route_flex(pin_number);
+			pin.disconnect_from_peripheral_output();
 			pin.set_level(if requested.inverted {
 				Level::High
 			} else {
