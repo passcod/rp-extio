@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/daemon", "crates/firmware", "crates/wire"]
+members = ["crates/daemon", "crates/firmware", "crates/firmware-esp32c3", "crates/wire"]
 resolver = "3"
 
 [workspace.package]

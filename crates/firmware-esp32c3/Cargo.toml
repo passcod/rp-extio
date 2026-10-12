@@ -1,0 +1,25 @@
+[package]
+name = "rp-extio-firmware-esp32c3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+firmware = []
+
+[[bin]]
+name = "rp-extio-firmware-esp32c3"
+path = "src/main.rs"
+test = false
+bench = false
+required-features = ["firmware"]
+
+[target.'cfg(target_arch = "riscv32")'.dependencies]
+esp-backtrace = { version = "0.20.0", features = ["esp32c3", "panic-handler", "println"] }
+esp-bootloader-esp-idf = { version = "0.6.0", features = ["esp32c3"] }
+esp-hal = { version = "1.2.2", features = ["esp32c3", "unstable"] }
+esp-println = { version = "0.18.0", default-features = false, features = ["esp32c3", "no-op"] }
+rp-extio-firmware = { path = "../firmware" }
+rp-extio-wire = { path = "../wire" }

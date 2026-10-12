@@ -1,5 +1,9 @@
 [alias]
 firmware = "build --release --package rp-extio-firmware --features firmware --target thumbv8m.main-none-eabihf"
+firmware-esp32c3 = "build --release --package rp-extio-firmware-esp32c3 --features firmware --target riscv32imc-unknown-none-elf"
 
 [target.thumbv8m.main-none-eabihf]
 rustflags = ["-C", "link-arg=-Tlink.x"]
+
+[target.riscv32imc-unknown-none-elf]
+rustflags = ["-C", "link-arg=-Tlinkall.x"]
