@@ -20,8 +20,24 @@ flash board="pico2" port="":
             just --justfile {{ quote(justfile()) }} _flash-pico2
             ;;
         esp32c3)
-            [[ -n {{ quote(port) }} ]] || { echo "usage: just flash esp32c3 /dev/serial/by-id/..." >&2; exit 2; }
-            just --justfile {{ quote(justfile()) }} _flash-esp32c3 {{ quote(port) }}
+            port={{ quote(port) }}
+            if [[ -z $port ]]; then
+                shopt -s nullglob
+                candidates=()
+                for candidate in /dev/serial/by-id/*; do
+                    properties=$(udevadm info --query=property --name "$candidate" 2>/dev/null || true)
+                    properties=$'\n'$properties$'\n'
+                    [[ $properties == *$'\nID_VENDOR_ID=10c4\n'* ]] || continue
+                    [[ $properties == *$'\nID_MODEL_ID=ea60\n'* ]] || continue
+                    candidates+=("$candidate")
+                done
+                case ${#candidates[@]} in
+                    1) port=${candidates[0]} ;;
+                    0) echo "no supported ESP32-C3 USB-to-UART bridge found" >&2; exit 2 ;;
+                    *) echo "multiple supported bridges found; pass a /dev/serial/by-id path" >&2; printf '  %s\n' "${candidates[@]}" >&2; exit 2 ;;
+                esac
+            fi
+            just --justfile {{ quote(justfile()) }} _flash-esp32c3 "$port"
             ;;
         *)
             printf 'unknown board %s (expected pico2 or esp32c3)\n' {{ quote(board) }} >&2

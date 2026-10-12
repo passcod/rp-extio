@@ -1,6 +1,6 @@
 # Hardware verification
 
-This guide verifies `rp-as-extio` against physical circuits and peripherals.
+This guide verifies `rp-extio` against physical circuits and peripherals.
 It complements the automated simulator and protocol tests by exercising the
 complete Linux kernel, daemon, USB, firmware, and electrical path.
 
@@ -10,7 +10,7 @@ reconnect, so discover them again rather than carrying numbers between steps.
 
 ## Safety
 
-- Use 3.3 V logic only. Never drive a Pico GPIO above 3.3 V.
+- Use 3.3 V logic only. Never drive either board's GPIO above 3.3 V.
 - Connect ground between the Pico and every attached board.
 - Do not connect the 3.3 V or 5 V supply rails of two independently powered
   computers. The Raspberry Pi UART test needs signal and ground wires only.
@@ -83,6 +83,28 @@ replace them without rebuilding. Always wire the fixture to the active map from
 
 Convenient ground pins include header pins 3, 8, 13, 18, 23, 28, and 33.
 
+## Default ESP32-C3-DevKitM-1 v1.6 wiring reference
+
+These routes are runtime configurable. GPIO20 and GPIO21 belong to the control
+transport and cannot be reassigned. GPIO2 and GPIO9 are boot-strapping pins;
+GPIO8 is also a strapping pin and drives the onboard RGB LED. Avoid external
+pulls on those pins until ordinary routes have been verified.
+
+| Interface | State | GPIO and header |
+| --- | --- | --- |
+| UART1 TX / RX | disabled | GPIO6 J3-9 / GPIO7 J3-8 |
+| I2C0 SDA / SCL | enabled | GPIO4 J3-11 / GPIO5 J3-10 |
+| SPI0 MISO / SCK / MOSI | enabled | GPIO3 J1-5 / GPIO6 J3-9 / GPIO7 J3-8 |
+| SPI0 CS0 / CS1 | enabled | GPIO10 J1-11 / GPIO1 J1-10 |
+| ADC0–4 | disabled | GPIO0 J1-9, GPIO1 J1-10, GPIO2 J1-4, GPIO3 J1-5, GPIO4 J3-11 |
+| PWM0–5 | disabled | any available exposed GPIO |
+| RGB LED | available | onboard GPIO8, J3-6 |
+| 3V3 / GND | — | J1-2 or J1-3 / J1-1 |
+
+GPIO0–GPIO10, GPIO18, and GPIO19 may be used as GPIO when not assigned to a
+peripheral. The ADC input measurement range is 0–2.5 V even though digital I/O
+uses 3.3 V logic. Never apply 3.3 V directly to an ADC test input.
+
 ## Record the test environment
 
 Before wiring peripherals, record:
@@ -95,14 +117,16 @@ Host distribution:
 Host kernel:
 Kernel module build:
 Daemon build:
-Pico USB serial:
-Pico USB path:
+Board kind and revision:
+Firmware identity:
+USB bridge path:
 I2C0 / I2C1 adapters:
 SPI0 / SPI1 controllers and children:
 GPIO chip:
 IIO device:
 PWM chip:
 UART0 / UART1 CDC ACM devices:
+Daemon-backed tty devices:
 Peripheral parts and board revisions:
 Logic-analyser capture names:
 ```
@@ -525,6 +549,86 @@ authentication itself.
 - UART0 and UART1 map to distinct, stable ACM interfaces and physical pins.
 - Concurrent bus activity does not stall or corrupt UART traffic.
 - Disconnect and reconnect restore the same stable CDC identity.
+
+## ESP32-C3-DevKitM-1 verification
+
+Use this section instead of Pico-specific instance and CDC checks. Flash with
+`just flash esp32c3`; it selects the sole supported CP2102N bridge, or requires
+an explicit `/dev/serial/by-id/…` path when several are attached. Start the
+daemon without `--serial`. `rp-extioctl list` must discover every compatible
+attached board, and the identity must remain the eFuse MAC across resets and
+host USB paths.
+
+### GPIO and onboard RGB LED
+
+Wire GPIO0 through a 1 kΩ resistor to an LED and 330 Ω series resistor to
+ground. Verify output high, output low, input, pull-up, and pull-down through
+both the CLI and TUI. Move the button and loopback fixtures from the Pico
+section across GPIO1–GPIO7, GPIO10, GPIO18, and GPIO19. Test GPIO2 and GPIO9
+last, with no external pull that can change their reset strap level.
+
+Set the onboard LED to red, green, blue, white, and off with `rp-extioctl led`
+and the TUI. Assign another signal to GPIO8 and confirm LED operations report
+busy without changing that signal. Release GPIO8 and confirm colour control
+returns.
+
+### I²C and SPI
+
+For I²C, substitute GPIO4 SDA and GPIO5 SCL in the I²C fixture. Retain the same
+2.2–4.7 kΩ pull-ups to 3.3 V. Read a repeated-start register device, exercise
+NACK recovery, then move the bus to at least two other GPIO pairs without
+reflashing.
+
+For SPI, substitute GPIO6 SCK, GPIO7 MOSI, GPIO3 MISO, GPIO10 CS0, and GPIO1
+CS1. Run loopback and peripheral tests, disable CS1 while CS0 remains active,
+then move every SPI signal to a second conflict-free map. Induce a rejected
+speed or malformed segment while monitoring both chip selects; neither chip
+select may remain asserted after the error.
+
+The C3 profile exposes one I²C and one SPI controller. Do not run the Pico
+second-controller cases for this board.
+
+### UART1 tty
+
+Enable UART1 on GPIO6 TX and GPIO7 RX. For local loopback, connect them through
+1 kΩ, locate the `ttyRPE` path reported by `rp-extioctl show`, disable terminal
+echo, and verify bidirectional byte patterns at 9600, 115200, and 921600 baud.
+Exercise 7E1, 8N1, and 8N2. Then replace the loopback with the Raspberry Pi
+console fixture: C3 TX to Pi RX, C3 RX to Pi TX, and ground to ground only.
+
+Move UART1 to another pair without restarting the daemon and repeat. Disable
+UART1 and confirm its tty disappears and the pins return to GPIO; re-enable it
+and confirm a tty returns. Reset and unplug the C3 while the tty is open: the
+old descriptor must fail, automatic discovery must reconnect the board, and a
+new tty must work without adding `--serial` or restarting the daemon.
+
+### ADC and LEDC PWM
+
+Enable ADC0–ADC4 one at a time on GPIO0–GPIO4. Drive each from the Pico ADC
+divider fixture, but keep the measured node between 0 and 2.5 V. Compare raw
+IIO and CLI readings at ground, an intermediate voltage, and near 2.5 V; never
+use the Pico section's 3.3 V endpoint. Verify enabling an ADC removes its pin
+from GPIO and disabling it restores the line.
+
+Route PWM0–PWM5 to six LEDs or logic-analyser channels. Verify independent
+routing, enable, duty, polarity, and frequency control. Channels 0/4 share one
+LEDC timer and channels 1/5 share another: equal periods must run concurrently,
+while a conflicting period must return busy without changing the active
+sibling. Channels 2 and 3 must accept independent periods. Repeat saved-state
+restoration after daemon restart and C3 reset.
+
+### C3 completion criteria
+
+- Automatic discovery registers all attached supported C3 boards and ignores
+  unrelated serial devices.
+- Dynamic routing, GPIO bias, ADC, PWM, RGB LED, I²C, SPI, and UART1 work
+  without reflashing.
+- Strap warnings are visible but do not prohibit deliberate GPIO2/GPIO8/GPIO9
+  routes.
+- Linux I²C, SPI, GPIO, IIO, PWM, and tty identifiers appear in the CLI and
+  TUI while active.
+- Reset, unplug, reflash, and daemon restart recover by stable firmware identity
+  and restore that board's persisted map and output state.
 
 ## Lifecycle and failure tests
 
