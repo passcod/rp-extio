@@ -11,6 +11,10 @@ pub const MAX_DATA: usize = 3584;
 pub const MAX_I2C_MESSAGES: usize = 16;
 pub const MAX_SPI_SEGMENTS: usize = 16;
 pub const USB_REPLY: u8 = 1;
+pub const SERIAL_FRAME_VERSION: u8 = 1;
+pub const MAX_SERIAL_BODY: usize = USB_HEADER_LEN + MAX_PAYLOAD;
+pub const MAX_SERIAL_RAW_FRAME: usize = 8 + MAX_SERIAL_BODY + 4;
+pub const MAX_SERIAL_FRAME: usize = MAX_SERIAL_RAW_FRAME + MAX_SERIAL_RAW_FRAME / 254 + 2;
 pub const CAP_GENERAL: u16 = 1;
 pub const CAP_I2C: u16 = 2;
 pub const CAP_SPI: u16 = 3;
@@ -340,6 +344,115 @@ pub enum WireError {
     Invalid,
     Unsupported,
     TooLarge,
+}
+
+pub fn encode_serial_frame(body: &[u8], output: &mut [u8]) -> Result<usize, WireError> {
+    if body.len() > MAX_SERIAL_BODY {
+        return Err(WireError::TooLarge);
+    }
+    let raw_len = 8 + body.len() + 4;
+    let mut raw = [0; MAX_SERIAL_RAW_FRAME];
+    raw[0] = SERIAL_FRAME_VERSION;
+    raw[4..8].copy_from_slice(&(body.len() as u32).to_le_bytes());
+    raw[8..8 + body.len()].copy_from_slice(body);
+    let checksum = crc32(&raw[..raw_len - 4]);
+    raw[raw_len - 4..raw_len].copy_from_slice(&checksum.to_le_bytes());
+    let encoded = cobs_encode(&raw[..raw_len], output)?;
+    let Some(delimiter) = output.get_mut(encoded) else {
+        return Err(WireError::TooLarge);
+    };
+    *delimiter = 0;
+    Ok(encoded + 1)
+}
+
+pub fn decode_serial_frame(encoded: &[u8], body: &mut [u8]) -> Result<usize, WireError> {
+    let encoded = encoded.strip_suffix(&[0]).unwrap_or(encoded);
+    let mut raw = [0; MAX_SERIAL_RAW_FRAME];
+    let raw_len = cobs_decode(encoded, &mut raw)?;
+    if raw_len < 12
+        || raw[0] != SERIAL_FRAME_VERSION
+        || raw[1..4] != [0; 3]
+        || raw_len != 12 + read_u32(&raw[4..8]) as usize
+    {
+        return Err(WireError::Invalid);
+    }
+    let body_len = raw_len - 12;
+    if body_len > body.len() {
+        return Err(WireError::TooLarge);
+    }
+    let expected = read_u32(&raw[raw_len - 4..]);
+    if crc32(&raw[..raw_len - 4]) != expected {
+        return Err(WireError::Invalid);
+    }
+    body[..body_len].copy_from_slice(&raw[8..8 + body_len]);
+    Ok(body_len)
+}
+
+fn cobs_encode(input: &[u8], output: &mut [u8]) -> Result<usize, WireError> {
+    let mut read: usize = 0;
+    let mut write: usize = 1;
+    let mut code_index: usize = 0;
+    let mut code = 1_u8;
+    while read < input.len() {
+        if input[read] == 0 {
+            *output.get_mut(code_index).ok_or(WireError::TooLarge)? = code;
+            code_index = write;
+            write += 1;
+            code = 1;
+        } else {
+            *output.get_mut(write).ok_or(WireError::TooLarge)? = input[read];
+            write += 1;
+            code += 1;
+            if code == 0xff {
+                *output.get_mut(code_index).ok_or(WireError::TooLarge)? = code;
+                code_index = write;
+                write += 1;
+                code = 1;
+            }
+        }
+        read += 1;
+    }
+    *output.get_mut(code_index).ok_or(WireError::TooLarge)? = code;
+    Ok(write)
+}
+
+fn cobs_decode(input: &[u8], output: &mut [u8]) -> Result<usize, WireError> {
+    if input.is_empty() {
+        return Err(WireError::Truncated);
+    }
+    let mut read: usize = 0;
+    let mut write: usize = 0;
+    while read < input.len() {
+        let code = input[read] as usize;
+        if code == 0 || read + code > input.len() + 1 {
+            return Err(WireError::Invalid);
+        }
+        read += 1;
+        let count = code - 1;
+        let end = write.checked_add(count).ok_or(WireError::TooLarge)?;
+        if end > output.len() || read + count > input.len() {
+            return Err(WireError::TooLarge);
+        }
+        output[write..end].copy_from_slice(&input[read..read + count]);
+        read += count;
+        write = end;
+        if code != 0xff && read < input.len() {
+            *output.get_mut(write).ok_or(WireError::TooLarge)? = 0;
+            write += 1;
+        }
+    }
+    Ok(write)
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = u32::MAX;
+    for &byte in bytes {
+        crc ^= u32::from(byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xedb8_8320 & 0_u32.wrapping_sub(crc & 1));
+        }
+    }
+    !crc
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1481,6 +1594,45 @@ mod tests {
         let mut malformed = header.encode();
         malformed[20] = Status::Nack as u8;
         assert_eq!(UsbHeader::decode(&malformed), Err(WireError::Invalid));
+    }
+
+    #[test]
+    fn serial_frames_round_trip_binary_bodies_and_detect_corruption() {
+        let mut body = [0; MAX_SERIAL_BODY];
+        for (index, byte) in body.iter_mut().enumerate() {
+            *byte = (index % 251) as u8;
+        }
+        let mut encoded = [0; MAX_SERIAL_FRAME];
+        let encoded_len = encode_serial_frame(&body, &mut encoded).unwrap();
+        assert_eq!(encoded[encoded_len - 1], 0);
+        assert!(!encoded[..encoded_len - 1].contains(&0));
+
+        let mut decoded = [0; MAX_SERIAL_BODY];
+        let decoded_len = decode_serial_frame(&encoded[..encoded_len], &mut decoded).unwrap();
+        assert_eq!(decoded_len, body.len());
+        assert_eq!(decoded, body);
+
+        encoded[encoded_len / 2] ^= 0x40;
+        assert_eq!(
+            decode_serial_frame(&encoded[..encoded_len], &mut decoded),
+            Err(WireError::Invalid)
+        );
+    }
+
+    #[test]
+    fn serial_frames_reject_noise_and_small_buffers() {
+        let mut output = [0; MAX_SERIAL_FRAME];
+        let mut body = [0; 4];
+        assert!(decode_serial_frame(b"ESP-ROM:esp32c3-api1\0", &mut body).is_err());
+        let encoded_len = encode_serial_frame(b"hello", &mut output).unwrap();
+        assert_eq!(
+            decode_serial_frame(&output[..encoded_len], &mut body),
+            Err(WireError::TooLarge)
+        );
+        assert_eq!(
+            encode_serial_frame(b"hello", &mut [0; 4]),
+            Err(WireError::TooLarge)
+        );
     }
 
     #[test]
