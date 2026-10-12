@@ -26,7 +26,7 @@ we've since grown support for more boards. There are several components:
 
 - A small kernel module, `rp-extio.ko`, creates the /dev/ interfaces, and exposes an ABI to...
 - the `rp-extiod` userspace daemon, which connects over USB to...
-- a devboard flashed with the `rp-extio-firmware`.
+- a devboard flashed with its corresponding rp-extio firmware.
 - The `rp-extioctl` CLI and TUI provides the management surface.
 
 Your software can then use the Linux I²C, SPI, GPIO, IIO, PWM, and tty
@@ -57,11 +57,6 @@ Build and install:
 just install
 just enable
 ```
-
-The installed service runs as root so it can open supported USB devices and
-serial bridges without a separate dialout-group setup. A custom unprivileged
-service needs read/write access to those device nodes as well as the kernel
-control device.
 
 ## Supported boards
 
@@ -114,15 +109,11 @@ just flash pico2
 
 Subsequent flashes don't need BOOTSEL mode.
 
-### ESP32-C3-DevKitM-1 v1.6
+### ESP32-C3-DevKitM-1
 
 - Peripherals: I²C, SPI, UART, GPIO, ADC inputs, PWM outputs.
 - Core: ESP32-C3.
 - Signal voltage: 3.3V only.
-
-GPIO20 and GPIO21 are reserved for rp-extio. GPIO2 and GPIO9 are strapping pins;
-GPIO8 is a strapping pin connected to the onboard RGB LED.
-The onboard bridge carries the rp-extio control protocol at 115200 baud.
 
 | Peripheral | Startup state | Default GPIOs / notes |
 | --- | --- | --- |
@@ -136,8 +127,6 @@ Notes:
 
 - GPIO inputs support none, pull-up, and pull-down bias using internal resistors.
 - ADC0–4 are 12-bit conversions over the ESP32-C3 ADC's 0–2.5 V measurement range.
-- PWM channels can route independently. Channels 0/4 and 1/5 share LEDC timers,
-  so each pair must use the same period while both outputs are active.
 - I2C initially runs at 100 kHz.
 - SPI accepts 78.125 kHz through 20 MHz, modes 0–3, 8-bit words, MSB- or LSB-first
   transfers, active-high or active-low chip select, and no-CS transfers.
@@ -156,14 +145,6 @@ With one supported board attached:
 ```sh
 just flash esp32c3
 ```
-
-If several supported bridges are attached, pass the selected stable path as a
-second argument.
-
-The daemon automatically discovers every attached board using a supported
-USB-to-UART bridge and confirms its firmware before registering it. Repeatable
-`rp-extiod --serial PATH` options add compatible bridge models that are not in
-the discovery table.
 
 ## Simulator
 
