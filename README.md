@@ -108,6 +108,38 @@ just flash pico2
 
 Subsequent flashes don't need BOOTSEL mode.
 
+### ESP32-C3-DevKitM-1 v1.6
+
+- Peripherals: I²C, SPI, UART, GPIO, ADC inputs, PWM outputs.
+- Core: ESP32-C3.
+- Signal voltage: 3.3V only.
+- Host transport: the onboard USB-to-UART bridge on GPIO20/GPIO21.
+
+GPIO20 and GPIO21 are reserved for rp-extio. GPIO2 and GPIO9 are strapping pins;
+GPIO8 is a strapping pin connected to the onboard RGB LED.
+
+| Peripheral | Startup state | Default GPIOs / notes |
+| --- | --- | --- |
+| UART1 | disabled | TX GPIO6, RX GPIO7 |
+| I2C0 | enabled | SDA GPIO4, SCL GPIO5 |
+| SPI0 | enabled | MISO GPIO3, SCK GPIO6, MOSI GPIO7, CS0 GPIO10, CS1 GPIO1 |
+| ADC0–4 | disabled | GPIO0–GPIO4 |
+| PWM0–5 | disabled | any available GPIO |
+
+#### Firmware
+
+- Rust target: `riscv32imc-unknown-none-elf`
+- Flasher: [`espflash`](https://github.com/esp-rs/espflash)
+
+Use the stable path for the board's USB-to-UART bridge:
+
+```sh
+just flash esp32c3 /dev/serial/by-id/...
+rp-extiod --serial /dev/serial/by-id/...
+```
+
+The daemon never probes serial devices automatically.
+
 ## Simulator
 
 In addition to running against real devices, the `rp-extiod` supports simulation mode.

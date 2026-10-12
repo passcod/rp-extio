@@ -10,8 +10,27 @@ default:
 # Build the host tools and kernel module.
 build: release module
 
+# Build and flash firmware for a supported board.
+flash board="pico2" port="":
+    #!/usr/bin/env bash
+    set -euo pipefail
+    case {{ quote(board) }} in
+        pico2)
+            [[ -z {{ quote(port) }} ]] || { echo "pico2 does not take a serial port" >&2; exit 2; }
+            just --justfile {{ quote(justfile()) }} _flash-pico2
+            ;;
+        esp32c3)
+            [[ -n {{ quote(port) }} ]] || { echo "usage: just flash esp32c3 /dev/serial/by-id/..." >&2; exit 2; }
+            just --justfile {{ quote(justfile()) }} _flash-esp32c3 {{ quote(port) }}
+            ;;
+        *)
+            printf 'unknown board %s (expected pico2 or esp32c3)\n' {{ quote(board) }} >&2
+            exit 2
+            ;;
+    esac
+
 # Build and flash the Pico 2 firmware, then reboot into the application.
-flash:
+_flash-pico2:
     #!/usr/bin/env bash
     set -euo pipefail
     ./scripts/build-uf2.sh
@@ -24,6 +43,14 @@ flash:
     done
     lsusb -d 2e8a:000f >/dev/null
     runzero picotool load --force --update --verify --execute {{ root }}/build/rp-extio-firmware.uf2
+
+# Build and flash ESP32-C3 firmware through an explicit serial device.
+_flash-esp32c3 port:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v espflash >/dev/null || { echo "espflash is required" >&2; exit 1; }
+    cargo firmware-esp32c3
+    espflash flash --chip esp32c3 --port {{ quote(port) }} --non-interactive {{ root }}/target/riscv32imc-unknown-none-elf/release/rp-extio-firmware-esp32c3
 
 # Build optimized daemon and control binaries.
 release:
