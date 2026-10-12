@@ -12,6 +12,7 @@ pub const MAX_I2C_MESSAGES: usize = 16;
 pub const MAX_SPI_SEGMENTS: usize = 16;
 pub const USB_REPLY: u8 = 1;
 pub const SERIAL_FRAME_VERSION: u8 = 1;
+pub const CONTROL_SERIAL_BAUD: u32 = 921_600;
 pub const MAX_SERIAL_BODY: usize = USB_HEADER_LEN + MAX_PAYLOAD;
 pub const MAX_SERIAL_RAW_FRAME: usize = 8 + MAX_SERIAL_BODY + 4;
 pub const MAX_SERIAL_FRAME: usize = MAX_SERIAL_RAW_FRAME + MAX_SERIAL_RAW_FRAME / 254 + 2;

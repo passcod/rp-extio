@@ -1459,9 +1459,9 @@ async fn drain_stale_input(in_endpoint: &mut Endpoint<Bulk, In>) -> io::Result<(
     Err(invalid("too much stale USB input"))
 }
 
-struct UsbReply {
-    header: UsbHeader,
-    payload: Vec<u8>,
+pub(crate) struct UsbReply {
+    pub(crate) header: UsbHeader,
+    pub(crate) payload: Vec<u8>,
 }
 
 struct UsbFailure {
@@ -1529,7 +1529,7 @@ async fn transfer(
     }
 }
 
-fn encode_transaction(transaction: &Transaction) -> io::Result<(Operation, Vec<u8>)> {
+pub(crate) fn encode_transaction(transaction: &Transaction) -> io::Result<(Operation, Vec<u8>)> {
     let mut payload = Vec::new();
     match transaction {
         Transaction::I2c { bus_id, messages } => {
@@ -1617,7 +1617,7 @@ fn encode_transaction(transaction: &Transaction) -> io::Result<(Operation, Vec<u
     }
 }
 
-fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<BackendReply> {
+pub(crate) fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<BackendReply> {
     if reply.header.status != Status::Ok {
         if reply.payload.len() != 4 {
             return Err(invalid("USB error reply has trailing data"));
@@ -1740,7 +1740,7 @@ fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Result<Backen
     }
 }
 
-fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
+pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig> {
     let mut offset = 0;
     let mut generation = None;
     let mut board = None;
