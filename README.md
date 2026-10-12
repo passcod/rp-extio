@@ -139,7 +139,7 @@ Notes:
 - PWM channels can route independently. Channels 0/4 and 1/5 share LEDC timers,
   so each pair must use the same period while both outputs are active.
 - I2C initially runs at 100 kHz.
-- SPI accepts 50 kHz through 20 MHz, modes 0–3, 8-bit words, MSB- or LSB-first
+- SPI accepts 78.125 kHz through 20 MHz, modes 0–3, 8-bit words, MSB- or LSB-first
   transfers, active-high or active-low chip select, and no-CS transfers.
 - UART1 appears as `/dev/ttyRPE*` when enabled and follows standard termios
   settings up to 5 Mbaud.

@@ -568,10 +568,10 @@ both the CLI and TUI. Move the button and loopback fixtures from the Pico
 section across GPIO1–GPIO7, GPIO10, GPIO18, and GPIO19. Test GPIO2 and GPIO9
 last, with no external pull that can change their reset strap level.
 
-Set the onboard LED to red, green, blue, white, and off with `rp-extioctl led`
-and the TUI. Assign another signal to GPIO8 and confirm LED operations report
-busy without changing that signal. Release GPIO8 and confirm colour control
-returns.
+Set the onboard LED to red, green, blue, white, and off with `rp-extioctl
+onboard-led` and the TUI. Assign another signal to GPIO8 and confirm LED
+operations report busy without changing that signal. Release GPIO8 and confirm
+colour control returns.
 
 ### I²C and SPI
 
@@ -582,9 +582,10 @@ reflashing.
 
 For SPI, substitute GPIO6 SCK, GPIO7 MOSI, GPIO3 MISO, GPIO10 CS0, and GPIO1
 CS1. Run loopback and peripheral tests, disable CS1 while CS0 remains active,
-then move every SPI signal to a second conflict-free map. Induce a rejected
-speed or malformed segment while monitoring both chip selects; neither chip
-select may remain asserted after the error.
+then move every SPI signal to a second conflict-free map. The supported range
+is 78.125 kHz through 20 MHz. Induce a rejected speed or malformed segment
+while monitoring both chip selects; neither chip select may remain asserted
+after the error.
 
 The C3 profile exposes one I²C and one SPI controller. Do not run the Pico
 second-controller cases for this board.

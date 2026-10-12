@@ -237,13 +237,18 @@ impl<'d> Esp32C3Board<'d> {
 			.unwrap()
 			.with_pin(self.route_flex(8));
 		let transaction = channel.transmit(&pulses).map_err(|(_, channel)| {
-			self.led_channel = Some(channel);
+			self.led_channel = Some(channel.with_pin(NoPin));
 			BusFailure::new(Status::IoError, 0)
 		})?;
-		self.led_channel = Some(transaction.wait().map_err(|(_, channel)| {
-			self.led_channel = Some(channel);
-			BusFailure::new(Status::IoError, 0)
-		})?);
+		self.led_channel = Some(
+			transaction
+				.wait()
+				.map_err(|(_, channel)| {
+					self.led_channel = Some(channel.with_pin(NoPin));
+					BusFailure::new(Status::IoError, 0)
+				})?
+				.with_pin(NoPin),
+		);
 		Ok(())
 	}
 
