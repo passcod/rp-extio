@@ -10,8 +10,8 @@ use rp_extio_firmware::{
 use rp_extio_wire::{
 	BoardKind, ClockSource, DeviceIdentity, GPIO_BIAS_NONE, GPIO_BIAS_PULL_DOWN, GPIO_BIAS_PULL_UP,
 	GPIO_DIRECTION_INPUT, GPIO_DIRECTION_OUTPUT, GPIO_GET, GPIO_GET_DIRECTION, GPIO_SET,
-	GPIO_SET_BIAS, HEADER_PINS, I2C_READ, I2C_TEN_BIT, I2cRequest, Peripheral, PinMap, PinSignal,
-	PinValidationError, PinValidationKind, PwmState, SpiRequest, Status, clock_divider,
+	GPIO_SET_BIAS, HEADER_PINS, I2C_READ, I2C_TEN_BIT, I2cRequest, LedState, Peripheral, PinMap,
+	PinSignal, PinValidationError, PinValidationKind, PwmState, SpiRequest, Status, clock_divider,
 };
 
 const TRANSACTION_DEADLINE_US: u64 = 5_000_000;
@@ -21,6 +21,7 @@ static UART_ENABLED: AtomicU8 = AtomicU8::new(0);
 
 pub struct Pico2Board<'d> {
 	pins: [Flex<'d>; HEADER_PINS.len()],
+	led: Flex<'d>,
 	_spi0: Peri<'d, SPI0>,
 	_spi1: Peri<'d, SPI1>,
 	_uart0: Peri<'d, UART0>,
@@ -31,6 +32,7 @@ pub struct Pico2Board<'d> {
 	gpio_pull_ups: u32,
 	gpio_pull_downs: u32,
 	pwm_states: [PwmState; rp_extio_wire::PWM_CHANNEL_COUNT],
+	led_state: LedState,
 	pin_map: PinMap,
 	generation: u64,
 	identity: DeviceIdentity,
@@ -39,6 +41,7 @@ pub struct Pico2Board<'d> {
 impl<'d> Pico2Board<'d> {
 	pub fn new(
 		mut pins: [Flex<'d>; HEADER_PINS.len()],
+		mut led: Flex<'d>,
 		spi0: Peri<'d, SPI0>,
 		spi1: Peri<'d, SPI1>,
 		uart0: Peri<'d, UART0>,
@@ -51,8 +54,11 @@ impl<'d> Pico2Board<'d> {
 			pin.set_as_input();
 			pin.set_pull(Pull::None);
 		}
+		led.set_low();
+		led.set_as_output();
 		let mut board = Self {
 			pins,
+			led,
 			_spi0: spi0,
 			_spi1: spi1,
 			_uart0: uart0,
@@ -69,6 +75,7 @@ impl<'d> Pico2Board<'d> {
 				period_ns: 1_000_000,
 				duty_ns: 0,
 			}),
+			led_state: LedState::OFF,
 			pin_map,
 			generation: 0,
 			identity,
@@ -754,6 +761,8 @@ impl Board for Pico2Board<'_> {
 
 	fn disconnect(&mut self) {
 		self.neutralize();
+		self.led.set_low();
+		self.led_state = LedState::OFF;
 	}
 
 	fn gpio_command(&mut self, command: u8, line: u8, value: u8) -> Result<u8, BusFailure> {
@@ -953,5 +962,20 @@ impl Board for Pico2Board<'_> {
 		};
 		self.pwm_states[channel] = applied;
 		Ok(applied)
+	}
+
+	fn onboard_led_state(&self) -> Result<LedState, BusFailure> {
+		Ok(self.led_state)
+	}
+
+	fn onboard_led_apply(&mut self, requested: LedState) -> Result<LedState, BusFailure> {
+		let on = requested.red == 255 && requested.green == 255 && requested.blue == 255;
+		if requested != LedState::OFF && !on {
+			return Err(BusFailure::new(Status::Unsupported, 0));
+		}
+		self.led
+			.set_level(if on { Level::High } else { Level::Low });
+		self.led_state = requested;
+		Ok(requested)
 	}
 }

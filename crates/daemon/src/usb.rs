@@ -2,7 +2,7 @@ use crate::{
 	backend::{Backend, BackendReply, Transaction},
 	control::{
 		BoardInfo, ButtonConfig, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo,
-		GpioStartup, PwmInfo, validate_buttons_for, validate_gpio_startup_for,
+		GpioStartup, LedInfo, PwmInfo, validate_buttons_for, validate_gpio_startup_for,
 		validate_pwm_startup,
 	},
 	kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
@@ -17,9 +17,10 @@ use nusb::{
 };
 use rp_extio_wire::{
 	BOARD_CAPABILITY_VERSION, BoardKind, CAP_ADC, CAP_BOARD, CAP_CLOCK, CAP_GENERAL, CAP_GPIO,
-	CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity, MAX_GPIO_LINES,
-	MAX_PAYLOAD, Operation, PIN_MAP_LEN, Peripheral, PinMap, PinValidationError, PwmState, Status,
-	TransportKind, USB_HEADER_LEN, UsbHeader,
+	CAP_I2C, CAP_ONBOARD_LED, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity, LED_GET,
+	LED_SET, LedState, MAX_GPIO_LINES, MAX_PAYLOAD, OnboardLed, OnboardLedKind, Operation,
+	PIN_MAP_LEN, Peripheral, PinMap, PinValidationError, PwmState, Status, TransportKind,
+	USB_HEADER_LEN, UsbHeader,
 };
 use std::{
 	collections::{HashMap, HashSet},
@@ -44,6 +45,7 @@ pub struct NegotiatedConfig {
 	pub board_kind: BoardKind,
 	pub transport: TransportKind,
 	pub identity: DeviceIdentity,
+	pub onboard_led: Option<OnboardLed>,
 	pub registration: RegistrationConfig,
 	pub pin_map: PinMap,
 	pub generation: u64,
@@ -477,6 +479,7 @@ fn board_info(
 		gpio_instance: Some(device.registration.gpio_instance_id()),
 		iio_device: device.registration.iio_device,
 		pwm_chip: device.registration.pwm_chip,
+		onboard_led: device.config.onboard_led.map(Into::into),
 		gpio_startup: gpio_startup.to_vec(),
 		pwm_startup: pwm_startup.to_vec(),
 		buttons: buttons.to_vec(),
@@ -501,6 +504,7 @@ fn disconnected_info(
 		gpio_instance: None,
 		iio_device: None,
 		pwm_chip: None,
+		onboard_led: None,
 		gpio_startup: gpio_startup.to_vec(),
 		pwm_startup: pwm_startup.to_vec(),
 		buttons: buttons.to_vec(),
@@ -776,6 +780,28 @@ async fn handle_control(
 				}
 			}
 		}
+		ControlRequest::OnboardLedGet { serial } => {
+			control_onboard_led(devices, &serial, LED_GET, LedState::OFF).await
+		}
+		ControlRequest::OnboardLedSet {
+			serial,
+			red,
+			green,
+			blue,
+		} => {
+			control_onboard_led(
+				devices,
+				&serial,
+				LED_SET,
+				LedState {
+					index: 0,
+					red,
+					green,
+					blue,
+				},
+			)
+			.await
+		}
 		ControlRequest::GpioSnapshot { serial } => {
 			let Some(id) = find_device(devices, &serial) else {
 				return disconnected(&serial);
@@ -1040,6 +1066,73 @@ async fn control_pwm(
 		return ControlResponse::error("protocol", "mismatched PWM reply");
 	}
 	ControlResponse::Pwm { pwm: state.into() }
+}
+
+async fn control_onboard_led(
+	devices: &HashMap<DeviceKey, ConnectedDevice>,
+	serial: &str,
+	command: u8,
+	state: LedState,
+) -> ControlResponse {
+	let Some(id) = find_device(devices, serial) else {
+		return disconnected(serial);
+	};
+	let device = &devices[&id];
+	let Some(led) = device.config.onboard_led else {
+		return ControlResponse::error("unsupported", format!("{serial} has no onboard LED"));
+	};
+	if device
+		.config
+		.board_kind
+		.profile()
+		.gpio_pins()
+		.contains(&led.pin)
+		&& gpio_line(device, led.pin).is_none()
+	{
+		return ControlResponse::error(
+			"busy",
+			format!(
+				"onboard LED pin GPIO{} is routed to another signal",
+				led.pin
+			),
+		);
+	}
+	if command == LED_SET
+		&& led.kind == OnboardLedKind::Monochrome
+		&& state != LedState::OFF
+		&& (state.red, state.green, state.blue) != (255, 255, 255)
+	{
+		return ControlResponse::error(
+			"unsupported",
+			"monochrome onboard LEDs accept only off or white",
+		);
+	}
+	let reply = device
+		.backend
+		.transact(Transaction::OnboardLed {
+			command,
+			index: state.index,
+			red: state.red,
+			green: state.green,
+			blue: state.blue,
+		})
+		.await;
+	if let Some(error) = backend_error(reply.status, "onboard LED operation") {
+		return error;
+	}
+	let Ok((reply_command, state)) = LedState::decode(&reply.data) else {
+		return ControlResponse::error("protocol", "invalid onboard LED reply");
+	};
+	if reply.completed != 1 || reply_command != command {
+		return ControlResponse::error("protocol", "mismatched onboard LED reply");
+	}
+	ControlResponse::OnboardLed {
+		led: LedInfo {
+			red: state.red,
+			green: state.green,
+			blue: state.blue,
+		},
+	}
 }
 
 fn gpio_line(device: &ConnectedDevice, pin: u8) -> Option<u8> {
@@ -1836,6 +1929,14 @@ pub(crate) fn encode_transaction(transaction: &Transaction) -> io::Result<(Opera
 				.encode(*command)
 				.to_vec(),
 		)),
+		Transaction::OnboardLed { command, .. } => Ok((
+			Operation::OnboardLed,
+			transaction
+				.led_state()
+				.expect("onboard LED transaction has state")
+				.encode(*command)
+				.to_vec(),
+		)),
 	}
 }
 
@@ -1958,6 +2059,21 @@ pub(crate) fn decode_reply(transaction: &Transaction, reply: UsbReply) -> io::Re
 				effective_speeds: Vec::new(),
 			})
 		}
+		Transaction::OnboardLed { command, .. } => {
+			let (reply_command, state) = LedState::decode(&reply.payload)
+				.map_err(|_| invalid("invalid onboard LED reply"))?;
+			if reply_command != *command
+				|| Some(state.index) != transaction.led_state().map(|state| state.index)
+			{
+				return Err(invalid("mismatched onboard LED reply"));
+			}
+			Ok(BackendReply {
+				status: Status::Ok as i32,
+				completed: 1,
+				data: state.encode(reply_command).to_vec(),
+				effective_speeds: Vec::new(),
+			})
+		}
 	}
 }
 
@@ -1973,6 +2089,7 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 	let mut adc = None;
 	let mut pwm = None;
 	let mut clocks = None;
+	let mut onboard_led = None;
 	while offset < payload.len() {
 		if payload.len() - offset < 4 {
 			return Err(invalid("truncated capability record"));
@@ -2133,6 +2250,16 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 				}
 				clocks = Some(value.to_vec());
 			}
+			CAP_ONBOARD_LED => {
+				if onboard_led.is_some() || value.len() != 4 || value[0] != 1 || value[3] != 0 {
+					return Err(invalid("invalid onboard LED capability"));
+				}
+				onboard_led = Some(OnboardLed {
+					kind: OnboardLedKind::try_from(value[1])
+						.map_err(|_| invalid("unsupported onboard LED kind"))?,
+					pin: value[2],
+				});
+			}
 			_ => {}
 		}
 	}
@@ -2147,6 +2274,11 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 	let (pwm_clock_hz, pwm_enabled, pwm_pins) =
 		pwm.ok_or_else(|| invalid("PWM capability missing"))?;
 	let clocks = clocks.ok_or_else(|| invalid("clock capability missing"))?;
+	if onboard_led.is_some_and(|led| led != profile.onboard_led()) {
+		return Err(invalid(
+			"onboard LED capability does not match board profile",
+		));
+	}
 	pin_map
 		.validate_for(profile)
 		.map_err(|_| invalid("invalid peripheral pin map"))?;
@@ -2207,6 +2339,7 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 		board_kind,
 		transport,
 		identity,
+		onboard_led,
 		registration: RegistrationConfig {
 			i2c: i2c.map(|capability| capability.map(|(speed_hz, _)| I2cRegistration { speed_hz })),
 			spi: spi.map(|capability| {
@@ -2289,6 +2422,12 @@ mod tests {
 		board.extend_from_slice(&profile.supported_signals().to_le_bytes());
 		board.extend_from_slice(identity);
 		capability_record(&mut payload, CAP_BOARD, &board);
+		let led = profile.onboard_led();
+		capability_record(
+			&mut payload,
+			CAP_ONBOARD_LED,
+			&[1, led.kind as u8, led.pin, 0],
+		);
 		for bus in 0..2 {
 			if map.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {
 				let mut value = vec![bus as u8, 0];
@@ -2354,6 +2493,7 @@ mod tests {
 				board_kind: BoardKind::Pico2,
 				transport: TransportKind::UsbBulk,
 				identity: DeviceIdentity::new(b"TEST").unwrap(),
+				onboard_led: Some(BoardKind::Pico2.profile().onboard_led()),
 				registration: RegistrationConfig::PICO2,
 				pin_map: rp_extio_wire::DEFAULT_PIN_MAP,
 				generation: 0,

@@ -26,6 +26,7 @@ pub const CAP_ADC: u16 = 7;
 pub const CAP_PWM: u16 = 8;
 pub const CAP_CLOCK: u16 = 9;
 pub const CAP_BOARD: u16 = 10;
+pub const CAP_ONBOARD_LED: u16 = 11;
 pub const BOARD_CAPABILITY_VERSION: u8 = 1;
 pub const MAX_DEVICE_ID_LEN: usize = 16;
 pub const GPIO_GET: u8 = 1;
@@ -43,6 +44,9 @@ pub const PWM_APPLY: u8 = 2;
 pub const PWM_ENABLED: u16 = 1 << 0;
 pub const PWM_INVERTED: u16 = 1 << 1;
 pub const PWM_STATE_LEN: usize = 20;
+pub const LED_GET: u8 = 1;
+pub const LED_SET: u8 = 2;
+pub const LED_STATE_LEN: usize = 8;
 pub const HEADER_PINS: [u8; 26] = [
 	0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 26, 27, 28,
 ];
@@ -99,6 +103,31 @@ impl TryFrom<u8> for TransportKind {
 pub enum PinWarning {
 	BootStrap,
 	OnboardRgbLed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum OnboardLedKind {
+	Monochrome = 1,
+	Rgb = 2,
+}
+
+impl TryFrom<u8> for OnboardLedKind {
+	type Error = WireError;
+
+	fn try_from(value: u8) -> Result<Self, Self::Error> {
+		match value {
+			1 => Ok(Self::Monochrome),
+			2 => Ok(Self::Rgb),
+			_ => Err(WireError::Unsupported),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OnboardLed {
+	pub kind: OnboardLedKind,
+	pub pin: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -211,6 +240,19 @@ impl BoardProfile {
 		}
 	}
 
+	pub const fn onboard_led(self) -> OnboardLed {
+		match self.kind {
+			BoardKind::Pico2 => OnboardLed {
+				kind: OnboardLedKind::Monochrome,
+				pin: 25,
+			},
+			BoardKind::Esp32C3DevKitM1 => OnboardLed {
+				kind: OnboardLedKind::Rgb,
+				pin: 8,
+			},
+		}
+	}
+
 	const fn requires_adjacent_i2c_pins(self) -> bool {
 		matches!(self.kind, BoardKind::Pico2)
 	}
@@ -283,6 +325,7 @@ pub enum Operation {
 	ConfigurePins = 5,
 	AdcRead = 6,
 	Pwm = 7,
+	OnboardLed = 8,
 }
 
 impl TryFrom<u8> for Operation {
@@ -296,6 +339,7 @@ impl TryFrom<u8> for Operation {
 			5 => Ok(Self::ConfigurePins),
 			6 => Ok(Self::AdcRead),
 			7 => Ok(Self::Pwm),
+			8 => Ok(Self::OnboardLed),
 			_ => Err(WireError::Unsupported),
 		}
 	}
@@ -645,6 +689,53 @@ pub struct PwmState {
 	pub inverted: bool,
 	pub period_ns: u64,
 	pub duty_ns: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LedState {
+	pub index: u8,
+	pub red: u8,
+	pub green: u8,
+	pub blue: u8,
+}
+
+impl LedState {
+	pub const OFF: Self = Self {
+		index: 0,
+		red: 0,
+		green: 0,
+		blue: 0,
+	};
+
+	pub fn encode(self, command: u8) -> [u8; LED_STATE_LEN] {
+		[
+			command, self.index, self.red, self.green, self.blue, 0, 0, 0,
+		]
+	}
+
+	pub fn decode(bytes: &[u8]) -> Result<(u8, Self), WireError> {
+		if bytes.len() != LED_STATE_LEN {
+			return Err(WireError::Truncated);
+		}
+		if !matches!(bytes[0], LED_GET | LED_SET) || bytes[1] != 0 || bytes[5..] != [0; 3] {
+			return Err(WireError::Invalid);
+		}
+		Ok((
+			bytes[0],
+			Self {
+				index: bytes[1],
+				red: bytes[2],
+				green: bytes[3],
+				blue: bytes[4],
+			},
+		))
+	}
+}
+
+impl Default for LedState {
+	fn default() -> Self {
+		Self::OFF
+	}
 }
 
 impl PwmState {
@@ -1765,6 +1856,37 @@ mod tests {
 		let mut invalid = state.encode(PWM_APPLY);
 		invalid[12..20].copy_from_slice(&21_000_000_u64.to_le_bytes());
 		assert_eq!(PwmState::decode(&invalid), Err(WireError::Invalid));
+	}
+
+	#[test]
+	fn onboard_led_profiles_and_states_are_explicit() {
+		assert_eq!(
+			BoardKind::Pico2.profile().onboard_led(),
+			OnboardLed {
+				kind: OnboardLedKind::Monochrome,
+				pin: 25,
+			}
+		);
+		assert_eq!(
+			BoardKind::Esp32C3DevKitM1.profile().onboard_led(),
+			OnboardLed {
+				kind: OnboardLedKind::Rgb,
+				pin: 8,
+			}
+		);
+		let state = LedState {
+			index: 0,
+			red: 12,
+			green: 34,
+			blue: 56,
+		};
+		assert_eq!(
+			LedState::decode(&state.encode(LED_SET)),
+			Ok((LED_SET, state))
+		);
+		let mut invalid = state.encode(LED_SET);
+		invalid[7] = 1;
+		assert_eq!(LedState::decode(&invalid), Err(WireError::Invalid));
 	}
 
 	#[test]

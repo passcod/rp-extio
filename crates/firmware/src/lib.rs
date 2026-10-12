@@ -2,9 +2,10 @@
 
 use rp_extio_wire::{
 	BOARD_CAPABILITY_VERSION, BoardKind, CAP_ADC, CAP_BOARD, CAP_CLOCK, CAP_GENERAL, CAP_GPIO,
-	CAP_I2C, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity, I2cRequest, MAX_PAYLOAD,
-	Operation, PWM_APPLY, PWM_GET, Peripheral, PinMap, PinValidationError, PinValidationKind,
-	PwmState, SPI_CS_CHANGE, SpiRequest, Status, UsbHeader, WireError, Writer,
+	CAP_I2C, CAP_ONBOARD_LED, CAP_PIN_CONFIG, CAP_PWM, CAP_SPI, CAP_UART, DeviceIdentity,
+	I2cRequest, LED_GET, LED_SET, LedState, MAX_PAYLOAD, Operation, PWM_APPLY, PWM_GET, Peripheral,
+	PinMap, PinValidationError, PinValidationKind, PwmState, SPI_CS_CHANGE, SpiRequest, Status,
+	UsbHeader, WireError, Writer,
 };
 
 pub use rp_extio_wire::DEFAULT_PIN_MAP;
@@ -97,6 +98,14 @@ pub trait Board {
 	fn pwm_state(&self, channel: u8) -> Result<PwmState, BusFailure>;
 
 	fn pwm_apply(&mut self, state: PwmState) -> Result<PwmState, BusFailure>;
+
+	fn onboard_led_state(&self) -> Result<LedState, BusFailure> {
+		Err(BusFailure::new(Status::Unsupported, 0))
+	}
+
+	fn onboard_led_apply(&mut self, _state: LedState) -> Result<LedState, BusFailure> {
+		Err(BusFailure::new(Status::Unsupported, 0))
+	}
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -126,6 +135,7 @@ pub fn dispatch<B: Board>(
 		Operation::GpioCommand => gpio(payload, board, response),
 		Operation::AdcRead => adc(payload, board, response),
 		Operation::Pwm => pwm(payload, board, response),
+		Operation::OnboardLed => onboard_led(payload, board, response),
 		Operation::ConfigurePins => unreachable!(),
 	};
 
@@ -182,6 +192,13 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
 		out.push(identity.len() as u8)?;
 		out.extend(&profile.supported_signals().to_le_bytes())?;
 		out.extend(identity.as_bytes())
+	})?;
+	let led = profile.onboard_led();
+	record(&mut out, CAP_ONBOARD_LED, 4, |out| {
+		out.push(1)?;
+		out.push(led.kind as u8)?;
+		out.push(led.pin)?;
+		out.push(0)
 	})?;
 	for bus in 0..2 {
 		if pins.is_enabled([Peripheral::I2c0, Peripheral::I2c1][bus]) {
@@ -329,6 +346,22 @@ fn pwm<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<u
 	};
 	response[..rp_extio_wire::PWM_STATE_LEN].copy_from_slice(&state.encode(command));
 	Ok(rp_extio_wire::PWM_STATE_LEN)
+}
+
+fn onboard_led<B: Board>(
+	payload: &[u8],
+	board: &mut B,
+	response: &mut [u8],
+) -> Result<usize, BusFailure> {
+	let (command, requested) =
+		LedState::decode(payload).map_err(|_| BusFailure::new(Status::BadFrame, 0))?;
+	let state = match command {
+		LED_GET => board.onboard_led_state()?,
+		LED_SET => board.onboard_led_apply(requested)?,
+		_ => return Err(BusFailure::new(Status::BadFrame, 0)),
+	};
+	response[..rp_extio_wire::LED_STATE_LEN].copy_from_slice(&state.encode(command));
+	Ok(rp_extio_wire::LED_STATE_LEN)
 }
 
 fn configure_pins<B: Board>(

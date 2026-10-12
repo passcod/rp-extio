@@ -214,6 +214,7 @@ async fn main(_spawner: embassy_executor::Spawner) -> ! {
 			Flex::new(peripherals.PIN_27),
 			Flex::new(peripherals.PIN_28),
 		],
+		Flex::new(peripherals.PIN_25),
 		peripherals.SPI0,
 		peripherals.SPI1,
 		peripherals.UART0,

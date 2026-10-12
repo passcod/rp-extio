@@ -591,7 +591,7 @@ impl Request {
 					duty_ns: state.duty_ns,
 				}
 			}
-			Operation::Hello | Operation::ConfigurePins => unreachable!(),
+			Operation::Hello | Operation::ConfigurePins | Operation::OnboardLed => unreachable!(),
 		};
 		Ok(Self {
 			operation,
@@ -686,6 +686,7 @@ impl Request {
 				&& reply.data.len() == rp_extio_wire::PWM_STATE_LEN
 				&& reply.effective_speeds.is_empty())
 			.then(|| reply.data.clone()),
+			Transaction::OnboardLed { .. } => None,
 		}
 	}
 }

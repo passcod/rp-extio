@@ -72,6 +72,11 @@ enum Command {
 		#[arg(long)]
 		active_low: bool,
 	},
+	/// Read or drive the board's built-in LED
+	OnboardLed {
+		#[command(subcommand)]
+		command: OnboardLedCommand,
+	},
 	/// Wait for a configured button level or transition
 	Button {
 		serial: String,
@@ -123,6 +128,25 @@ enum PwmCommand {
 	Forget {
 		serial: String,
 		channel: u8,
+	},
+}
+
+#[derive(Subcommand)]
+enum OnboardLedCommand {
+	Get {
+		serial: String,
+	},
+	On {
+		serial: String,
+	},
+	Off {
+		serial: String,
+	},
+	Rgb {
+		serial: String,
+		red: u8,
+		green: u8,
+		blue: u8,
 	},
 }
 
@@ -603,6 +627,35 @@ fn main() -> Result<(), Box<dyn Error>> {
 				cli.json,
 			)
 		}
+		Command::OnboardLed { command } => {
+			let request = match command {
+				OnboardLedCommand::Get { serial } => ControlRequest::OnboardLedGet { serial },
+				OnboardLedCommand::On { serial } => ControlRequest::OnboardLedSet {
+					serial,
+					red: 255,
+					green: 255,
+					blue: 255,
+				},
+				OnboardLedCommand::Off { serial } => ControlRequest::OnboardLedSet {
+					serial,
+					red: 0,
+					green: 0,
+					blue: 0,
+				},
+				OnboardLedCommand::Rgb {
+					serial,
+					red,
+					green,
+					blue,
+				} => ControlRequest::OnboardLedSet {
+					serial,
+					red,
+					green,
+					blue,
+				},
+			};
+			output(client.request(&request)?, cli.json)
+		}
 		Command::Button {
 			serial,
 			pin,
@@ -824,6 +877,12 @@ fn output(response: ControlResponse, json: bool) -> Result<(), Box<dyn Error>> {
 					pwm.period_ns,
 					pwm.duty_ns,
 					if pwm.inverted { "inverted" } else { "normal" }
+				);
+			}
+			ControlResponse::OnboardLed { led } => {
+				println!(
+					"onboard LED: #{:02x}{:02x}{:02x}",
+					led.red, led.green, led.blue
 				);
 			}
 			ControlResponse::GpioSnapshot { gpio } => {
@@ -1337,6 +1396,7 @@ mod tests {
 			gpio_instance: Some(9),
 			iio_device: Some(4),
 			pwm_chip: Some(5),
+			onboard_led: None,
 			gpio_startup: vec![],
 			pwm_startup: vec![],
 			buttons: vec![],

@@ -66,6 +66,7 @@ struct Device {
 	gpio_pull_downs: u32,
 	adc_values: [u16; 3],
 	pwm: [Option<rp_extio_wire::PwmState>; 16],
+	onboard_led: rp_extio_wire::LedState,
 }
 #[derive(Default)]
 pub struct Simulator {
@@ -137,6 +138,7 @@ impl Simulator {
 					state.gpio_pull_ups = 0;
 					state.gpio_pull_downs = 0;
 					state.pwm = [None; 16];
+					state.onboard_led = rp_extio_wire::LedState::OFF;
 					Response::Ok
 				}
 				None => Response::Error {
@@ -301,6 +303,23 @@ impl Backend for SimBackend {
 						return BackendReply::error(Status::Busy);
 					}
 					device.pwm[channel] = Some(requested);
+					requested
+				}
+				_ => return BackendReply::error(Status::BadFrame),
+			};
+			return BackendReply {
+				status: Status::Ok as i32,
+				completed: 1,
+				data: state.encode(*command).to_vec(),
+				effective_speeds: vec![],
+			};
+		}
+		if let Transaction::OnboardLed { command, .. } = &transaction {
+			let requested = transaction.led_state().unwrap();
+			let state = match *command {
+				rp_extio_wire::LED_GET => device.onboard_led,
+				rp_extio_wire::LED_SET => {
+					device.onboard_led = requested;
 					requested
 				}
 				_ => return BackendReply::error(Status::BadFrame),

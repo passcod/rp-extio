@@ -258,6 +258,15 @@ pub enum ControlRequest {
 		serial: String,
 		channel: u8,
 	},
+	OnboardLedGet {
+		serial: String,
+	},
+	OnboardLedSet {
+		serial: String,
+		red: u8,
+		green: u8,
+		blue: u8,
+	},
 	GpioSnapshot {
 		serial: String,
 	},
@@ -297,6 +306,7 @@ impl ControlRequest {
 				| Self::Show { .. }
 				| Self::AdcRead { .. }
 				| Self::PwmGet { .. }
+				| Self::OnboardLedGet { .. }
 				| Self::GpioSnapshot { .. }
 		)
 	}
@@ -360,6 +370,32 @@ pub struct PwmInfo {
 	pub duty_ns: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OnboardLedInfo {
+	pub kind: String,
+	pub pin: u8,
+}
+
+impl From<rp_extio_wire::OnboardLed> for OnboardLedInfo {
+	fn from(led: rp_extio_wire::OnboardLed) -> Self {
+		Self {
+			kind: match led.kind {
+				rp_extio_wire::OnboardLedKind::Monochrome => "monochrome",
+				rp_extio_wire::OnboardLedKind::Rgb => "rgb",
+			}
+			.into(),
+			pin: led.pin,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LedInfo {
+	pub red: u8,
+	pub green: u8,
+	pub blue: u8,
+}
+
 impl From<rp_extio_wire::PwmState> for PwmInfo {
 	fn from(state: rp_extio_wire::PwmState) -> Self {
 		Self {
@@ -396,6 +432,7 @@ pub struct BoardInfo {
 	pub gpio_instance: Option<u32>,
 	pub iio_device: Option<i32>,
 	pub pwm_chip: Option<i32>,
+	pub onboard_led: Option<OnboardLedInfo>,
 	pub gpio_startup: Vec<GpioStartup>,
 	pub pwm_startup: Vec<PwmInfo>,
 	#[serde(default)]
@@ -442,6 +479,9 @@ pub enum ControlResponse {
 	},
 	Pwm {
 		pwm: PwmInfo,
+	},
+	OnboardLed {
+		led: LedInfo,
 	},
 	GpioSnapshot {
 		gpio: Vec<GpioInfo>,
@@ -1284,6 +1324,7 @@ mod tests {
 				gpio_instance: Some(99),
 				iio_device: Some(2),
 				pwm_chip: Some(1),
+				onboard_led: None,
 				gpio_startup: vec![GpioStartup::Output {
 					pin: 22,
 					value: true,

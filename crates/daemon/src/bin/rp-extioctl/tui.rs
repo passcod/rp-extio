@@ -2265,6 +2265,7 @@ mod tests {
 				gpio_instance: Some(3),
 				iio_device: Some(0),
 				pwm_chip: Some(0),
+				onboard_led: None,
 				gpio_startup: vec![],
 				pwm_startup: vec![],
 				buttons: vec![],

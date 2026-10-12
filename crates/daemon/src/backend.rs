@@ -51,6 +51,13 @@ pub enum Transaction {
 		period_ns: u64,
 		duty_ns: u64,
 	},
+	OnboardLed {
+		command: u8,
+		index: u8,
+		red: u8,
+		green: u8,
+		blue: u8,
+	},
 }
 
 impl Transaction {
@@ -72,6 +79,25 @@ impl Transaction {
 			inverted: *inverted,
 			period_ns: *period_ns,
 			duty_ns: *duty_ns,
+		})
+	}
+
+	pub fn led_state(&self) -> Option<rp_extio_wire::LedState> {
+		let Self::OnboardLed {
+			index,
+			red,
+			green,
+			blue,
+			..
+		} = self
+		else {
+			return None;
+		};
+		Some(rp_extio_wire::LedState {
+			index: *index,
+			red: *red,
+			green: *green,
+			blue: *blue,
 		})
 	}
 }
