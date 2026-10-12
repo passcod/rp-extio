@@ -9,7 +9,6 @@ if ((EUID != 0)); then
 fi
 
 ctl=$root/target/release/rp-extioctl
-install -m 0755 "$root/target/release/rp-extiod" "$ctl" /usr/local/bin/
 cleanup() {
 	status=$?
 	trap - EXIT
