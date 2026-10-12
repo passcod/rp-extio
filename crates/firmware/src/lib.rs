@@ -67,6 +67,18 @@ pub trait Board {
 
 	fn generation(&self) -> u64;
 
+	fn adc_resolution_bits(&self) -> u8 {
+		12
+	}
+
+	fn adc_reference_mv(&self) -> u16 {
+		3_300
+	}
+
+	fn pwm_clock_hz(&self) -> u32 {
+		embassy_clock_hz()
+	}
+
 	fn configure_pins(&mut self, map: PinMap, generation: u64) -> Result<(), PinValidationError>;
 
 	fn i2c_transfer(
@@ -250,23 +262,20 @@ fn hello<B: Board>(payload: &[u8], board: &B, response: &mut [u8]) -> Result<usi
 		out.u16(0)?;
 		out.extend(gpio_pins.as_slice())
 	})?;
-	record(&mut out, CAP_ADC, 7, |out| {
-		out.push(rp_extio_wire::ADC_CHANNEL_COUNT as u8)?;
-		out.push(12)?;
-		out.u16(3_300)?;
-		out.extend(&pins.adc_pins)
+	let adc_channels = profile.adc_channel_count();
+	record(&mut out, CAP_ADC, (4 + adc_channels) as u16, |out| {
+		out.push(adc_channels as u8)?;
+		out.push(board.adc_resolution_bits())?;
+		out.u16(board.adc_reference_mv())?;
+		out.extend(&pins.adc_pins[..adc_channels])
 	})?;
-	record(
-		&mut out,
-		CAP_PWM,
-		(7 + rp_extio_wire::PWM_CHANNEL_COUNT) as u16,
-		|out| {
-			out.push(rp_extio_wire::PWM_CHANNEL_COUNT as u8)?;
-			out.u32(embassy_clock_hz())?;
-			out.u16(pins.pwm_enabled)?;
-			out.extend(&pins.pwm_pins)
-		},
-	)?;
+	let pwm_channels = profile.pwm_channel_count();
+	record(&mut out, CAP_PWM, (7 + pwm_channels) as u16, |out| {
+		out.push(pwm_channels as u8)?;
+		out.u32(board.pwm_clock_hz())?;
+		out.u16(pins.pwm_enabled)?;
+		out.extend(&pins.pwm_pins[..pwm_channels])
+	})?;
 	record(&mut out, CAP_CLOCK, 14, |out| {
 		out.push(rp_extio_wire::CLOCK_OUTPUT_COUNT as u8)?;
 		out.push(pins.clock_enabled)?;
@@ -324,14 +333,14 @@ fn gpio<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<
 
 fn adc<B: Board>(payload: &[u8], board: &mut B, response: &mut [u8]) -> Result<usize, BusFailure> {
 	if payload.len() != 4
-		|| payload[0] as usize >= rp_extio_wire::ADC_CHANNEL_COUNT
+		|| payload[0] as usize >= board.board_kind().profile().adc_channel_count()
 		|| payload[1..] != [0, 0, 0]
 	{
 		return Err(BusFailure::new(Status::BadFrame, 0));
 	}
 	let channel = payload[0];
 	response[..2].copy_from_slice(&board.adc_read(channel)?.to_le_bytes());
-	response[2] = 12;
+	response[2] = board.adc_resolution_bits();
 	response[3] = channel;
 	Ok(4)
 }

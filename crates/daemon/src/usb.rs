@@ -662,7 +662,7 @@ async fn handle_control(
 				return disconnected(&serial);
 			};
 			let device = &devices[&id];
-			if channel as usize >= rp_extio_wire::ADC_CHANNEL_COUNT
+			if channel as usize >= device.config.board_kind.profile().adc_channel_count()
 				|| device.config.pin_map.adc_enabled & (1 << channel) == 0
 			{
 				return ControlResponse::error(
@@ -2214,10 +2214,12 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 				gpio_pins = Some(value[4..].to_vec());
 			}
 			CAP_ADC => {
+				let channels = value.first().copied().unwrap_or(0) as usize;
 				if adc.is_some()
-					|| value.len() != 7
-					|| value[0] as usize != rp_extio_wire::ADC_CHANNEL_COUNT
-					|| value[1] != 12
+					|| channels == 0
+					|| channels > rp_extio_wire::ADC_CHANNEL_COUNT
+					|| value.len() != 4 + channels
+					|| value[1] == 0
 					|| u16::from_le_bytes(value[2..4].try_into().unwrap()) == 0
 				{
 					return Err(invalid("invalid ADC capability"));
@@ -2225,13 +2227,15 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 				adc = Some((
 					value[1],
 					u16::from_le_bytes(value[2..4].try_into().unwrap()),
-					value[4..7].to_vec(),
+					value[4..].to_vec(),
 				));
 			}
 			CAP_PWM => {
+				let channels = value.first().copied().unwrap_or(0) as usize;
 				if pwm.is_some()
-					|| value.len() != 7 + rp_extio_wire::PWM_CHANNEL_COUNT
-					|| value[0] as usize != rp_extio_wire::PWM_CHANNEL_COUNT
+					|| channels == 0
+					|| channels > rp_extio_wire::PWM_CHANNEL_COUNT
+					|| value.len() != 7 + channels
 				{
 					return Err(invalid("invalid PWM capability"));
 				}
@@ -2313,9 +2317,11 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 	if expected_gpio.as_slice() != gpio_pins.as_slice() {
 		return Err(invalid("GPIO capability does not match peripheral pins"));
 	}
-	if adc_pins.as_slice() != pin_map.adc_pins
+	if adc_pins.len() != profile.adc_channel_count()
+		|| adc_pins.as_slice() != &pin_map.adc_pins[..profile.adc_channel_count()]
+		|| pwm_pins.len() != profile.pwm_channel_count()
 		|| pwm_enabled != pin_map.pwm_enabled
-		|| pwm_pins.as_slice() != pin_map.pwm_pins
+		|| pwm_pins.as_slice() != &pin_map.pwm_pins[..profile.pwm_channel_count()]
 		|| pwm_clock_hz == 0
 		|| clocks[1] != pin_map.clock_enabled
 	{
@@ -2357,12 +2363,12 @@ pub(crate) fn parse_capabilities(payload: &[u8]) -> io::Result<NegotiatedConfig>
 			gpio_lines: gpio_pins.len() as u16,
 			gpio_pins: gpio_array,
 			adc: Some(crate::kernel::AdcRegistration {
-				channels: rp_extio_wire::ADC_CHANNEL_COUNT as u8,
+				channels: profile.adc_channel_count() as u8,
 				resolution_bits: adc_bits,
 				reference_mv: adc_reference_mv,
 			}),
 			pwm: Some(crate::kernel::PwmRegistration {
-				channels: rp_extio_wire::PWM_CHANNEL_COUNT as u8,
+				channels: profile.pwm_channel_count() as u8,
 				enabled: pwm_enabled,
 				clock_hz: pwm_clock_hz,
 			}),
@@ -2466,14 +2472,14 @@ mod tests {
 		let mut value = vec![gpio.len() as u8, 0, 0, 0];
 		value.extend_from_slice(gpio.as_slice());
 		capability_record(&mut payload, CAP_GPIO, &value);
-		let mut value = vec![rp_extio_wire::ADC_CHANNEL_COUNT as u8, 12];
+		let mut value = vec![profile.adc_channel_count() as u8, 12];
 		value.extend_from_slice(&3_300_u16.to_le_bytes());
-		value.extend_from_slice(&map.adc_pins);
+		value.extend_from_slice(&map.adc_pins[..profile.adc_channel_count()]);
 		capability_record(&mut payload, CAP_ADC, &value);
-		let mut value = vec![rp_extio_wire::PWM_CHANNEL_COUNT as u8];
+		let mut value = vec![profile.pwm_channel_count() as u8];
 		value.extend_from_slice(&150_000_000_u32.to_le_bytes());
 		value.extend_from_slice(&map.pwm_enabled.to_le_bytes());
-		value.extend_from_slice(&map.pwm_pins);
+		value.extend_from_slice(&map.pwm_pins[..profile.pwm_channel_count()]);
 		capability_record(&mut payload, CAP_PWM, &value);
 		let mut value = vec![rp_extio_wire::CLOCK_OUTPUT_COUNT as u8, map.clock_enabled];
 		for output in 0..rp_extio_wire::CLOCK_OUTPUT_COUNT {

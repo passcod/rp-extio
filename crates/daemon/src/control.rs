@@ -13,7 +13,7 @@ const fn enabled_by_default() -> bool {
 	true
 }
 
-const fn default_adc_pins() -> [u8; 3] {
+const fn default_adc_pins() -> [u8; rp_extio_wire::ADC_CHANNEL_COUNT] {
 	rp_extio_wire::DEFAULT_PIN_MAP.adc_pins
 }
 
@@ -105,9 +105,9 @@ pub struct PinMapConfig {
 	pub spi1_cs1_enabled: bool,
 	pub spi1_cs1: u8,
 	#[serde(default)]
-	pub adc_enabled: [bool; 3],
+	pub adc_enabled: [bool; rp_extio_wire::ADC_CHANNEL_COUNT],
 	#[serde(default = "default_adc_pins")]
-	pub adc_pins: [u8; 3],
+	pub adc_pins: [u8; rp_extio_wire::ADC_CHANNEL_COUNT],
 	#[serde(default)]
 	pub pwm_enabled: [bool; 16],
 	#[serde(default = "default_pwm_pins")]
@@ -1167,6 +1167,8 @@ pub fn signal_name(signal: PinSignal) -> &'static str {
 		PinSignal::Adc0 => "adc0",
 		PinSignal::Adc1 => "adc1",
 		PinSignal::Adc2 => "adc2",
+		PinSignal::Adc3 => "adc3",
+		PinSignal::Adc4 => "adc4",
 		PinSignal::Pwm0A => "pwm0a",
 		PinSignal::Pwm0B => "pwm0b",
 		PinSignal::Pwm1A => "pwm1a",
@@ -1456,7 +1458,7 @@ mod tests {
 		assert_eq!(saved["boards"]["ABC"]["uart1_enabled"], false);
 		assert_eq!(
 			saved["boards"]["ABC"]["adc_enabled"],
-			serde_json::json!([false, false, false])
+			serde_json::json!([false, false, false, false, false])
 		);
 	}
 

@@ -461,7 +461,7 @@ impl<'d> Pico2Board<'d> {
 				uart_enabled |= 1 << bus;
 			}
 		}
-		for channel in 0..rp_extio_wire::ADC_CHANNEL_COUNT {
+		for channel in 0..rp_extio_wire::PICO2_ADC_CHANNEL_COUNT {
 			if map.adc_enabled & (1 << channel) != 0 {
 				let pin = map.adc_pins[channel];
 				Self::set_function(pin, 31);
@@ -845,7 +845,7 @@ impl Board for Pico2Board<'_> {
 	}
 
 	fn adc_read(&mut self, channel: u8) -> Result<u16, BusFailure> {
-		if channel as usize >= rp_extio_wire::ADC_CHANNEL_COUNT
+		if channel as usize >= rp_extio_wire::PICO2_ADC_CHANNEL_COUNT
 			|| self.pin_map.adc_enabled & (1 << channel) == 0
 		{
 			return Err(BusFailure::new(Status::Unsupported, 0));

@@ -53,10 +53,13 @@ pub const HEADER_PINS: [u8; 26] = [
 pub const ESP32_C3_GPIO_PINS: [u8; 13] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 18, 19];
 pub const ESP32_C3_TRANSPORT_PINS: [u8; 2] = [20, 21];
 pub const MAX_GPIO_LINES: usize = HEADER_PINS.len();
-pub const ADC_CHANNEL_COUNT: usize = 3;
+pub const ADC_CHANNEL_COUNT: usize = 5;
+pub const PICO2_ADC_CHANNEL_COUNT: usize = 3;
+pub const ESP32_C3_ADC_CHANNEL_COUNT: usize = 5;
 pub const PWM_CHANNEL_COUNT: usize = 16;
+pub const ESP32_C3_PWM_CHANNEL_COUNT: usize = 6;
 pub const CLOCK_OUTPUT_COUNT: usize = 2;
-pub const PIN_SIGNAL_COUNT: usize = 39;
+pub const PIN_SIGNAL_COUNT: usize = 41;
 pub const PIN_MAP_LEN: usize = PIN_SIGNAL_COUNT + 15;
 const SPI0_CS1_DISABLE_MASK: u8 = 1 << 6;
 const SPI1_CS1_DISABLE_MASK: u8 = 1 << 7;
@@ -183,7 +186,7 @@ impl BoardProfile {
 
 	pub const fn supports(self, signal: PinSignal) -> bool {
 		match self.kind {
-			BoardKind::Pico2 => true,
+			BoardKind::Pico2 => !matches!(signal, PinSignal::Adc3 | PinSignal::Adc4),
 			BoardKind::Esp32C3DevKitM1 => {
 				matches!(
 					signal,
@@ -197,7 +200,8 @@ impl BoardProfile {
 						| PinSignal::Spi0Cs0
 						| PinSignal::Spi0Cs1
 						| PinSignal::Adc0 | PinSignal::Adc1
-						| PinSignal::Adc2 | PinSignal::Pwm0A
+						| PinSignal::Adc2 | PinSignal::Adc3
+						| PinSignal::Adc4 | PinSignal::Pwm0A
 						| PinSignal::Pwm0B | PinSignal::Pwm1A
 						| PinSignal::Pwm1B | PinSignal::Pwm2A
 						| PinSignal::Pwm2B
@@ -226,9 +230,25 @@ impl BoardProfile {
 				PinSignal::Adc0 => &[0],
 				PinSignal::Adc1 => &[1],
 				PinSignal::Adc2 => &[2],
+				PinSignal::Adc3 => &[3],
+				PinSignal::Adc4 => &[4],
 				_ if self.supports(signal) => &ESP32_C3_GPIO_PINS,
 				_ => &[],
 			},
+		}
+	}
+
+	pub const fn adc_channel_count(self) -> usize {
+		match self.kind {
+			BoardKind::Pico2 => PICO2_ADC_CHANNEL_COUNT,
+			BoardKind::Esp32C3DevKitM1 => ESP32_C3_ADC_CHANNEL_COUNT,
+		}
+	}
+
+	pub const fn pwm_channel_count(self) -> usize {
+		match self.kind {
+			BoardKind::Pico2 => PWM_CHANNEL_COUNT,
+			BoardKind::Esp32C3DevKitM1 => ESP32_C3_PWM_CHANNEL_COUNT,
 		}
 	}
 
@@ -522,24 +542,26 @@ pub enum PinSignal {
 	Adc0 = 18,
 	Adc1 = 19,
 	Adc2 = 20,
-	Pwm0A = 21,
-	Pwm0B = 22,
-	Pwm1A = 23,
-	Pwm1B = 24,
-	Pwm2A = 25,
-	Pwm2B = 26,
-	Pwm3A = 27,
-	Pwm3B = 28,
-	Pwm4A = 29,
-	Pwm4B = 30,
-	Pwm5A = 31,
-	Pwm5B = 32,
-	Pwm6A = 33,
-	Pwm6B = 34,
-	Pwm7A = 35,
-	Pwm7B = 36,
-	Clock0 = 37,
-	Clock1 = 38,
+	Adc3 = 21,
+	Adc4 = 22,
+	Pwm0A = 23,
+	Pwm0B = 24,
+	Pwm1A = 25,
+	Pwm1B = 26,
+	Pwm2A = 27,
+	Pwm2B = 28,
+	Pwm3A = 29,
+	Pwm3B = 30,
+	Pwm4A = 31,
+	Pwm4B = 32,
+	Pwm5A = 33,
+	Pwm5B = 34,
+	Pwm6A = 35,
+	Pwm6B = 36,
+	Pwm7A = 37,
+	Pwm7B = 38,
+	Clock0 = 39,
+	Clock1 = 40,
 }
 
 impl PinSignal {
@@ -565,6 +587,8 @@ impl PinSignal {
 		Self::Adc0,
 		Self::Adc1,
 		Self::Adc2,
+		Self::Adc3,
+		Self::Adc4,
 		Self::Pwm0A,
 		Self::Pwm0B,
 		Self::Pwm1A,
@@ -605,6 +629,7 @@ impl PinSignal {
 			Self::Adc0 => &[26],
 			Self::Adc1 => &[27],
 			Self::Adc2 => &[28],
+			Self::Adc3 | Self::Adc4 => &[],
 			Self::Pwm0A => &[0, 16],
 			Self::Pwm0B => &[1, 17],
 			Self::Pwm1A => &[2, 18],
@@ -644,7 +669,7 @@ impl PinSignal {
 
 	pub const fn adc_channel(self) -> Option<usize> {
 		let value = self as usize;
-		if value >= Self::Adc0 as usize && value <= Self::Adc2 as usize {
+		if value >= Self::Adc0 as usize && value <= Self::Adc4 as usize {
 			Some(value - Self::Adc0 as usize)
 		} else {
 			None
@@ -958,7 +983,7 @@ pub const DEFAULT_PIN_MAP: PinMap = PinMap {
 	spi_mosi: [19, 15],
 	spi_chip_selects: [[17, 21], [13, 20]],
 	enabled: Peripheral::Uart0.mask() | Peripheral::I2c0.mask() | Peripheral::Spi0.mask(),
-	adc_pins: [26, 27, 28],
+	adc_pins: [26, 27, 28, 0, 0],
 	adc_enabled: 0,
 	pwm_pins: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
 	pwm_enabled: 0,
@@ -978,7 +1003,7 @@ pub const ESP32_C3_DEFAULT_PIN_MAP: PinMap = PinMap {
 	spi_mosi: [7, 2],
 	spi_chip_selects: [[10, 1], [3, 4]],
 	enabled: Peripheral::I2c0.mask() | Peripheral::Spi0.mask(),
-	adc_pins: [0, 1, 2],
+	adc_pins: [0, 1, 2, 3, 4],
 	adc_enabled: 0,
 	pwm_pins: [0, 1, 2, 3, 4, 5, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
 	pwm_enabled: 0,
@@ -1018,31 +1043,33 @@ impl PinMap {
 		bytes[18] = self.adc_pins[0];
 		bytes[19] = self.adc_pins[1];
 		bytes[20] = self.adc_pins[2];
+		bytes[21] = self.adc_pins[3];
+		bytes[22] = self.adc_pins[4];
 		let mut index = 0;
 		while index < PWM_CHANNEL_COUNT {
-			bytes[21 + index] = self.pwm_pins[index];
+			bytes[23 + index] = self.pwm_pins[index];
 			index += 1;
 		}
-		bytes[37] = self.clock_pins[0];
-		bytes[38] = self.clock_pins[1];
-		bytes[39] = self.enabled;
-		bytes[40] = self.adc_enabled;
+		bytes[39] = self.clock_pins[0];
+		bytes[40] = self.clock_pins[1];
+		bytes[41] = self.enabled;
+		bytes[42] = self.adc_enabled;
 		let pwm_enabled = self.pwm_enabled.to_le_bytes();
-		bytes[41] = pwm_enabled[0];
-		bytes[42] = pwm_enabled[1];
-		bytes[43] = self.clock_enabled;
-		bytes[44] = self.clock_sources[0] as u8;
-		bytes[45] = self.clock_sources[1] as u8;
+		bytes[43] = pwm_enabled[0];
+		bytes[44] = pwm_enabled[1];
+		bytes[45] = self.clock_enabled;
+		bytes[46] = self.clock_sources[0] as u8;
+		bytes[47] = self.clock_sources[1] as u8;
 		let clock0 = self.clock_hz[0].to_le_bytes();
-		bytes[46] = clock0[0];
-		bytes[47] = clock0[1];
-		bytes[48] = clock0[2];
-		bytes[49] = clock0[3];
+		bytes[48] = clock0[0];
+		bytes[49] = clock0[1];
+		bytes[50] = clock0[2];
+		bytes[51] = clock0[3];
 		let clock1 = self.clock_hz[1].to_le_bytes();
-		bytes[50] = clock1[0];
-		bytes[51] = clock1[1];
-		bytes[52] = clock1[2];
-		bytes[53] = clock1[3];
+		bytes[52] = clock1[0];
+		bytes[53] = clock1[1];
+		bytes[54] = clock1[2];
+		bytes[55] = clock1[3];
 		bytes
 	}
 
@@ -1059,18 +1086,18 @@ impl PinMap {
 			spi_sck: [bytes[9], bytes[14]],
 			spi_mosi: [bytes[10], bytes[15]],
 			spi_chip_selects: [[bytes[11], bytes[12]], [bytes[16], bytes[17]]],
-			adc_pins: [bytes[18], bytes[19], bytes[20]],
-			pwm_pins: bytes[21..37].try_into().unwrap(),
-			clock_pins: [bytes[37], bytes[38]],
-			enabled: bytes[39],
-			adc_enabled: bytes[40],
-			pwm_enabled: u16::from_le_bytes([bytes[41], bytes[42]]),
-			clock_enabled: bytes[43],
+			adc_pins: [bytes[18], bytes[19], bytes[20], bytes[21], bytes[22]],
+			pwm_pins: bytes[23..39].try_into().unwrap(),
+			clock_pins: [bytes[39], bytes[40]],
+			enabled: bytes[41],
+			adc_enabled: bytes[42],
+			pwm_enabled: u16::from_le_bytes([bytes[43], bytes[44]]),
+			clock_enabled: bytes[45],
 			clock_sources: [
-				ClockSource::try_from(bytes[44])?,
-				ClockSource::try_from(bytes[45])?,
+				ClockSource::try_from(bytes[46])?,
+				ClockSource::try_from(bytes[47])?,
 			],
-			clock_hz: [read_u32(&bytes[46..50]), read_u32(&bytes[50..54])],
+			clock_hz: [read_u32(&bytes[48..52]), read_u32(&bytes[52..56])],
 		})
 	}
 
@@ -1101,6 +1128,8 @@ impl PinMap {
 			PinSignal::Adc0 => self.adc_pins[0] = pin,
 			PinSignal::Adc1 => self.adc_pins[1] = pin,
 			PinSignal::Adc2 => self.adc_pins[2] = pin,
+			PinSignal::Adc3 => self.adc_pins[3] = pin,
+			PinSignal::Adc4 => self.adc_pins[4] = pin,
 			PinSignal::Pwm0A
 			| PinSignal::Pwm0B
 			| PinSignal::Pwm1A
@@ -1194,7 +1223,16 @@ impl PinMap {
 	}
 
 	pub fn validate_for(self, profile: BoardProfile) -> Result<(), PinValidationError> {
-		if self.adc_enabled & !0x07 != 0 || self.clock_enabled & !0x03 != 0 {
+		let adc_mask = (1_u8 << profile.adc_channel_count()) - 1;
+		let pwm_mask = if profile.pwm_channel_count() == u16::BITS as usize {
+			u16::MAX
+		} else {
+			(1_u16 << profile.pwm_channel_count()) - 1
+		};
+		if self.adc_enabled & !adc_mask != 0
+			|| self.pwm_enabled & !pwm_mask != 0
+			|| self.clock_enabled & !0x03 != 0
+		{
 			return Err(PinValidationError {
 				kind: PinValidationKind::InvalidEnableMask,
 				signal: PinSignal::Adc0,

@@ -2008,6 +2008,8 @@ fn routed_map(
 		| PinSignal::Adc0
 		| PinSignal::Adc1
 		| PinSignal::Adc2
+		| PinSignal::Adc3
+		| PinSignal::Adc4
 		| PinSignal::Pwm0A
 		| PinSignal::Pwm0B
 		| PinSignal::Pwm1A
@@ -2118,6 +2120,8 @@ fn display_signal(signal: PinSignal) -> &'static str {
 		PinSignal::Adc0 => "ADC0",
 		PinSignal::Adc1 => "ADC1",
 		PinSignal::Adc2 => "ADC2",
+		PinSignal::Adc3 => "ADC3",
+		PinSignal::Adc4 => "ADC4",
 		PinSignal::Pwm0A => "PWM0 A",
 		PinSignal::Pwm0B => "PWM0 B",
 		PinSignal::Pwm1A => "PWM1 A",
@@ -2162,6 +2166,8 @@ fn short_signal(signal: PinSignal) -> &'static str {
 		PinSignal::Adc0 => "ADC0",
 		PinSignal::Adc1 => "ADC1",
 		PinSignal::Adc2 => "ADC2",
+		PinSignal::Adc3 => "ADC3",
+		PinSignal::Adc4 => "ADC4",
 		PinSignal::Pwm0A => "P0-A",
 		PinSignal::Pwm0B => "P0-B",
 		PinSignal::Pwm1A => "P1-A",
@@ -2201,7 +2207,9 @@ fn signal_style(signal: PinSignal) -> Style {
 		| PinSignal::Spi1Mosi
 		| PinSignal::Spi1Cs0
 		| PinSignal::Spi1Cs1 => Color::Yellow,
-		PinSignal::Adc0 | PinSignal::Adc1 | PinSignal::Adc2 => Color::Green,
+		PinSignal::Adc0 | PinSignal::Adc1 | PinSignal::Adc2 | PinSignal::Adc3 | PinSignal::Adc4 => {
+			Color::Green
+		}
 		PinSignal::Pwm0A
 		| PinSignal::Pwm0B
 		| PinSignal::Pwm1A

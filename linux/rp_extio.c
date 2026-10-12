@@ -672,6 +672,8 @@ static const struct iio_chan_spec rpe_adc_channels[] = {
 	RPE_ADC_CHANNEL(0),
 	RPE_ADC_CHANNEL(1),
 	RPE_ADC_CHANNEL(2),
+	RPE_ADC_CHANNEL(3),
+	RPE_ADC_CHANNEL(4),
 };
 
 static int rpe_pwm_call(struct rpe_instance *instance, unsigned int channel,
