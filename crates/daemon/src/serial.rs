@@ -1,7 +1,7 @@
 use crate::{
     backend::{Backend, BackendReply, Transaction},
     usb::{
-        ConfigureError, NegotiatedConfig, UsbReply, decode_reply, encode_transaction,
+        ConfigureError, DeviceKey, NegotiatedConfig, UsbReply, decode_reply, encode_transaction,
         parse_capabilities,
     },
 };
@@ -13,7 +13,7 @@ use rp_extio_wire::{
 };
 use std::{
     io,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{
         Arc, OnceLock,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -33,14 +33,15 @@ pub struct SerialBackend {
     next_request_id: AtomicU64,
     connected: AtomicBool,
     board_kind: OnceLock<rp_extio_wire::BoardKind>,
-    path: PathBuf,
-    failed: mpsc::UnboundedSender<PathBuf>,
+    device_key: DeviceKey,
+    failed: mpsc::UnboundedSender<DeviceKey>,
 }
 
 impl SerialBackend {
-    pub async fn connect(
+    pub(crate) async fn connect(
         path: &Path,
-        failed: mpsc::UnboundedSender<PathBuf>,
+        device_key: DeviceKey,
+        failed: mpsc::UnboundedSender<DeviceKey>,
     ) -> io::Result<(Arc<Self>, NegotiatedConfig)> {
         let mut port =
             tokio_serial::new(path.to_string_lossy(), CONTROL_SERIAL_BAUD).open_native_async()?;
@@ -50,7 +51,7 @@ impl SerialBackend {
             next_request_id: AtomicU64::new(2),
             connected: AtomicBool::new(true),
             board_kind: OnceLock::new(),
-            path: path.to_owned(),
+            device_key,
             failed,
         });
         let hello = backend.exchange(Operation::Hello, 1, &[]).await?;
@@ -129,9 +130,9 @@ impl SerialBackend {
         Ok(config)
     }
 
-    fn fail(&self) {
+    pub(crate) fn fail(&self) {
         if self.connected.swap(false, Ordering::AcqRel) {
-            let _ = self.failed.send(self.path.clone());
+            let _ = self.failed.send(self.device_key.clone());
         }
     }
 

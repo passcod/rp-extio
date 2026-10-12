@@ -1015,7 +1015,17 @@ fn restore_entry<T>(map: &mut BTreeMap<String, T>, key: &str, value: Option<T>) 
 }
 
 pub fn validate_gpio_startup(map: &PinMap, entries: &[GpioStartup]) -> Result<(), String> {
-    let pins = map.gpio_pins().map_err(|error| format_validation(error))?;
+    validate_gpio_startup_for(map, rp_extio_wire::BoardKind::Pico2.profile(), entries)
+}
+
+pub fn validate_gpio_startup_for(
+    map: &PinMap,
+    profile: rp_extio_wire::BoardProfile,
+    entries: &[GpioStartup],
+) -> Result<(), String> {
+    let pins = map
+        .gpio_pins_for(profile)
+        .map_err(|error| format_validation(error))?;
     let mut seen = Vec::new();
     for entry in entries {
         let pin = entry.pin();
@@ -1031,7 +1041,15 @@ pub fn validate_gpio_startup(map: &PinMap, entries: &[GpioStartup]) -> Result<()
 }
 
 pub fn validate_buttons(map: &PinMap, entries: &[ButtonConfig]) -> Result<(), String> {
-    let pins = map.gpio_pins().map_err(format_validation)?;
+    validate_buttons_for(map, rp_extio_wire::BoardKind::Pico2.profile(), entries)
+}
+
+pub fn validate_buttons_for(
+    map: &PinMap,
+    profile: rp_extio_wire::BoardProfile,
+    entries: &[ButtonConfig],
+) -> Result<(), String> {
+    let pins = map.gpio_pins_for(profile).map_err(format_validation)?;
     let mut seen = Vec::new();
     for button in entries {
         if !pins.as_slice().contains(&button.pin) {

@@ -2,9 +2,11 @@ use crate::{
     backend::{Backend, BackendReply, Transaction},
     control::{
         BoardInfo, ButtonConfig, ConfigStore, ControlRequest, ControlResponse, GpioBias, GpioInfo,
-        GpioStartup, PwmInfo, validate_buttons, validate_gpio_startup, validate_pwm_startup,
+        GpioStartup, PwmInfo, validate_buttons_for, validate_gpio_startup_for,
+        validate_pwm_startup,
     },
     kernel::{DeviceRegistration, I2cRegistration, Kernel, RegistrationConfig, SpiRegistration},
+    serial::SerialBackend,
 };
 use async_trait::async_trait;
 use futures_lite::StreamExt;
@@ -65,10 +67,58 @@ impl std::error::Error for ConfigureError {}
 
 struct ConnectedDevice {
     serial: String,
-    backend: Arc<UsbBackend>,
+    backend: Arc<ConnectedBackend>,
     registration: DeviceRegistration,
     gpio_poll: tokio::task::JoinHandle<()>,
     config: NegotiatedConfig,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum DeviceKey {
+    Usb(DeviceId),
+    Serial(PathBuf),
+}
+
+enum ConnectedBackend {
+    Usb(Arc<UsbBackend>),
+    Serial(Arc<SerialBackend>),
+}
+
+impl ConnectedBackend {
+    async fn configure_pins(
+        &self,
+        map: PinMap,
+        generation: u64,
+    ) -> Result<NegotiatedConfig, ConfigureError> {
+        match self {
+            Self::Usb(backend) => backend.configure_pins(map, generation).await,
+            Self::Serial(backend) => backend.configure_pins(map, generation).await,
+        }
+    }
+
+    fn fail(&self) {
+        match self {
+            Self::Usb(backend) => backend.fail(),
+            Self::Serial(backend) => backend.fail(),
+        }
+    }
+}
+
+#[async_trait]
+impl Backend for ConnectedBackend {
+    async fn transact(&self, transaction: Transaction) -> BackendReply {
+        match self {
+            Self::Usb(backend) => backend.transact(transaction).await,
+            Self::Serial(backend) => backend.transact(transaction).await,
+        }
+    }
+
+    async fn disconnect(&self) {
+        match self {
+            Self::Usb(backend) => backend.disconnect().await,
+            Self::Serial(backend) => backend.disconnect().await,
+        }
+    }
 }
 
 pub struct ControlCall {
@@ -80,6 +130,7 @@ pub async fn run(
     kernel: Arc<Kernel>,
     config_path: PathBuf,
     strict: bool,
+    serial_paths: Vec<PathBuf>,
     mut control: mpsc::Receiver<ControlCall>,
 ) -> io::Result<()> {
     let mut config = ConfigStore::load(config_path)?;
@@ -107,6 +158,10 @@ pub async fn run(
     for info in initial {
         try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
     }
+    for path in &serial_paths {
+        try_connect_serial(&kernel, &failed_tx, &config, &mut devices, path).await;
+    }
+    let mut serial_retry = tokio::time::interval(Duration::from_secs(1));
     loop {
         tokio::select! {
             event = watch.next() => match event {
@@ -114,7 +169,7 @@ pub async fn run(
                     try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
                 }
                 Some(nusb::hotplug::HotplugEvent::Disconnected(id)) => {
-                    remove_device(&mut devices, &id).await;
+                    remove_device(&mut devices, &DeviceKey::Usb(id)).await;
                 }
                 Some(nusb::hotplug::HotplugEvent::Connected(_)) => {}
                 None => return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "USB hotplug watch ended")),
@@ -122,6 +177,13 @@ pub async fn run(
             failed = failed_rx.recv() => match failed {
                 Some(id) => remove_device(&mut devices, &id).await,
                 None => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "USB failure channel closed")),
+            },
+            _ = serial_retry.tick(), if !serial_paths.is_empty() => {
+                for path in &serial_paths {
+                    if !devices.contains_key(&DeviceKey::Serial(path.clone())) {
+                        try_connect_serial(&kernel, &failed_tx, &config, &mut devices, path).await;
+                    }
+                }
             },
             call = control.recv() => match call {
                 Some(call) => {
@@ -144,12 +206,12 @@ fn matches_bridge(info: &DeviceInfo) -> bool {
 
 async fn try_connect(
     kernel: &Arc<Kernel>,
-    failed: &mpsc::UnboundedSender<DeviceId>,
+    failed: &mpsc::UnboundedSender<DeviceKey>,
     desired: &ConfigStore,
-    devices: &mut HashMap<DeviceId, ConnectedDevice>,
+    devices: &mut HashMap<DeviceKey, ConnectedDevice>,
     info: DeviceInfo,
 ) {
-    let id = info.id();
+    let id = DeviceKey::Usb(info.id());
     if devices.contains_key(&id) {
         return;
     }
@@ -157,7 +219,7 @@ async fn try_connect(
         eprintln!("refusing rp-extio USB device without stable serial number");
         return;
     };
-    let (backend, mut config) = match UsbBackend::connect(&info, failed.clone()).await {
+    let (backend, mut config) = match UsbBackend::connect(&info, id.clone(), failed.clone()).await {
         Ok(connected) => connected,
         Err(error) => {
             eprintln!(
@@ -167,9 +229,15 @@ async fn try_connect(
             return;
         }
     };
+    let backend = Arc::new(ConnectedBackend::Usb(backend));
     if config.transport != TransportKind::UsbBulk || config.identity.as_bytes() != serial.as_bytes()
     {
         eprintln!("refusing rp-extio USB device {serial}: firmware identity or transport mismatch");
+        backend.disconnect().await;
+        return;
+    }
+    if devices.values().any(|device| device.serial == serial) {
+        eprintln!("refusing duplicate connected rp-extio identity {serial}");
         backend.disconnect().await;
         return;
     }
@@ -190,6 +258,7 @@ async fn try_connect(
     if let Err(error) = apply_gpio_startup(
         backend.as_ref(),
         &config.pin_map,
+        config.board_kind.profile(),
         desired.gpio_startup(&serial),
     )
     .await
@@ -227,9 +296,98 @@ async fn try_connect(
     }
 }
 
+async fn try_connect_serial(
+    kernel: &Arc<Kernel>,
+    failed: &mpsc::UnboundedSender<DeviceKey>,
+    desired: &ConfigStore,
+    devices: &mut HashMap<DeviceKey, ConnectedDevice>,
+    path: &PathBuf,
+) {
+    let id = DeviceKey::Serial(path.clone());
+    if devices.contains_key(&id) {
+        return;
+    }
+    let (backend, mut config) = match SerialBackend::connect(path, id.clone(), failed.clone()).await
+    {
+        Ok(connected) => connected,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            eprintln!(
+                "failed to connect rp-extio serial device {}: {error}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let serial = match core::str::from_utf8(config.identity.as_bytes()) {
+        Ok(serial) => serial.to_owned(),
+        Err(_) => {
+            eprintln!(
+                "refusing rp-extio serial device {} with non-text identity",
+                path.display()
+            );
+            backend.disconnect().await;
+            return;
+        }
+    };
+    if devices.values().any(|device| device.serial == serial) {
+        eprintln!("refusing duplicate connected rp-extio identity {serial}");
+        backend.disconnect().await;
+        return;
+    }
+    let backend = Arc::new(ConnectedBackend::Serial(backend));
+    if let Some(map) = desired.get(&serial)
+        && map != config.pin_map
+    {
+        config = match backend
+            .configure_pins(map, config.generation.wrapping_add(1))
+            .await
+        {
+            Ok(config) => config,
+            Err(error) => {
+                eprintln!("failed to configure rp-extio serial device {serial}: {error}");
+                return;
+            }
+        };
+    }
+    if apply_gpio_startup(
+        backend.as_ref(),
+        &config.pin_map,
+        config.board_kind.profile(),
+        desired.gpio_startup(&serial),
+    )
+    .await
+    .is_err()
+        || apply_pwm_startup(
+            backend.as_ref(),
+            &config.pin_map,
+            desired.pwm_startup(&serial),
+        )
+        .await
+        .is_err()
+    {
+        backend.disconnect().await;
+        return;
+    }
+    match register_device(kernel, backend.clone(), serial.clone(), config) {
+        Ok(device) => {
+            eprintln!(
+                "rp-extio {serial} via {}: generation {}",
+                path.display(),
+                config.generation
+            );
+            devices.insert(id, device);
+        }
+        Err(error) => {
+            eprintln!("failed to register rp-extio serial device {serial}: {error}");
+            backend.disconnect().await;
+        }
+    }
+}
+
 fn register_device(
     kernel: &Arc<Kernel>,
-    backend: Arc<UsbBackend>,
+    backend: Arc<ConnectedBackend>,
     serial: String,
     config: NegotiatedConfig,
 ) -> io::Result<ConnectedDevice> {
@@ -250,7 +408,7 @@ fn register_device(
     })
 }
 
-async fn remove_device(devices: &mut HashMap<DeviceId, ConnectedDevice>, id: &DeviceId) {
+async fn remove_device(devices: &mut HashMap<DeviceKey, ConnectedDevice>, id: &DeviceKey) {
     if let Some(device) = devices.remove(id) {
         device.gpio_poll.abort();
         device.backend.disconnect().await;
@@ -306,16 +464,16 @@ fn disconnected_info(
     }
 }
 
-fn find_device(devices: &HashMap<DeviceId, ConnectedDevice>, serial: &str) -> Option<DeviceId> {
+fn find_device(devices: &HashMap<DeviceKey, ConnectedDevice>, serial: &str) -> Option<DeviceKey> {
     devices
         .iter()
-        .find_map(|(id, device)| (device.serial == serial).then_some(*id))
+        .find_map(|(id, device)| (device.serial == serial).then(|| id.clone()))
 }
 
 async fn handle_control(
     kernel: &Arc<Kernel>,
     store: &mut ConfigStore,
-    devices: &mut HashMap<DeviceId, ConnectedDevice>,
+    devices: &mut HashMap<DeviceKey, ConnectedDevice>,
     request: ControlRequest,
 ) -> ControlResponse {
     match request {
@@ -377,31 +535,30 @@ async fn handle_control(
             map,
         } => {
             let map = PinMap::from(map);
-            if let Err(error) = map.validate() {
+            let profile = find_device(devices, &serial)
+                .map(|id| devices[&id].config.board_kind.profile())
+                .unwrap_or_else(|| BoardKind::Pico2.profile());
+            if let Err(error) = map.validate_for(profile) {
                 return ControlResponse::validation(error);
             }
-            if let Err(message) = validate_gpio_startup(&map, store.gpio_startup(&serial)) {
+            if let Err(message) =
+                validate_gpio_startup_for(&map, profile, store.gpio_startup(&serial))
+            {
                 return ControlResponse::error("gpio_startup_conflict", message);
             }
             if let Err(message) = validate_pwm_startup(&map, store.pwm_startup(&serial)) {
                 return ControlResponse::error("pwm_startup_conflict", message);
             }
-            if let Err(message) = validate_buttons(&map, store.buttons(&serial)) {
+            if let Err(message) = validate_buttons_for(&map, profile, store.buttons(&serial)) {
                 return ControlResponse::error("button_conflict", message);
             }
             change_map(kernel, store, devices, serial, generation, map, false).await
         }
         ControlRequest::Default { serial, generation } => {
-            change_map(
-                kernel,
-                store,
-                devices,
-                serial,
-                generation,
-                rp_extio_wire::DEFAULT_PIN_MAP,
-                true,
-            )
-            .await
+            let default = find_device(devices, &serial)
+                .map(|id| devices[&id].config.board_kind.profile().default_pin_map())
+                .unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
+            change_map(kernel, store, devices, serial, generation, default, true).await
         }
         ControlRequest::Reload => {
             if let Err(error) = store.reload() {
@@ -413,14 +570,14 @@ async fn handle_control(
                     let desired = store
                         .get(&device.serial)
                         .unwrap_or(rp_extio_wire::DEFAULT_PIN_MAP);
-                    (desired != device.config.pin_map).then_some((*id, desired))
+                    (desired != device.config.pin_map).then_some((id.clone(), desired))
                 })
                 .collect();
             for (id, map) in changes {
                 if let Err(response) = reconfigure(
                     kernel,
                     devices,
-                    id,
+                    id.clone(),
                     map,
                     store.gpio_startup(&devices[&id].serial),
                     store.pwm_startup(&devices[&id].serial),
@@ -434,6 +591,7 @@ async fn handle_control(
                 if let Err(response) = apply_gpio_startup(
                     device.backend.as_ref(),
                     &device.config.pin_map,
+                    device.config.board_kind.profile(),
                     store.gpio_startup(&device.serial),
                 )
                 .await
@@ -654,9 +812,13 @@ async fn handle_control(
             if let Err(error) = store.set_gpio_startup(serial.clone(), startup) {
                 return ControlResponse::error("configuration", error.to_string());
             }
-            if let Err(response) =
-                apply_one_gpio_startup(device.backend.as_ref(), &device.config.pin_map, startup)
-                    .await
+            if let Err(response) = apply_one_gpio_startup(
+                device.backend.as_ref(),
+                &device.config.pin_map,
+                device.config.board_kind.profile(),
+                startup,
+            )
+            .await
             {
                 let rollback = match previous {
                     Some(previous) => store.set_gpio_startup(serial.clone(), previous),
@@ -744,7 +906,7 @@ async fn handle_control(
 
 fn button_board_response(
     store: &ConfigStore,
-    devices: &HashMap<DeviceId, ConnectedDevice>,
+    devices: &HashMap<DeviceKey, ConnectedDevice>,
     serial: String,
 ) -> ControlResponse {
     let board = if let Some(id) = find_device(devices, &serial) {
@@ -791,7 +953,7 @@ fn backend_error(status: i32, operation: &str) -> Option<ControlResponse> {
 }
 
 async fn control_pwm(
-    devices: &HashMap<DeviceId, ConnectedDevice>,
+    devices: &HashMap<DeviceKey, ConnectedDevice>,
     serial: &str,
     command: u8,
     pwm: PwmInfo,
@@ -841,7 +1003,7 @@ fn gpio_line(device: &ConnectedDevice, pin: u8) -> Option<u8> {
     device
         .config
         .pin_map
-        .gpio_pins()
+        .gpio_pins_for(device.config.board_kind.profile())
         .ok()?
         .as_slice()
         .iter()
@@ -849,8 +1011,8 @@ fn gpio_line(device: &ConnectedDevice, pin: u8) -> Option<u8> {
         .map(|line| line as u8)
 }
 
-fn gpio_line_for_map(map: &PinMap, pin: u8) -> Option<u8> {
-    map.gpio_pins()
+fn gpio_line_for_map(map: &PinMap, profile: rp_extio_wire::BoardProfile, pin: u8) -> Option<u8> {
+    map.gpio_pins_for(profile)
         .ok()?
         .as_slice()
         .iter()
@@ -861,9 +1023,10 @@ fn gpio_line_for_map(map: &PinMap, pin: u8) -> Option<u8> {
 async fn apply_one_gpio_startup(
     backend: &dyn Backend,
     map: &PinMap,
+    profile: rp_extio_wire::BoardProfile,
     startup: GpioStartup,
 ) -> Result<(), ControlResponse> {
-    let Some(line) = gpio_line_for_map(map, startup.pin()) else {
+    let Some(line) = gpio_line_for_map(map, profile, startup.pin()) else {
         return Err(ControlResponse::error(
             "gpio_startup_conflict",
             format!("GP{} is not configured as GPIO", startup.pin()),
@@ -894,10 +1057,11 @@ async fn apply_one_gpio_startup(
 async fn apply_gpio_startup(
     backend: &dyn Backend,
     map: &PinMap,
+    profile: rp_extio_wire::BoardProfile,
     entries: &[GpioStartup],
 ) -> Result<(), ControlResponse> {
     for &entry in entries {
-        apply_one_gpio_startup(backend, map, entry).await?;
+        apply_one_gpio_startup(backend, map, profile, entry).await?;
     }
     Ok(())
 }
@@ -1001,7 +1165,11 @@ async fn gpio_snapshot(device: &ConnectedDevice) -> ControlResponse {
     let outputs = u32::from_le_bytes(data[4..8].try_into().unwrap());
     let pull_ups = u32::from_le_bytes(data[8..12].try_into().unwrap());
     let pull_downs = u32::from_le_bytes(data[12..16].try_into().unwrap());
-    let pins = device.config.pin_map.gpio_pins().unwrap();
+    let pins = device
+        .config
+        .pin_map
+        .gpio_pins_for(device.config.board_kind.profile())
+        .unwrap();
     if reply.completed != pins.len() as u32 {
         return ControlResponse::error("protocol", "GPIO snapshot line count changed");
     }
@@ -1032,7 +1200,7 @@ async fn gpio_snapshot(device: &ConnectedDevice) -> ControlResponse {
 async fn change_map(
     kernel: &Arc<Kernel>,
     store: &mut ConfigStore,
-    devices: &mut HashMap<DeviceId, ConnectedDevice>,
+    devices: &mut HashMap<DeviceKey, ConnectedDevice>,
     serial: String,
     generation: u64,
     map: PinMap,
@@ -1103,8 +1271,8 @@ async fn change_map(
 
 async fn reconfigure(
     kernel: &Arc<Kernel>,
-    devices: &mut HashMap<DeviceId, ConnectedDevice>,
-    id: DeviceId,
+    devices: &mut HashMap<DeviceKey, ConnectedDevice>,
+    id: DeviceKey,
     map: PinMap,
     gpio_startup: &[GpioStartup],
     pwm_startup: &[PwmInfo],
@@ -1138,8 +1306,13 @@ async fn reconfigure(
             return Err(ControlResponse::error("usb", error.to_string()));
         }
     };
-    if let Err(response) =
-        apply_gpio_startup(backend.as_ref(), &new_config.pin_map, gpio_startup).await
+    if let Err(response) = apply_gpio_startup(
+        backend.as_ref(),
+        &new_config.pin_map,
+        new_config.board_kind.profile(),
+        gpio_startup,
+    )
+    .await
     {
         backend.disconnect().await;
         return Err(response);
@@ -1162,7 +1335,12 @@ async fn reconfigure(
     }
 }
 
-async fn poll_gpio(backend: Arc<UsbBackend>, kernel: Arc<Kernel>, instance_id: u32, lines: u16) {
+async fn poll_gpio(
+    backend: Arc<ConnectedBackend>,
+    kernel: Arc<Kernel>,
+    instance_id: u32,
+    lines: u16,
+) {
     let mut previous: Option<u32> = None;
     let mut interval = tokio::time::interval(Duration::from_millis(10));
     loop {
@@ -1215,14 +1393,15 @@ pub struct UsbBackend {
     transport: Mutex<Transport>,
     next_request_id: AtomicU64,
     connected: AtomicBool,
-    device_id: DeviceId,
-    failed: mpsc::UnboundedSender<DeviceId>,
+    device_id: DeviceKey,
+    failed: mpsc::UnboundedSender<DeviceKey>,
 }
 
 impl UsbBackend {
-    pub async fn connect(
+    pub(crate) async fn connect(
         info: &DeviceInfo,
-        failed: mpsc::UnboundedSender<DeviceId>,
+        device_id: DeviceKey,
+        failed: mpsc::UnboundedSender<DeviceKey>,
     ) -> io::Result<(Arc<Self>, NegotiatedConfig)> {
         let interface_number = info
             .interfaces()
@@ -1281,7 +1460,7 @@ impl UsbBackend {
             }),
             next_request_id: AtomicU64::new(2),
             connected: AtomicBool::new(true),
-            device_id: info.id(),
+            device_id,
             failed,
         });
         let hello = backend
@@ -1358,7 +1537,7 @@ impl UsbBackend {
 
     fn fail(&self) {
         if self.connected.swap(false, Ordering::AcqRel) {
-            let _ = self.failed.send(self.device_id);
+            let _ = self.failed.send(self.device_id.clone());
         }
     }
 
@@ -2328,6 +2507,7 @@ mod tests {
         apply_gpio_startup(
             &backend,
             &map,
+            BoardKind::Pico2.profile(),
             &[
                 GpioStartup::Output {
                     pin: 20,
@@ -2384,8 +2564,8 @@ mod tests {
                 value: 0,
             })
             .await;
-        let output_line = gpio_line_for_map(&map, 20).unwrap();
-        let input_line = gpio_line_for_map(&map, 28).unwrap();
+        let output_line = gpio_line_for_map(&map, BoardKind::Pico2.profile(), 20).unwrap();
+        let input_line = gpio_line_for_map(&map, BoardKind::Pico2.profile(), 28).unwrap();
         let levels = u32::from_le_bytes(snapshot.data[0..4].try_into().unwrap());
         let outputs = u32::from_le_bytes(snapshot.data[4..8].try_into().unwrap());
         let pull_downs = u32::from_le_bytes(snapshot.data[12..16].try_into().unwrap());
@@ -2517,7 +2697,9 @@ mod tests {
             .find(matches_bridge)
             .expect("rp-extio Pico 2 not found");
         let (failed, _failures) = mpsc::unbounded_channel();
-        let (backend, config) = UsbBackend::connect(&info, failed).await.unwrap();
+        let (backend, config) = UsbBackend::connect(&info, DeviceKey::Usb(info.id()), failed)
+            .await
+            .unwrap();
         assert_eq!(config.registration.i2c, RegistrationConfig::PICO2.i2c);
         assert_eq!(config.registration.spi[0].unwrap().spi_chip_selects, 2);
         assert_eq!(config.registration.gpio_lines, 17);

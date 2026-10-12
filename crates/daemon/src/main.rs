@@ -32,6 +32,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let mut control_socket = PathBuf::from("/run/rp-extiod.sock");
     let mut strict_config = false;
     let mut operator_group = None;
+    let mut serial_paths = Vec::new();
     while let Some(argument) = arguments.next() {
         if argument == "--simulate" {
             simulation_socket = arguments.next().map(PathBuf::from);
@@ -52,6 +53,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 .ok_or("--socket needs a path")?;
         } else if argument == "--strict-config" {
             strict_config = true;
+        } else if argument == "--serial" {
+            serial_paths.push(
+                arguments
+                    .next()
+                    .map(PathBuf::from)
+                    .ok_or("--serial needs a device path")?,
+            );
         } else if argument == "--operator-group" {
             operator_group = Some(
                 arguments
@@ -67,7 +75,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let kernel = Kernel::open(control)?;
     let dispatcher = kernel.clone().run();
     let (control_tx, control_rx) = mpsc::channel(32);
-    let usb = usb::run(kernel.clone(), config, strict_config, control_rx);
+    let usb = usb::run(
+        kernel.clone(),
+        config,
+        strict_config,
+        serial_paths,
+        control_rx,
+    );
     let control = serve_control(control_socket, operator_group, control_tx);
     tokio::pin!(dispatcher, usb);
     tokio::pin!(control);
