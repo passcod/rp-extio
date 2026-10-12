@@ -143,26 +143,41 @@ pub async fn run(
 		.map_err(nusb_error)?
 		.filter(matches_bridge)
 		.collect();
+	let (failed_tx, mut failed_rx) = mpsc::unbounded_channel();
+	let (serial_result_tx, mut serial_result_rx) = mpsc::unbounded_channel();
+	let mut devices = HashMap::new();
+	let mut serial_in_flight = HashSet::new();
+	let mut serial_probe_errors = HashMap::new();
+	for info in initial {
+		try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
+	}
+	for path in serial_candidates(&serial_paths) {
+		start_serial_probe(path, &failed_tx, &serial_result_tx, &mut serial_in_flight);
+	}
 	if strict {
+		while !serial_in_flight.is_empty() {
+			let (path, result) = serial_result_rx.recv().await.ok_or_else(|| {
+				io::Error::new(io::ErrorKind::BrokenPipe, "serial probe channel closed")
+			})?;
+			serial_in_flight.remove(&path);
+			handle_serial_probe_result(
+				&kernel,
+				&config,
+				&mut devices,
+				&mut serial_probe_errors,
+				path,
+				result,
+			)
+			.await;
+		}
 		for serial in config.boards().keys() {
-			if !initial
-				.iter()
-				.any(|info| info.serial_number() == Some(serial.as_str()))
-			{
+			if !devices.values().any(|device| &device.serial == serial) {
 				return Err(io::Error::new(
 					io::ErrorKind::NotFound,
 					format!("configured rp-extio board {serial} is not connected"),
 				));
 			}
 		}
-	}
-	let (failed_tx, mut failed_rx) = mpsc::unbounded_channel();
-	let mut devices = HashMap::new();
-	for info in initial {
-		try_connect(&kernel, &failed_tx, &config, &mut devices, info).await;
-	}
-	for path in serial_candidates(&serial_paths) {
-		try_connect_serial(&kernel, &failed_tx, &config, &mut devices, path).await;
 	}
 	let mut serial_retry = tokio::time::interval(Duration::from_secs(1));
 	loop {
@@ -181,10 +196,29 @@ pub async fn run(
 				Some(id) => remove_device(&mut devices, &id).await,
 				None => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "USB failure channel closed")),
 			},
+			result = serial_result_rx.recv() => match result {
+				Some((path, result)) => {
+					serial_in_flight.remove(&path);
+					handle_serial_probe_result(
+						&kernel,
+						&config,
+						&mut devices,
+						&mut serial_probe_errors,
+						path,
+						result,
+					).await;
+				}
+				None => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "serial probe channel closed")),
+			},
 			_ = serial_retry.tick() => {
 				for path in serial_candidates(&serial_paths) {
-					if !devices.contains_key(&DeviceKey::Serial(path.clone())) {
-						try_connect_serial(&kernel, &failed_tx, &config, &mut devices, path).await;
+					if !devices.contains_key(&DeviceKey::Serial(path.clone())) && !serial_in_flight.contains(&path) {
+						start_serial_probe(
+							path,
+							&failed_tx,
+							&serial_result_tx,
+							&mut serial_in_flight,
+						);
 					}
 				}
 			},
@@ -342,29 +376,82 @@ async fn try_connect(
 	}
 }
 
-async fn try_connect_serial(
-	kernel: &Arc<Kernel>,
+type SerialProbeResult = io::Result<(Arc<SerialBackend>, NegotiatedConfig)>;
+
+fn start_serial_probe(
+	path: PathBuf,
 	failed: &mpsc::UnboundedSender<DeviceKey>,
+	results: &mpsc::UnboundedSender<(PathBuf, SerialProbeResult)>,
+	in_flight: &mut HashSet<PathBuf>,
+) {
+	if !in_flight.insert(path.clone()) {
+		return;
+	}
+	let id = DeviceKey::Serial(path.clone());
+	let failed = failed.clone();
+	let results = results.clone();
+	tokio::spawn(async move {
+		let result = SerialBackend::connect(&path, id, failed).await;
+		let _ = results.send((path, result));
+	});
+}
+
+async fn handle_serial_probe_result(
+	kernel: &Arc<Kernel>,
+	desired: &ConfigStore,
+	devices: &mut HashMap<DeviceKey, ConnectedDevice>,
+	errors: &mut HashMap<PathBuf, String>,
+	path: PathBuf,
+	result: SerialProbeResult,
+) {
+	let (backend, config) = match result {
+		Ok(connected) => {
+			errors.remove(&path);
+			connected
+		}
+		Err(error) if error.kind() == io::ErrorKind::NotFound => {
+			errors.remove(&path);
+			return;
+		}
+		Err(error) => {
+			let message = error.to_string();
+			if remember_serial_probe_error(errors, &path, &message) {
+				eprintln!(
+					"failed to probe rp-extio serial device {}: {message}",
+					path.display()
+				);
+			}
+			return;
+		}
+	};
+	finish_connect_serial(kernel, desired, devices, path, backend, config).await;
+}
+
+fn remember_serial_probe_error(
+	errors: &mut HashMap<PathBuf, String>,
+	path: &Path,
+	message: &str,
+) -> bool {
+	if errors.get(path).is_some_and(|previous| previous == message) {
+		return false;
+	}
+	errors.insert(path.to_owned(), message.to_owned());
+	true
+}
+
+async fn finish_connect_serial(
+	kernel: &Arc<Kernel>,
 	desired: &ConfigStore,
 	devices: &mut HashMap<DeviceKey, ConnectedDevice>,
 	path: PathBuf,
+	backend: Arc<SerialBackend>,
+	mut config: NegotiatedConfig,
 ) {
 	let id = DeviceKey::Serial(path.clone());
 	if devices.contains_key(&id) {
+		backend.disconnect().await;
 		return;
 	}
-	let (backend, mut config) =
-		match SerialBackend::connect(&path, id.clone(), failed.clone()).await {
-			Ok(connected) => connected,
-			Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-			Err(error) => {
-				eprintln!(
-					"failed to connect rp-extio serial device {}: {error}",
-					path.display()
-				);
-				return;
-			}
-		};
 	let serial = match core::str::from_utf8(config.identity.as_bytes()) {
 		Ok(serial) => serial.to_owned(),
 		Err(_) => {
@@ -392,6 +479,7 @@ async fn try_connect_serial(
 			Ok(config) => config,
 			Err(error) => {
 				eprintln!("failed to configure rp-extio serial device {serial}: {error}");
+				backend.disconnect().await;
 				return;
 			}
 		};
@@ -2490,6 +2578,34 @@ mod tests {
 	use super::*;
 	use crate::backend::{I2cMessage, SpiSegment};
 	use crate::sim::{Command as SimCommand, Response as SimResponse, Simulator};
+
+	#[test]
+	fn repeated_serial_probe_errors_are_suppressed_until_they_change() {
+		let path = Path::new("/dev/serial/by-id/example");
+		let mut errors = HashMap::new();
+		assert!(remember_serial_probe_error(&mut errors, path, "timeout"));
+		assert!(!remember_serial_probe_error(&mut errors, path, "timeout"));
+		assert!(remember_serial_probe_error(&mut errors, path, "bad frame"));
+	}
+
+	#[tokio::test]
+	async fn serial_probe_tasks_are_deduplicated_by_path() {
+		let (failed, _failed_rx) = mpsc::unbounded_channel();
+		let (results, mut result_rx) = mpsc::unbounded_channel();
+		let mut in_flight = HashSet::new();
+		let path = PathBuf::from("/dev/rp-extio-definitely-missing-for-test");
+		start_serial_probe(path.clone(), &failed, &results, &mut in_flight);
+		start_serial_probe(path.clone(), &failed, &results, &mut in_flight);
+		assert_eq!(in_flight, HashSet::from([path.clone()]));
+
+		let (result_path, result) = tokio::time::timeout(Duration::from_secs(1), result_rx.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		assert_eq!(result_path, path);
+		assert!(result.is_err());
+		assert!(result_rx.try_recv().is_err());
+	}
 
 	fn capability_record(payload: &mut Vec<u8>, kind: u16, value: &[u8]) {
 		payload.extend_from_slice(&kind.to_le_bytes());
